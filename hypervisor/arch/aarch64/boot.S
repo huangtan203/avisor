@@ -13,7 +13,7 @@
 #include "common/mm.h"
 
 .section ".text.boot"
-
+//TO DO cortex R52
 .globl _start
 _start:
 	mrs x0, mpidr_el1
