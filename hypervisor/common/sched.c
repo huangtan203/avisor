@@ -120,6 +120,9 @@ void set_cpu_sysregs(struct task_struct *tsk)
 
 void vm_entering_work()
 {
+	if (!current || current->pid == 0)
+		return;
+
 	if (HAVE_FUNC(current->board_ops, entering_vm))
 		current->board_ops->entering_vm(current);
 
@@ -132,6 +135,9 @@ void vm_entering_work()
 
 void vm_leaving_work()
 {
+	if (!current || current->pid == 0)
+		return;
+
 	save_sysregs(&current->cpu_sysregs);
 
 	if (HAVE_FUNC(current->board_ops, leaving_vm))

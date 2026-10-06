@@ -1,0 +1,16 @@
+# Build outputs
+build_*/
+bin_*/
+*.o
+*.elf
+*.img
+*.list
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

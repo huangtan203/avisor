@@ -1,0 +1,145 @@
+# aVisor Hypervisor - QEMU virt 平台 Makefile (Phase 1)
+#
+# 学习要点：
+#   这个 Makefile 构建 QEMU virt 平台版本的 Hypervisor。
+#   Phase 1 只包含核心功能，没有 shell 和文件系统，
+#   目标是快速验证启动 + 串口 + 中断 + 定时器 + 调度器。
+
+GNU_TOOLS ?= aarch64-linux-gnu
+GNU_GCC = $(GNU_TOOLS)-gcc
+GNU_LD = $(GNU_TOOLS)-ld
+GNU_OBJCOPY = $(GNU_TOOLS)-objcopy
+GNU_OBJDUMP = $(GNU_TOOLS)-objdump
+
+INC_DIR = include
+
+# 编译选项
+# -DPLATFORM_VIRT=1 标记当前构建的是 virt 平台
+C_OPS = -Wall -nostdlib -nostartfiles -ffreestanding -I$(INC_DIR) -mgeneral-regs-only -DPLATFORM_VIRT=1 -g
+ASM_OPS = -I$(INC_DIR) -DPLATFORM_VIRT=1 -g
+
+BUILD_DIR = build_virt
+OUTDIR = bin_virt
+
+# ========== 源文件列表 ==========
+
+# 架构层代码（通用，所有平台共享）
+SRC_DIR += hypervisor/arch/aarch64
+
+# virt 平台代码
+SRC_DIR += hypervisor/boards/virt
+
+# 通用代码
+SRC_DIR += hypervisor/common
+
+# Phase 1 暂不包含：
+# - hypervisor/fs/       (FAT 文件系统，依赖 SD 卡)
+# - hypervisor/emulator/ (guest 设备模型)
+
+HV_DIR = hypervisor
+
+.PHONY: all
+all: kernel8.img
+
+# 查找所有 C 和汇编文件
+C_FILES = $(wildcard *.c $(foreach fd, $(SRC_DIR), $(fd)/*.c))
+ASM_FILES = $(wildcard *.S $(foreach fd, $(SRC_DIR), $(fd)/*.S))
+
+#
+# 排除不需要的文件
+#
+# Phase 1 排除的文件：
+# - common/main.c:   raspi 版的主入口，用 main_virt.c 替代
+# - common/shell.c:  依赖 FAT 文件系统，Phase 2 再加
+# - common/loader.c: 依赖 FAT 文件系统，Phase 2 再加
+# - arch/aarch64/boot.S:  raspi 版的启动代码，用 boot_virt.S 替代
+#
+EXCLUDE_C_FILES = \
+    hypervisor/common/main.c \
+    hypervisor/common/shell.c \
+    hypervisor/common/loader.c
+
+EXCLUDE_ASM_FILES = \
+    hypervisor/arch/aarch64/boot.S
+
+C_FILES := $(filter-out $(EXCLUDE_C_FILES), $(C_FILES))
+ASM_FILES := $(filter-out $(EXCLUDE_ASM_FILES), $(ASM_FILES))
+
+# 编译规则
+$(BUILD_DIR)/%_c.o: %.c
+	mkdir -p $(dir $@)
+	$(GNU_GCC) $(C_OPS) -MMD -c $< -o $@
+
+$(BUILD_DIR)/%_s.o: %.S
+	mkdir -p $(dir $@)
+	$(GNU_GCC) $(ASM_OPS) -MMD -c $< -o $@
+
+OBJ_FILES = $(C_FILES:%.c=$(BUILD_DIR)/%_c.o)
+OBJ_FILES += $(ASM_FILES:%.S=$(BUILD_DIR)/%_s.o)
+
+DEP_FILES = $(OBJ_FILES:%.o=%.d)
+-include $(DEP_FILES)
+
+# 链接脚本
+LINKER_FILE = $(HV_DIR)/boards/virt/linker_virt.ld
+
+# 构建镜像
+kernel8.img: $(LINKER_FILE) $(OBJ_FILES)
+	$(GNU_LD) -T $(LINKER_FILE) -o $(BUILD_DIR)/kernel8.elf $(OBJ_FILES)
+	$(GNU_OBJCOPY) $(BUILD_DIR)/kernel8.elf -O binary $(BUILD_DIR)/kernel8.img
+	mkdir -p ./$(OUTDIR)
+	cp $(BUILD_DIR)/kernel8.img $(OUTDIR)/kernel8.img
+	$(GNU_OBJDUMP) -d $(BUILD_DIR)/kernel8.elf > $(BUILD_DIR)/kernel8.list
+	@echo ""
+	@echo "=== Build complete ==="
+	@echo "Image: $(OUTDIR)/kernel8.img"
+	@echo "Size:  $$(ls -l $(OUTDIR)/kernel8.img | awk '{print $$5}') bytes"
+	@echo "Run with: make run"
+	@echo ""
+
+# 在 QEMU 上运行
+.PHONY: run
+run: kernel8.img
+	qemu-system-aarch64 \
+		-M virt,virtualization=on,gic-version=3 \
+		-cpu max \
+		-smp 1 \
+		-m 1G \
+		-kernel $(OUTDIR)/kernel8.img \
+		-nographic \
+		-serial mon:stdio
+
+# 在 QEMU 上运行（调试模式，开启 gdbserver，等待 gdb 连接）
+.PHONY: debug
+debug: kernel8.img
+	@echo "QEMU waiting for GDB connection on port 1234..."
+	@echo "In another terminal, run:"
+	@echo "  $(GNU_TOOLS)-gdb build_virt/kernel8.elf"
+	@echo "  (gdb) target remote :1234"
+	@echo "  (gdb) continue"
+	@echo ""
+	qemu-system-aarch64 \
+		-M virt,virtualization=on,gic-version=3 \
+		-cpu max \
+		-smp 1 \
+		-m 1G \
+		-kernel $(OUTDIR)/kernel8.img \
+		-nographic \
+		-serial mon:stdio \
+		-s -S
+
+.PHONY: clean
+clean:
+	rm -rf $(BUILD_DIR) $(OUTDIR)
+
+# 调试用：打印变量
+.PHONY: echoes
+echoes:
+	@echo "C_FILES:"
+	@echo $(C_FILES) | tr ' ' '\n'
+	@echo ""
+	@echo "ASM_FILES:"
+	@echo $(ASM_FILES) | tr ' ' '\n'
+	@echo ""
+	@echo "OBJ_FILES:"
+	@echo $(OBJ_FILES) | tr ' ' '\n'

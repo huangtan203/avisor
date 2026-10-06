@@ -30,7 +30,21 @@
  *
  */
 
+/*
+ * 注意：wait_msec_st 使用的是 BCM2837 系统定时器（MMIO 访问），
+ * 这是树莓派特有的。在 virt 平台上没有这个定时器，
+ * 所以用条件编译区分。
+ *
+ * 学习要点：
+ *   wait_msec() 使用的是 ARM 架构通用定时器（CNTPCT_EL0），
+ *   在所有 ARMv8 平台上都能用，是平台无关的。
+ *   wait_msec_st() 使用的是芯片厂商加的额外定时器（BCM System Timer），
+ *   只有特定平台才有。
+ *   做平台移植时，优先用架构通用的功能。
+ */
+#ifndef PLATFORM_VIRT
 #include "boards/raspi/timer.h"
+#endif
 #include "common/timer.h"
 #include "common/utils.h"
 
@@ -68,7 +82,10 @@ void wait_msec(unsigned int n)
 
 /**
  * Wait N microsec (with BCM System Timer)
+ * 
+ * 注意：仅在树莓派平台可用，virt 平台使用架构定时器版本。
  */
+#ifndef PLATFORM_VIRT
 void wait_msec_st(unsigned int n)
 {
 	unsigned long t = get_system_timer();
@@ -79,3 +96,10 @@ void wait_msec_st(unsigned int n)
 		while (get_system_timer() < t + n)
 			;
 }
+#else
+/* virt 平台：用架构定时器实现同样的接口 */
+void wait_msec_st(unsigned int n)
+{
+	wait_msec(n);
+}
+#endif

@@ -9,18 +9,43 @@
 
 #include "common/mm.h"
 #include "arch/aarch64/mmu.h"
-#include "boards/raspi/raspi3b.h"
 #include "common/board.h"
 #include "common/debug.h"
 #include "common/task.h"
 #include "common/utils.h"
+
+/*
+ * 平台相关的页池（page pool）获取函数
+ *
+ * 学习要点：
+ *   不同平台的内存布局不同，可用内存的起始地址和大小也不同。
+ *   我们通过一个统一的 get_page_pool() 接口来获取当前平台的页池，
+ *   这样通用的内存管理代码就不需要知道具体平台的细节了。
+ *
+ *   这是"依赖倒置原则"（DIP）的一个简单应用：
+ *   高层模块（通用 mm 代码）不依赖底层模块（平台具体实现），
+ *   两者都依赖抽象（page_pool 接口）。
+ */
+#ifndef PLATFORM_VIRT
+#include "boards/raspi/raspi3b.h"
+static inline struct page_pool *get_page_pool(void)
+{
+    return get_page_pool();
+}
+#else
+#include "boards/virt/virt_board.h"
+static inline struct page_pool *get_page_pool(void)
+{
+    return get_virt_page_pool();
+}
+#endif
 
 paddr_t get_free_page(struct page_pool *pool);
 void free_page(struct page_pool *pool, paddr_t p);
 
 void *allocate_page()
 {
-	paddr_t page = get_free_page(get_rasp3b_page_pool());
+	paddr_t page = get_free_page(get_page_pool());
 
 	if (page == 0) {
 		return 0;
@@ -31,12 +56,12 @@ void *allocate_page()
 
 void deallocate_page(void *page)
 {
-	free_page(get_rasp3b_page_pool(), TO_PADDR(page));
+	free_page(get_page_pool(), TO_PADDR(page));
 }
 
 void *allocate_task_page(struct task_struct *task, vaddr_t va)
 {
-	paddr_t page = get_free_page(get_rasp3b_page_pool());
+	paddr_t page = get_free_page(get_page_pool());
 
 	if (page == 0) {
 		return 0;
@@ -97,7 +122,7 @@ static paddr_t map_stage2_table(vaddr_t table, uint64_t shift, vaddr_t va,
 	if (!((uint64_t *)table)[index]) {
 		*new_table = 1;
 		paddr_t next_level_table =
-			get_free_page(get_rasp3b_page_pool());
+			get_free_page(get_page_pool());
 		uint64_t entry = next_level_table | MM_TYPE_PAGE_TABLE;
 
 		((uint64_t *)table)[index] = entry;
@@ -114,7 +139,7 @@ bool check_task_page_mapped(struct task_struct *task, vaddr_t va)
 	paddr_t lv1_table;
 
 	if (!task->mm.first_table) {
-		task->mm.first_table = get_free_page(get_rasp3b_page_pool());
+		task->mm.first_table = get_free_page(get_page_pool());
 		task->mm.kernel_pages_count++;
 	}
 
@@ -144,7 +169,7 @@ void map_stage2_page(struct task_struct *task, vaddr_t va, paddr_t page,
 	paddr_t lv1_table;
 
 	if (!task->mm.first_table) {
-		task->mm.first_table = get_free_page(get_rasp3b_page_pool());
+		task->mm.first_table = get_free_page(get_page_pool());
 		task->mm.kernel_pages_count++;
 	}
 
@@ -186,7 +211,7 @@ int handle_mem_abort(vaddr_t addr, uint64_t esr)
 
 	if (dfsc >> 2 == 0x1) {
 		// translation fault
-		paddr_t page = get_free_page(get_rasp3b_page_pool());
+		paddr_t page = get_free_page(get_page_pool());
 
 		if (page == 0) {
 			return -1;

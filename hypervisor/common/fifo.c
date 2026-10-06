@@ -31,12 +31,23 @@ int is_full_fifo(struct fifo *fifo)
 	return fifo->used == FIFO_SIZE;
 }
 
+static void dbg_putc(char c)
+{
+	volatile unsigned int *uart_fr = (volatile unsigned int *)(0x09000000 + 0x18);
+	volatile unsigned int *uart_dr = (volatile unsigned int *)(0x09000000 + 0x00);
+	while (*uart_fr & (1 << 5)) { }
+	*uart_dr = c;
+}
+
 struct fifo *create_fifo()
 {
+	dbg_putc('f');
 	struct fifo *fifo = (struct fifo *)allocate_page();
+	dbg_putc('g');
 	fifo->head = 0;
 	fifo->tail = 0;
 	fifo->used = 0;
+	dbg_putc('h');
 
 	return fifo;
 }
