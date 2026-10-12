@@ -34,8 +34,6 @@
 #include "common/debug.h"
 #include "common/sched.h"
 #include "common/utils.h"
-
-/* 全局变量：定时器频率 */
 static unsigned long timer_freq = 0;
 
 /* 全局 tick 计数（每 100Hz tick = 1 秒） */

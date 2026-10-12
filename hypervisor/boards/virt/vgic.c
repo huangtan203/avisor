@@ -152,35 +152,6 @@ void vgic_inject_virq_hw(uint32_t vintid, uint32_t pintid)
 }
 
 /*
- * vtimer 中断的"延迟注入"机制
- *
- * 背景：Guest 用 WFI 主循环（WFI 会 trap 给 EL2 触发调度），
- * HV 和 Guest 在 EL2/EL1 之间快速切换。PPI #27 到达 EL2 时，
- * 如果此刻 current 是 HV（pid=0），无法立即注入——
- * 丢弃它会导致 Guest 的定时器中断永久丢失
- * （27 保持 active 屏蔽电平信号，直到 Guest 重装 CVAL 才解锁，
- *  而 Guest 收不到中断就不会重装，死锁）。
- *
- * 方案：HV 上下文收到 27 时置一个 pending 标志（中断照常走
- * split EOIR，27 保持 active 不风暴）；每次即将回到 Guest 时
- * （board_ops->entering_vm）检查标志补注入 HW LR。
- */
-static int vtimer_pending;
-
-void vgic_vtimer_defer(void)
-{
-    vtimer_pending = 1;
-}
-
-void vgic_vtimer_flush(void)
-{
-    if (vtimer_pending) {
-        vtimer_pending = 0;
-        vgic_inject_virq_hw(PPI_VIRT_TIMER, PPI_VIRT_TIMER);
-    }
-}
-
-/*
  * 读取 LR0 当前内容（调试用：判断虚拟中断是否还在排队）
  */
 uint64_t vgic_get_lr0(void)

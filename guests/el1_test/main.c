@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * aVisor Guest - 主程序
+ * aVisor Guest - 主程序（Phase 3：多 VM 实例）
+ *
+ * 同一份镜像被 Hypervisor 加载为多个 VM 实例：
+ *   - 各自独立的 Stage 2 页表（同一 IPA 映射到不同物理页）
+ *   - 各自独立的虚拟定时器 / 虚拟 GIC 状态（世界切换保存恢复）
+ *   - 各自独立的 VMID / CNTVOFF（时间与内存视图隔离）
+ *
+ * 通过 HVC_GET_VMID 查询自己的编号，不同实例用不同的
+ * 定时器频率（vm1: 10Hz, vm2: 5Hz），运行时可从心跳
+ * 输出直接观察到"两个 VM 的定时器完全独立"。
  */
 
 #include "guest.h"
@@ -37,6 +46,12 @@ u64 guest_timer_freq(void)
     return hvc_call(HVC_GET_TIMER_FREQ, 0);
 }
 
+u64 guest_vmid(void)
+{
+    /* 查询自己是几号 VM（Hypervisor 的 task pid） */
+    return hvc_call(HVC_GET_VMID, 0);
+}
+
 /* ---------- 虚拟 GIC（CPU 接口）初始化 ---------- */
 
 /*
@@ -44,6 +59,7 @@ u64 guest_timer_freq(void)
  *   这些 ICC_*_EL1 写操作在 EL1 执行时被 GICv3 硬件自动重定向到
  *   "虚拟 CPU 接口"（实际写入 ICH_VMCR_EL2 的后端字段），
  *   完全不会陷入 EL2——guest 用的就是标准 GICv3 驱动代码。
+ *   多 VM 场景下，这份状态在世界切换时由 Hypervisor 保存/恢复。
  */
 static void gic_vcpu_init(void)
 {
@@ -57,15 +73,28 @@ static void gic_vcpu_init(void)
 /* ---------- 虚拟定时器 ---------- */
 
 static u64 timer_freq;
+static u64 tick_hz;               /* 本实例的定时器频率 */
 static volatile u64 tick_count = 0;
 
 static void vtimer_start(void)
 {
+    u64 now;
+
     timer_freq = guest_timer_freq();
 
-    /* 第一个到期点：现在 + freq/10（10Hz） */
-    u64 now = cntvct_read();
-    cntv_cval_write(now + timer_freq / GUEST_TIMER_HZ);
+    /*
+     * 按 VM 编号差异化频率（多 VM 独立定时器的直观演示）：
+     *   vm1: 10Hz，vm2: 5Hz，其他: 1Hz
+     */
+    {
+        u64 vmid = guest_vmid();
+
+        tick_hz = (vmid == 1) ? 10 : (vmid == 2) ? 5 : 1;
+    }
+
+    /* 第一个到期点：现在 + freq/tick_hz */
+    now = cntvct_read();
+    cntv_cval_write(now + timer_freq / tick_hz);
 
     /* 使能定时器 + 不屏蔽中断（bit0=enable, bit1=imask） */
     cntv_ctl_write(1);
@@ -96,14 +125,14 @@ void guest_irq_handler(void)
 
         /* 重新装载下一个到期点（周期模式） */
         u64 now = cntvct_read();
-        cntv_cval_write(now + timer_freq / GUEST_TIMER_HZ);
+        cntv_cval_write(now + timer_freq / tick_hz);
         /* 写 CVAL 会自动清除 istatus */
 
-        /* 每秒（10 tick）打印一次心跳 */
-        if (tick_count % GUEST_TIMER_HZ == 0) {
-            guest_puts("guest: tick ");
-            puts_dec(tick_count / GUEST_TIMER_HZ);
-            guest_puts(" (timer + vGIC working)\n");
+        /* 每秒打印一次心跳 */
+        if (tick_count % tick_hz == 0) {
+            guest_puts("tick ");
+            puts_dec(tick_count / tick_hz);
+            guest_puts("\n");
         }
     }
 
@@ -127,14 +156,18 @@ void guest_fatal(const char *msg, u64 esr, u64 elr)
 
 void guest_main(void)
 {
+    u64 vmid = guest_vmid();
+
     guest_puts("\nguest: hello from EL1!\n");
-    guest_puts("guest: running on aVisor hypervisor (QEMU virt)\n");
+    guest_puts("guest: I am VM ");
+    puts_dec(vmid);
+    guest_puts(", running on aVisor hypervisor\n");
 
     gic_vcpu_init();
     guest_puts("guest: virtual GIC CPU interface initialized\n");
 
     vtimer_start();
-    guest_puts("guest: virtual timer started (10Hz)\n");
+    guest_puts("guest: virtual timer started\n");
 
     /* 打开 IRQ（PSTATE.I 清零；Hypervisor 启动时 DAIF 是全屏蔽的） */
     asm volatile("msr daifclr, #2" ::: "memory");
@@ -145,9 +178,9 @@ void guest_main(void)
      *
      * 学习要点：
      *   HCR_EL2.TWI=1，所以 WFI 会 trap 到 EL2——
-     *   Hypervisor 借机执行调度（让出 CPU），然后 PC+4 返回这里。
-     *   虚拟定时器到期时，虚拟 IRQ 信号（GIC 虚拟接口驱动）
-     *   会打断 EL1，进入 vectors.S 的 IRQ 向量。
+     *   Hypervisor 借机执行调度（让出 CPU 给其他 VM），然后
+     *   PC+4 返回这里。虚拟定时器到期时，虚拟 IRQ 信号
+     *   （GIC 虚拟接口驱动）会打断 EL1，进入 IRQ 向量。
      */
     while (1) {
         asm volatile("wfi" ::: "memory");

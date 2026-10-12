@@ -147,6 +147,21 @@ struct task_console {
 	struct fifo *out_fifo;
 };
 
+/*
+ * per-VM 虚拟化状态（virt 平台，Phase 3）
+ *
+ * GICv3 虚拟接口的 ICH_VMCR/ICH_LR 和架构虚拟定时器 CNTV 都是
+ * per-CPU 硬件资源：多个 VM 分时复用同一 CPU 时，世界切换必须
+ * 保存/恢复，否则 VM A 的状态会泄漏给 VM B。
+ */
+struct vm_virt_state {
+	unsigned long gic_vmcr;     /* ICH_VMCR_EL2（guest 的 PMR/GRPEN1 后端） */
+	unsigned long gic_lr0;      /* ICH_LR0_EL2（可能含 pending/active 的 v27） */
+	unsigned long cntv_ctl;     /* CNTV_CTL_EL0 */
+	unsigned long cntv_cval;    /* CNTV_CVAL_EL0 */
+	int vtimer_pending;         /* 延迟注入标志（leaving 时 ISTATUS=1 或 HV 期缓存） */
+};
+
 struct task_struct {
 	struct cpu_context cpu_context;
 	long state;
@@ -162,6 +177,7 @@ struct task_struct {
 	struct cpu_sysregs cpu_sysregs;
 	struct task_stat stat;
 	struct task_console console;
+	struct vm_virt_state virt; /* per-VM 虚拟化状态（Phase 3） */
 };
 
 extern void sched_init(void);
@@ -181,6 +197,7 @@ extern void show_task_list(void);
 		/* cpu_context */ { 0 }, /* state etc */ 0, 0, 1, 0, 0, 0, "", \
 			0, 0, /* mm */ { 0 }, /* cpu_sysregs */ { 0 },         \
 			/* stat */ { 0 }, /* console */ { 0 },                 \
+			/* virt */ { 0 },                                      \
 	}
 
 #endif

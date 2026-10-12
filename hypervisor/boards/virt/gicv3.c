@@ -257,10 +257,19 @@ static void gic_cpuif_init(void)
 
     /*
      * 2. 配置 ICC_CTLR
-     *    EOImode = 0（EOI 同时做 priority drop 和 deactivate）
-     *    简单模式，一步完成中断结束
+     *    EOImode = 1（split EOI 模式）
+     *      - 写 EOIR 只做 priority drop（清 APR），不 deactivate
+     *      - deactivate 需要单独写 ICC_DIR
+     *
+     * 为什么需要 split EOI：
+     *   虚拟定时器（PPI 27）使用 HW 模式 LR 注入。EL2 ack 物理 27 后，
+     *   需要保持物理中断 active 状态来屏蔽电平信号，防止 re-pend 风暴。
+     *   Guest 写虚拟 EOIR 时，硬件自动 deactivate 物理中断。
+     *   这一切只有在 split EOI 模式下才成立。
+     *
+     * 对于普通中断（如 PPI 26），处理完后手动写 ICC_DIR deactivate。
      */
-    icc_ctlr_write(0x0);
+    icc_ctlr_write(0x1 << 1);  // EOImode=1 (split EOI)
 
     /*
      * 3. 使能 Group 1 中断

@@ -37,6 +37,7 @@ typedef unsigned int u32;
 /* Hypercall 功能号（与 include/common/hvc.h 保持一致） */
 #define HVC_CONSOLE_PUTC   1
 #define HVC_GET_TIMER_FREQ 2
+#define HVC_GET_VMID       3
 
 /* ---- 内联汇编访问系统寄存器 ---- */
 
@@ -67,6 +68,7 @@ static inline void write_sysreg(u64 val, const char *name)
 
 /* 虚拟定时器寄存器（直通，不 trap） */
 #define cntvct_read()       SYSREG_READ(CNTVCT_EL0)
+#define cntv_ctl_read()     SYSREG_READ(CNTV_CTL_EL0)
 #define cntv_ctl_write(v)   SYSREG_WRITE(CNTV_CTL_EL0, v)
 #define cntv_cval_write(v)  SYSREG_WRITE(CNTV_CVAL_EL0, v)
 
@@ -96,6 +98,7 @@ static inline void hvc_putc(char c)
 
 void guest_puts(const char *s);
 u64 guest_timer_freq(void);
+u64 guest_vmid(void);
 
 /* 入口（start.S） */
 extern char vectors;

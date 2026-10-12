@@ -123,6 +123,10 @@ void handle_hvc64(unsigned long hvc_nr)
 		/* 告诉 Guest 定时器频率，避免 guest 硬编码 */
 		regs->regs[0] = get_timer_frequency();
 		break;
+	case HVC_GET_VMID:
+		/* 告诉 Guest 自己的 VM 编号（多 VM 演示用） */
+		regs->regs[0] = current->pid;
+		break;
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);

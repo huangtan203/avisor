@@ -15,6 +15,4 @@
 
 void vgic_init(void);
 void vgic_inject_virq_hw(uint32_t vintid, uint32_t pintid);
-void vgic_vtimer_defer(void);   /* HV 上下文收到 vtimer 中断：延迟注入 */
-void vgic_vtimer_flush(void);   /* 回到 Guest 前补注入缓存的 vtimer 中断 */
 uint64_t vgic_get_lr0(void);

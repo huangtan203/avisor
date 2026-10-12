@@ -124,39 +124,50 @@ void hypervisor_main()
     printf("[7] Interrupts enabled (IRQ + FIQ)\n");
 
     /*
-     * 8. 创建 Guest VM
+     * 8. 创建两个 Guest VM（Phase 3：多 VM）
      *
-     * 内嵌镜像 -> Guest IPA 0x40000000（Stage 2 按页映射到页池物理页）。
-     * 首次调度时 loader 负责拷贝，ERET 把 CPU 交给 EL1。
+     * 同一份内嵌镜像创建两个实例：
+     *   - 相同的 IPA 布局（0x40000000），但各自的 Stage 2 页表
+     *     把 IPA 映射到【不同】的物理页——内存视图完全隔离
+     *   - 各自独立的 VMID / CNTVOFF / vGIC 状态 / 虚拟定时器
+     *   - Guest 通过 HVC_GET_VMID 知道自己是几号，
+     *     vm1 用 10Hz、vm2 用 5Hz 定时器（运行时可观察独立性）
      */
-    struct embedded_binary_loader_args guest_args = {
-        .load_addr = 0x40000000,
-        .entry_point = 0x40000000,
-        .image_begin = (unsigned long)el1_test_begin,
-        .image_end = (unsigned long)el1_test_end,
-    };
-    int pid = create_task(embedded_binary_loader, &guest_args);
+    {
+        struct embedded_binary_loader_args guest_args = {
+            .load_addr = 0x40000000,
+            .entry_point = 0x40000000,
+            .image_begin = (unsigned long)el1_test_begin,
+            .image_end = (unsigned long)el1_test_end,
+        };
 
-    if (pid < 0)
-        PANIC("failed to create guest VM");
+        for (int i = 0; i < 2; i++) {
+            int pid = create_task(embedded_binary_loader, &guest_args);
 
-    /*
-     * 给 Guest 更高的调度优先级（时间片更长）。
-     *
-     * 教训：_schedule 在 counter 相同时总是选索引小的任务
-     * （init_task 是 0 号），如果 Guest 和 HV 同优先级，
-     * HV 的调度循环会反复选自己，Guest 被饿死——
-     * 表现为 vtimer 中断到达 EL2 时 current 几乎总是 HV，
-     * 注入永远无法送达 Guest。
-     */
-    task[pid]->priority = 10;
-    task[pid]->counter = 10;
+            if (pid < 0)
+                PANIC("failed to create guest VM #%d", i);
 
-    printf("[8] Guest VM created (pid=%d, entry=0x40000000, image=%lu bytes)\n",
-           pid, (unsigned long)(el1_test_end - el1_test_begin));
+            /*
+             * 给 Guest 更高的调度优先级（时间片更长）。
+             *
+             * 教训：_schedule 在 counter 相同时总是选索引小的任务
+             * （init_task 是 0 号），如果 Guest 和 HV 同优先级，
+             * HV 的调度循环会反复选自己，Guest 被饿死。
+             * （Phase 3 已加轮转指针保证 VM 间公平，
+             *   这里仍保持 VM 相对 HV 的高优先级。）
+             */
+            task[pid]->priority = 10;
+            task[pid]->counter = 10;
+
+            printf("[8.%d] Guest VM created (pid=%d, entry=0x40000000, image=%lu bytes)\n",
+                   i + 1, pid,
+                   (unsigned long)(el1_test_end - el1_test_begin));
+        }
+    }
 
     printf("\nAll core systems online. Entering scheduler loop...\n");
-    printf("Expect: guest banner, then guest heartbeat every second.\n\n");
+    printf("Expect: two guest banners, then interleaved heartbeats\n");
+    printf("(vm1 every 1s @ 10Hz timer, vm2 every 1s @ 5Hz timer).\n\n");
 
     /*
      * 9. 调度主循环（Hypervisor 的"_idle"身份）

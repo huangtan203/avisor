@@ -126,10 +126,26 @@
 #define ICH_LR_HW      (1UL << 61) /* 映射到物理中断（pINTID [41:32]） */
 #define ICH_LR_PENDING (1UL << 62) /* state: pending（state 字段 [63:62]） */
 #define ICH_LR_ACTIVE  (1UL << 63) /* state: active */
+#define ICH_LR_STATE_MASK (3UL << 62) /* state 字段整体掩码 */
 
 /* 虚拟定时器相关 */
 #define CNTVOFF_EL2  S3_4_C14_C0_3 /* 虚拟计数器偏移 */
 #define CNTHCTL_EL2  S3_4_C14_C1_0 /* EL1 访问 CNTP/CNTV 的 trap 控制 */
+
+/*
+ * EL1 视角的虚拟定时器寄存器（EL2 可直接访问 = 访问"当前加载的
+ * 那个 VM"的虚拟定时器；世界切换时用于保存/恢复 per-VM 状态）
+ */
+#define CNTV_CTL_EL0  S3_3_C14_C3_1  /* 虚拟定时器控制 */
+#define CNTV_CVAL_EL0 S3_3_C14_C3_2  /* 虚拟定时器比较值 */
+
+/* CNTV_CTL_EL0 位 */
+#define CNTV_CTL_ENABLE  (1UL << 0)
+#define CNTV_CTL_IMASK   (1UL << 1)
+#define CNTV_CTL_ISTATUS (1UL << 2)
+
+/* ICC_DIR_EL1：单独 deactivate 物理中断（需 EOImode=1 配合） */
+#define ICC_DIR_EL1 S3_0_C12_C11_1
 
 /* Flags for get_page_from_gva, gvirt_to_maddr etc */
 #define GV2M_READ  (0u<<0)
