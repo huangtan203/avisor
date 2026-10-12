@@ -222,39 +222,58 @@ int handle_mem_abort(vaddr_t addr, uint64_t esr)
 {
 	struct pt_regs *regs = task_pt_regs(current);
 	uint64_t dfsc = esr & ISS_ABORT_DFSC_MASK;
+	const struct board_ops *ops = current->board_ops;
+	vaddr_t ipa = get_ipa(addr);
 
-	if (dfsc >> 2 == 0x1) {
-		// translation fault
+	/*
+	 * 检查是否是 MMIO 地址：
+	 *   - permission fault (dfsc >> 2 == 0x3) 一定是 MMIO
+	 *   - translation fault (dfsc >> 2 == 0x1) 可能是 demand paging，
+	 *     也可能是 MMIO 区域（无映射）。用 board_ops->is_mmio_addr 判断。
+	 *
+	 * 如果是 MMIO 地址，走设备模拟路径。
+	 */
+	int is_mmio = 0;
+
+	if ((dfsc >> 2) == 0x3) {
+		/* permission fault -> 肯定是 MMIO */
+		is_mmio = 1;
+	} else if ((dfsc >> 2) == 0x1) {
+		/* translation fault -> 检查是否是 MMIO 区域 */
+		if (HAVE_FUNC(ops, is_mmio_addr) &&
+		    ops->is_mmio_addr(current, ipa))
+			is_mmio = 1;
+	}
+
+	if (is_mmio) {
+		unsigned int srt = (esr >> 16) & 0x1f;
+		unsigned int wnr = (esr >> 6) & 0x1;
+
+		if (wnr == 0) {
+			if (HAVE_FUNC(ops, mmio_read))
+				regs->regs[srt] = ops->mmio_read(current, ipa);
+		} else {
+			if (HAVE_FUNC(ops, mmio_write))
+				ops->mmio_write(current, ipa,
+						regs->regs[srt]);
+		}
+
+		increment_current_pc(4);
+		current->stat.mmio_count++;
+		return 0;
+	}
+
+	if ((dfsc >> 2) == 0x1) {
+		// translation fault -> demand paging
 		paddr_t page = get_free_page(get_page_pool());
 
 		if (page == 0) {
 			return -1;
 		}
 
-		map_stage2_page(current, get_ipa(addr) & PAGE_MASK, page,
+		map_stage2_page(current, ipa & PAGE_MASK, page,
 				MMU_STAGE2_PAGE_FLAGS);
 		current->stat.pf_count++;
-		return 0;
-	} else if (dfsc >> 2 == 0x3) {
-		// permission fault (mmio)
-		const struct board_ops *ops = current->board_ops;
-
-		//int sas = (esr >> 22) & 0x3;
-		unsigned int srt = (esr >> 16) & 0x1f;
-		unsigned int wnr = (esr >> 6) & 0x1;
-
-		if (wnr == 0) {
-			if (HAVE_FUNC(ops, mmio_read))
-				regs->regs[srt] =
-					ops->mmio_read(current, get_ipa(addr));
-		} else {
-			if (HAVE_FUNC(ops, mmio_write))
-				ops->mmio_write(current, get_ipa(addr),
-						regs->regs[srt]);
-		}
-
-		increment_current_pc(4);
-		current->stat.mmio_count++;
 		return 0;
 	}
 

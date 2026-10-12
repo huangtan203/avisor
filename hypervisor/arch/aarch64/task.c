@@ -122,6 +122,20 @@ int create_task(loader_func_t loader, void *arg)
 	task[pid] = p;
 	p->pid = pid;
 
+#ifndef PLATFORM_VIRT
+	p->board_ops = &bcm2837_board_ops;
+	if (HAVE_FUNC(p->board_ops, initialize))
+		p->board_ops->initialize(p);
+#else
+	/* virt 平台：Phase 2 的设备模型（CNTVOFF 快照等） */
+	p->board_ops = &virt_board_ops;
+	if (HAVE_FUNC(p->board_ops, initialize))
+		p->board_ops->initialize(p);
+#endif
+
+	prepare_initial_sysregs();
+	memcpy(&p->cpu_sysregs, &initial_sysregs, sizeof(struct cpu_sysregs));
+
 	init_task_console(p);
 
 	return pid;

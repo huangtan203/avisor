@@ -23,6 +23,12 @@
 
 typedef unsigned long u64;
 typedef unsigned int u32;
+typedef unsigned short u16;
+typedef unsigned char u8;
+typedef int bool;
+
+#define true  1
+#define false 0
 
 /* Guest 内存布局（IPA，Hypervisor 通过 Stage 2 映射到真实物理页） */
 #define GUEST_LOAD_ADDR  0x40000000UL /* 镜像加载/入口地址 */
@@ -97,6 +103,7 @@ static inline void hvc_putc(char c)
 }
 
 void guest_puts(const char *s);
+void guest_fatal(const char *msg, u64 esr, u64 elr);
 u64 guest_timer_freq(void);
 u64 guest_vmid(void);
 

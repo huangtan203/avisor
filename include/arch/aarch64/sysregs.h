@@ -112,6 +112,10 @@
 #define ICH_VTR_EL2  S3_4_C12_C11_6 /* 虚拟化特征（只读，LR 个数等） */
 #define ICH_VMCR_EL2 S3_4_C12_C11_7 /* 虚拟机控制（PMR/BPR/GRPEN 后端） */
 #define ICH_LR0_EL2  S3_4_C12_C12_0 /* List Register 0 */
+#define ICH_LR1_EL2  S3_4_C12_C12_1 /* List Register 1 */
+
+/* LR 数量（我们使用的数量，实际硬件可能更多） */
+#define NR_VGIC_LRS   2
 
 /* ICH_HCR_EL2 位 */
 #define ICH_HCR_EL2_EN (1 << 0) /* 使能虚拟 CPU 接口 */
