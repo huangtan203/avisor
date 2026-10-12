@@ -88,7 +88,12 @@ master:
 
 el3:
     /* 从 EL3 降到 EL2 */
-    ldr x0, =HCR_VALUE
+    /*
+     * HCR_EL2 = HCR_VALUE（sysregs.h）= 0x8027613B
+     *   VM=1, RW=1, IMO/FMO/AMO=1, HCE=1, TWI/TWE=1, TID/TACR=1
+     * 注意：gas 的 ldr= 表达式不支持 C 的 UL 后缀，这里直接用数值。
+     */
+    ldr x0, =0x8027613B
     msr hcr_el2, x0
 
     ldr x0, =SCR_VALUE

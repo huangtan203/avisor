@@ -12,6 +12,7 @@
 
 #include "common/mm.h"
 #include "common/types.h"
+#include "common/board.h"
 
 struct page_pool {
     paddr_t start_addr;
@@ -21,3 +22,6 @@ struct page_pool {
 };
 
 struct page_pool *get_virt_page_pool(void);
+
+/* virt 平台的 VM 设备模型（Phase 2） */
+extern const struct board_ops virt_board_ops;

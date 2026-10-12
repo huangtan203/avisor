@@ -30,6 +30,8 @@
  */
 #ifndef PLATFORM_VIRT
 #include "emulator/raspi/bcm2837.h"
+#else
+#include "boards/virt/virt_board.h"
 #endif
 
 int uart_forwarded_task = 0;
@@ -105,8 +107,10 @@ int create_task(loader_func_t loader, void *arg)
 	if (HAVE_FUNC(p->board_ops, initialize))
 		p->board_ops->initialize(p);
 #else
-	/* virt 平台：Phase 2 才实现设备模型，Phase 1 暂设为 NULL */
-	p->board_ops = NULL;
+	/* virt 平台：Phase 2 的设备模型（CNTVOFF 快照等） */
+	p->board_ops = &virt_board_ops;
+	if (HAVE_FUNC(p->board_ops, initialize))
+		p->board_ops->initialize(p);
 #endif
 
 	prepare_initial_sysregs();
@@ -123,22 +127,10 @@ int create_task(loader_func_t loader, void *arg)
 	return pid;
 }
 
-static void task_dbg_putc(char c)
-{
-	volatile unsigned int *uart_fr = (volatile unsigned int *)(0x09000000 + 0x18);
-	volatile unsigned int *uart_dr = (volatile unsigned int *)(0x09000000 + 0x00);
-	while (*uart_fr & (1 << 5)) { }
-	*uart_dr = c;
-}
-
 void init_task_console(struct task_struct *tsk)
 {
-	task_dbg_putc('T');
-	task_dbg_putc('0' + (unsigned long)tsk);  // 低地址字节
 	tsk->console.in_fifo = create_fifo();
-	task_dbg_putc('I');
 	tsk->console.out_fifo = create_fifo();
-	task_dbg_putc('O');
 }
 
 void flush_task_console(struct task_struct *tsk)

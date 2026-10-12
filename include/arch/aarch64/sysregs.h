@@ -28,26 +28,33 @@
 // ***************************************
 
 // trap related
-#define HCR_TACR (1 << 21)
-#define HCR_TID3 (1 << 18)
-#define HCR_TID2 (1 << 17)
-#define HCR_TID1 (1 << 16)
-#define HCR_TWE	 (1 << 14)
-#define HCR_TWI	 (1 << 13)
+#define HCR_TACR (1UL << 21)
+#define HCR_TID3 (1UL << 18)
+#define HCR_TID2 (1UL << 17)
+#define HCR_TID1 (1UL << 16)
+#define HCR_TWE	 (1UL << 14)
+#define HCR_TWI	 (1UL << 13)
+#define HCR_HCE	 (1UL << 8) // HVC instruction enable at EL1
 // others
-#define HCR_E2H	 (0 << 34)
-#define HCR_RW	 (1 << 31)
-#define HCR_TGE	 (0 << 27)
-#define HCR_AMO	 (1 << 5) // routing to EL2
-#define HCR_IMO	 (1 << 4) // routing to EL2
-#define HCR_FMO	 (1 << 3) // routing to EL2
-#define HCR_SWIO (1 << 1)
-#define HCR_VM	 (1 << 0) // stage 2 translation enable
+#define HCR_E2H	 (0UL << 34)
+#define HCR_RW	 (1UL << 31)
+#define HCR_TGE	 (0UL << 27)
+#define HCR_AMO	 (1UL << 5) // routing to EL2
+#define HCR_IMO	 (1UL << 4) // routing to EL2
+#define HCR_FMO	 (1UL << 3) // routing to EL2
+#define HCR_SWIO (1UL << 1)
+#define HCR_VM	 (1UL << 0) // stage 2 translation enable
 
+/*
+ * 注意：所有位定义必须用 1UL（无符号）。
+ * 如果用 (1 << 31)（有符号 int 负数），组合后的 HCR_VALUE 在
+ * WRITE_SYSREG64 的 uint64_t 转换中发生符号扩展，高位全变 1，
+ * 意外置位 E2H(VHE)/高位 trap 位——曾导致虚拟中断完全失灵。
+ */
 #define HCR_VALUE                                                              \
 	(HCR_TACR | HCR_TID3 | HCR_TID2 | HCR_TID1 | HCR_TWE | HCR_TWI |       \
-	 HCR_E2H | HCR_RW | HCR_TGE | HCR_AMO | HCR_IMO | HCR_FMO | HCR_SWIO | \
-	 HCR_VM)
+	 HCR_HCE | HCR_E2H | HCR_RW | HCR_TGE | HCR_AMO | HCR_IMO | HCR_FMO | \
+	 HCR_SWIO | HCR_VM)
 
 // SCR_EL3, Secure Configuration Register (EL3)
 // ***************************************
@@ -86,6 +93,43 @@
 #define VTCR_VALUE                                                       \
 	(VTCR_NSA | VTCR_NSW | VTCR_VS | VTCR_PS | VTCR_TG0 | VTCR_SH0 | \
 	 VTCR_ORGN0 | VTCR_IRGN0 | VTCR_SL0 | VTCR_T0SZ)
+
+// ***************************************
+// GICv3 虚拟化寄存器 (ICH_*_EL2)
+//
+// 学习要点：
+//   GICv3 原生支持中断虚拟化（不需要像 GICv2 那样额外配 GICH）：
+//     - 虚拟 CPU 接口：Guest 在 EL1 直接访问 ICC_*_EL1 系统寄存器，
+//       硬件自动重定向到"虚拟视图"（由 HCR_EL2.IMO/FMO 控制路由），
+//       因此 Guest 的 GICv3 驱动无需任何修改。
+//     - List Register (ICH_LR<n>_EL2)：EL2 向 Guest 注入虚拟中断的
+//       通道，一个 LR 条目代表一个虚拟中断。
+//     - ICH_VMCR_EL2：Guest 看到的 ICC_PMR/BPR/IGRPEN1 的后端。
+//   这就是 GICv3 相对 BCM2837（软件模拟中断控制器）的巨大优势。
+// ***************************************
+
+#define ICH_HCR_EL2  S3_4_C12_C11_0 /* Hypervisor 控制接口 */
+#define ICH_VTR_EL2  S3_4_C12_C11_6 /* 虚拟化特征（只读，LR 个数等） */
+#define ICH_VMCR_EL2 S3_4_C12_C11_7 /* 虚拟机控制（PMR/BPR/GRPEN 后端） */
+#define ICH_LR0_EL2  S3_4_C12_C12_0 /* List Register 0 */
+
+/* ICH_HCR_EL2 位 */
+#define ICH_HCR_EL2_EN (1 << 0) /* 使能虚拟 CPU 接口 */
+
+/* ICH_VMCR_EL2 位（Guest 视角 ICC_* 的后端，与 QEMU 编码一致） */
+#define ICH_VMCR_VENG1 (1UL << 1)  /* ICC_IGRPEN1_EL1.EnableGrp1 */
+#define ICH_VMCR_VPMR_SHIFT 24     /* ICC_PMR_EL1 在 bits[31:24] */
+
+/* ICH_LR<n>_EL2 位（与 QEMU/KVM 的编码一致） */
+#define ICH_LR_EOI     (1UL << 41) /* guest EOIR 时硬件去活对应物理中断 */
+#define ICH_LR_GROUP1  (1UL << 60) /* 虚拟中断属于 Group 1 */
+#define ICH_LR_HW      (1UL << 61) /* 映射到物理中断（pINTID [41:32]） */
+#define ICH_LR_PENDING (1UL << 62) /* state: pending（state 字段 [63:62]） */
+#define ICH_LR_ACTIVE  (1UL << 63) /* state: active */
+
+/* 虚拟定时器相关 */
+#define CNTVOFF_EL2  S3_4_C14_C0_3 /* 虚拟计数器偏移 */
+#define CNTHCTL_EL2  S3_4_C14_C1_0 /* EL1 访问 CNTP/CNTV 的 trap 控制 */
 
 /* Flags for get_page_from_gva, gvirt_to_maddr etc */
 #define GV2M_READ  (0u<<0)

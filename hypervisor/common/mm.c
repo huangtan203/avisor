@@ -9,6 +9,7 @@
 
 #include "common/mm.h"
 #include "arch/aarch64/mmu.h"
+#include "arch/aarch64/sysregs.h"
 #include "common/board.h"
 #include "common/debug.h"
 #include "common/task.h"
@@ -195,6 +196,19 @@ void map_stage2_page(struct task_struct *task, vaddr_t va, paddr_t page,
 
 paddr_t get_ipa(vaddr_t va)
 {
+	/*
+	 * 学习要点：
+	 *   Guest 的两级地址翻译是 VA --(stage1)--> IPA --(stage2)--> PA。
+	 *   stage 1 由 Guest 自己的 MMU（SCTLR_EL1.M）控制：
+	 *     - MMU 开启（如分页 OS）：用 AT 指令做硬件翻译
+	 *     - MMU 关闭（裸机 guest）：VA == IPA，直接透传
+	 *   如果不加判断，对 MMU 关闭的 guest 执行 at s1e1r 会得到
+	 *   PAR_EL1.F=1（翻译失败），IPA 计算出错。
+	 *   在 EL2 直接读 SCTLR_EL1 拿到的就是当前 VM 的实时值。
+	 */
+	if ((READ_SYSREG64(sctlr_el1) & 1) == 0)
+		return va;
+
 	paddr_t ipa = translate_el1(va);
 
 	ipa &= 0xFFFFFFFFF000;

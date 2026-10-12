@@ -10,10 +10,15 @@
 #include "common/sync_exc.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
+#include "common/hvc.h"
 #include "common/irq.h"
 #include "common/mm.h"
 #include "common/sched.h"
 #include "common/task.h"
+
+#ifdef PLATFORM_VIRT
+#include "boards/virt/arch_timer.h"
+#endif
 
 const char *sync_error_reasons[] = {
 	"Unknown reason.",
@@ -85,9 +90,44 @@ void handle_trap_wfx()
 	increment_current_pc(4);
 }
 
+/*
+ * Hypercall 处理（半虚拟化接口）
+ *
+ * 学习要点：
+ *   Guest 执行 HVC 指令陷入 EL2，x8 是功能号，x0 是参数。
+ *   Guest 的通用寄存器已经保存在异常栈帧（pt_regs）里，
+ *   修改 pt_regs->regs[] 就等于修改 Guest 恢复后的寄存器——
+ *   这是"返回值"的传递方式（类似 syscall 的返回值写回 x0）。
+ */
 void handle_hvc64(unsigned long hvc_nr)
 {
-	WARN("HVC #%d", hvc_nr);
+	struct pt_regs *regs = task_pt_regs(current);
+
+	switch (hvc_nr) {
+	case HVC_CONSOLE_PUTC: {
+		/*
+		 * Guest 控制台输出：只在每行行首打 "[vmN] " 前缀，
+		 * 避免逐字符 HVC 时前缀刷屏。
+		 */
+		static int at_line_start = 1;
+		char c = (char)(regs->regs[0] & 0xff);
+
+		if (at_line_start)
+			printf("[vm%lu] ", current->pid);
+		printf("%c", c);
+		at_line_start = (c == '\n');
+		break;
+	}
+#ifdef PLATFORM_VIRT
+	case HVC_GET_TIMER_FREQ:
+		/* 告诉 Guest 定时器频率，避免 guest 硬编码 */
+		regs->regs[0] = get_timer_frequency();
+		break;
+#endif
+	default:
+		WARN("HVC #%d", hvc_nr);
+		break;
+	}
 }
 
 void handle_trap_system(unsigned long esr)

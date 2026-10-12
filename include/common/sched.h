@@ -126,6 +126,12 @@ struct mm_struct {
 	unsigned long first_table;
 	int user_pages_count;
 	int kernel_pages_count;
+	/*
+	 * 虚拟计数器偏移（virt 平台）：
+	 * 创建 VM 时快照物理计数器，Guest 的 CNTVCT 从 0 开始。
+	 * 每次进入 VM 时由 board_ops->entering_vm 写入 CNTVOFF_EL2。
+	 */
+	unsigned long cntvoff;
 };
 
 struct task_stat {

@@ -1,9 +1,10 @@
-# aVisor Hypervisor - QEMU virt 平台 Makefile (Phase 1)
+# aVisor Hypervisor - QEMU virt 平台 Makefile (Phase 2)
 #
 # 学习要点：
 #   这个 Makefile 构建 QEMU virt 平台版本的 Hypervisor。
-#   Phase 1 只包含核心功能，没有 shell 和文件系统，
-#   目标是快速验证启动 + 串口 + 中断 + 定时器 + 调度器。
+#   Phase 2 新增：先构建 EL1 Guest 镜像（guests/el1_test），
+#   再通过 guest_image.S 的 .incbin 把它嵌入 Hypervisor 主镜像。
+#   构建顺序：guest .bin -> guest_image_s.o -> 链接 kernel8.img
 
 GNU_TOOLS ?= aarch64-linux-gnu
 GNU_GCC = $(GNU_TOOLS)-gcc
@@ -20,6 +21,10 @@ ASM_OPS = -I$(INC_DIR) -DPLATFORM_VIRT=1 -g
 
 BUILD_DIR = build_virt
 OUTDIR = bin_virt
+
+# Guest 镜像（Phase 2）
+GUEST_DIR = guests/el1_test
+GUEST_BIN = $(GUEST_DIR)/el1_test.bin
 
 # ========== 源文件列表 ==========
 
@@ -73,6 +78,19 @@ $(BUILD_DIR)/%_c.o: %.c
 $(BUILD_DIR)/%_s.o: %.S
 	mkdir -p $(dir $@)
 	$(GNU_GCC) $(ASM_OPS) -MMD -c $< -o $@
+
+# guest_image.S 特殊规则：依赖 Guest .bin，并把路径传给 .incbin
+# （-DGUEST_BIN_PATH 经 C 预处理器展开成 .incbin "..." 的操作数）
+$(BUILD_DIR)/hypervisor/common/guest_image_s.o: hypervisor/common/guest_image.S $(GUEST_BIN)
+	mkdir -p $(dir $@)
+	$(GNU_GCC) $(ASM_OPS) -DGUEST_BIN_PATH='"$(GUEST_BIN)"' -MMD -c $< -o $@
+
+# 构建 Guest 镜像（递归 make；子目录自己做增量判断）
+.PHONY: guest
+guest:
+	$(MAKE) -C $(GUEST_DIR)
+
+$(GUEST_BIN): guest
 
 OBJ_FILES = $(C_FILES:%.c=$(BUILD_DIR)/%_c.o)
 OBJ_FILES += $(ASM_FILES:%.S=$(BUILD_DIR)/%_s.o)
@@ -131,6 +149,7 @@ debug: kernel8.img
 .PHONY: clean
 clean:
 	rm -rf $(BUILD_DIR) $(OUTDIR)
+	$(MAKE) -C $(GUEST_DIR) clean
 
 # 调试用：打印变量
 .PHONY: echoes

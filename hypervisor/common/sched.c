@@ -65,6 +65,19 @@ void schedule(void)
 
 void set_cpu_virtual_interrupt(struct task_struct *tsk)
 {
+#ifdef PLATFORM_VIRT
+	/*
+	 * virt 平台（GICv3）：虚拟中断由 GIC 硬件的 List Register
+	 * （ICH_LR）注入，信号由 GIC 虚拟接口直接驱动 CPU 的 vIRQ 线。
+	 *
+	 * 注意：绝不能在这里清 HCR_EL2.VI（clear_virq）——
+	 * QEMU 中 VI 位与 GIC 虚拟接口信号共享 CPU_INTERRUPT_VIRQ，
+	 * 写 0 会连带撤销 GIC 硬件注入的 vIRQ 信号！
+	 * （raspi 的 BCM2837 无 GIC，才用 VI/VF 软件注入。）
+	 */
+	(void)tsk;
+	return;
+#else
 	if (HAVE_FUNC(tsk->board_ops, is_irq_asserted) &&
 	    tsk->board_ops->is_irq_asserted(tsk))
 		assert_virq();
@@ -76,6 +89,7 @@ void set_cpu_virtual_interrupt(struct task_struct *tsk)
 		assert_vfiq();
 	else
 		clear_vfiq();
+#endif
 }
 
 void switch_to(struct task_struct *next)
