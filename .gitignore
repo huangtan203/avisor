@@ -5,6 +5,7 @@ bin_*/
 *.elf
 *.img
 *.list
+guests/*/*.bin
 
 # Editor files
 *.swp
