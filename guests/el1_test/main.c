@@ -209,6 +209,9 @@ struct vring_used {
 };
 
 /* virtio-net 设备状态 */
+/* 每个描述符承载的数据大小（用于测试描述符链） */
+#define VIRTIO_NET_FRAG_SIZE   256
+
 struct virtio_net_drv {
     u64 base;
     int ready;
@@ -224,6 +227,7 @@ struct virtio_net_drv {
     struct vring_avail *tx_avail;
     struct vring_used *tx_used;
     u16 tx_last_used;
+    u16 tx_num_free;      /* 可用描述符计数 */
 
     /* 内存区域 (用于描述符/avail/used 环) */
     u8 *rx_mem;
@@ -348,17 +352,32 @@ static int virtio_net_init(void)
     }
     vnet.rx_last_used = 0;
 
-    /* 向 rx 队列填入空缓冲区 (用于接收) */
-    for (int i = 0; i < VRING_SIZE; i++) {
-        u8 *buf = guest_alloc(1500, 64);
-        if (!buf) break;
-        vnet.rx_desc[i].addr = (u64)buf;
-        vnet.rx_desc[i].len = 1500;
-        vnet.rx_desc[i].flags = VRING_DESC_F_WRITE;
-        vnet.rx_desc[i].next = 0;
-        vnet.rx_avail->ring[i] = i;
+    /* 向 rx 队列填入空缓冲区链
+     * 每个描述符 256 字节，每 4 个描述符组成一条链（共 1024 字节容量）
+     * 16 个描述符可以组成 4 条链，链头放入 avail 环
+     */
+    {
+        int descs_per_chain = 4;
+        int num_chains = VRING_SIZE / descs_per_chain;
+        for (int c = 0; c < num_chains; c++) {
+            int chain_start = c * descs_per_chain;
+            for (int i = 0; i < descs_per_chain; i++) {
+                int idx = chain_start + i;
+                u8 *buf = guest_alloc(VIRTIO_NET_FRAG_SIZE, 64);
+                if (!buf) break;
+                vnet.rx_desc[idx].addr = (u64)buf;
+                vnet.rx_desc[idx].len = VIRTIO_NET_FRAG_SIZE;
+                vnet.rx_desc[idx].flags = VRING_DESC_F_WRITE;
+                vnet.rx_desc[idx].next = 0;
+                if (i < descs_per_chain - 1) {
+                    vnet.rx_desc[idx].flags |= VRING_DESC_F_NEXT;
+                    vnet.rx_desc[idx].next = idx + 1;
+                }
+            }
+            vnet.rx_avail->ring[c] = (u16)chain_start;
+        }
+        vnet.rx_avail->idx = (u16)(VRING_SIZE / 4);
     }
-    vnet.rx_avail->idx = VRING_SIZE;
 
     /* 7. 初始化 tx 队列 (q1) */
     if (vring_init(base, 1, VRING_SIZE,
@@ -367,6 +386,7 @@ static int virtio_net_init(void)
         return -1;
     }
     vnet.tx_last_used = 0;
+    vnet.tx_num_free = VRING_SIZE;
 
     /* 8. 状态: DRIVER_OK */
     mmio_write32(base + VIRTIO_MMIO_STATUS,
@@ -397,98 +417,120 @@ static int virtio_net_init(void)
     return 0;
 }
 
-/* 发送一个包 (简化: 单描述符) */
+/* 回收已完成的 tx 描述符（从 used 环） */
+static void virtio_net_tx_reclaim(void)
+{
+    while (vnet.tx_used->idx != vnet.tx_last_used) {
+        u16 idx = vnet.tx_last_used % VRING_SIZE;
+        /* 我们只需要计数，链的第一个描述符就是 ring[idx].id
+           但整条链有多少个描述符呢？我们需要计算链长。
+           简化处理：每次 reclaim 时重新遍历整个链来计数。
+           更好的方式是发送时记录每条链的长度。这里简化，
+           因为 used ring 的 id 是链头，我们可以遍历整条链来计数。*/
+        u16 cur = (u16)vnet.tx_used->ring[idx].id;
+        int count = 0;
+        while (1) {
+            count++;
+            if (!(vnet.tx_desc[cur].flags & VRING_DESC_F_NEXT))
+                break;
+            cur = vnet.tx_desc[cur].next;
+        }
+        vnet.tx_num_free += count;
+        vnet.tx_last_used++;
+    }
+}
+
+/* 发送一个包（支持多描述符链）
+ * 将数据包按 VIRTIO_NET_FRAG_SIZE 拆分到多个描述符
+ * 返回 0 成功，-1 失败
+ */
 static int virtio_net_tx(const u8 *data, int len)
 {
     if (!vnet.ready)
         return -1;
 
-    /* 找一个可用 tx 描述符 */
-    static u16 tx_desc_idx = 0;
-    u16 idx = tx_desc_idx % VRING_SIZE;
+    /* 先回收已完成的描述符 */
+    virtio_net_tx_reclaim();
 
-    vnet.tx_desc[idx].addr = (u64)data;
-    vnet.tx_desc[idx].len = len;
-    vnet.tx_desc[idx].flags = 0;
-    vnet.tx_desc[idx].next = 0;
+    /* 计算需要多少个描述符 */
+    int frags_needed = (len + VIRTIO_NET_FRAG_SIZE - 1) / VIRTIO_NET_FRAG_SIZE;
+    if (frags_needed == 0)
+        frags_needed = 1;
+    if (frags_needed > vnet.tx_num_free)
+        return -1;  /* 描述符不够 */
 
-    /* 调试：写回后自己读一遍验证 */
-    volatile u64 *dbg_addr = (volatile u64 *)&vnet.tx_desc[idx].addr;
-    volatile u32 *dbg_len = (volatile u32 *)&vnet.tx_desc[idx].len;
-    guest_puts("[dbg] tx_desc[");
-    puts_dec(idx);
-    guest_puts("] self-check: addr=0x");
-    puts_hex(*dbg_addr, 16);
-    guest_puts(" len=");
-    puts_dec(*dbg_len);
-    guest_puts("\n");
+    /* 找一个起始描述符索引（简单的轮询分配）
+       因为我们通过 tx_num_free 确保有足够的空闲描述符，
+       这里直接用 avail idx 来分配 */
+    u16 head_idx = vnet.tx_avail->idx;
+    int remaining = len;
+    const u8 *p = data;
 
-    /* 调试：尝试 clean dcache 到内存 */
-    {
-        u64 line_size = 64;  /* 假设 64 字节 cache line */
-        u64 p = (u64)vnet.tx_desc & ~(line_size - 1);
-        u64 end = (u64)(vnet.tx_desc + VRING_SIZE);
-        while (p < end) {
-            asm volatile("dc cvac, %0" ::"r"(p) : "memory");
-            p += line_size;
+    for (int i = 0; i < frags_needed; i++) {
+        u16 idx = (head_idx + i) % VRING_SIZE;
+        int frag_len = remaining < VIRTIO_NET_FRAG_SIZE ? remaining : VIRTIO_NET_FRAG_SIZE;
+
+        vnet.tx_desc[idx].addr = (u64)p;
+        vnet.tx_desc[idx].len = (u32)frag_len;
+        vnet.tx_desc[idx].flags = 0;
+        vnet.tx_desc[idx].next = 0;
+
+        if (i < frags_needed - 1) {
+            vnet.tx_desc[idx].flags |= VRING_DESC_F_NEXT;
+            vnet.tx_desc[idx].next = (idx + 1) % VRING_SIZE;
         }
-        /* 也 clean avail 环 */
-        p = (u64)vnet.tx_avail & ~(line_size - 1);
-        end = (u64)((u8 *)vnet.tx_avail + 6 + 2 * VRING_SIZE + line_size);
-        while (p < end) {
-            asm volatile("dc cvac, %0" ::"r"(p) : "memory");
-            p += line_size;
-        }
-        asm volatile("dsb sy" ::: "memory");
-        guest_puts("[dbg] dcache cleaned\n");
+
+        p += frag_len;
+        remaining -= frag_len;
     }
 
-    /* 提交到 avail 环 */
-    u16 avail_idx = vnet.tx_avail->idx;
-    vnet.tx_avail->ring[avail_idx % VRING_SIZE] = idx;
-    vnet.tx_avail->idx = avail_idx + 1;
+    vnet.tx_num_free -= frags_needed;
 
-    /* 调试：读回 avail idx */
-    guest_puts("[dbg] tx_avail->idx after write = ");
-    puts_dec(vnet.tx_avail->idx);
-    guest_puts("\n");
-
-    /* 调试：clean avail ring cache */
+    /* clean dcache 确保设备能读到最新数据 */
     {
         u64 line_size = 64;
-        u64 p = (u64)vnet.tx_avail & ~(line_size - 1);
-        u64 end = (u64)((u8 *)vnet.tx_avail + 6 + 2 * VRING_SIZE + line_size);
-        while (p < end) {
-            asm volatile("dc cvac, %0" ::"r"(p) : "memory");
-            p += line_size;
+        u64 p1 = (u64)vnet.tx_desc & ~(line_size - 1);
+        u64 end = (u64)(vnet.tx_desc + VRING_SIZE);
+        while (p1 < end) {
+            asm volatile("dc cvac, %0" ::"r"(p1) : "memory");
+            p1 += line_size;
+        }
+        /* 也 clean avail 环 */
+        p1 = (u64)vnet.tx_avail & ~(line_size - 1);
+        end = (u64)((u8 *)vnet.tx_avail + 6 + 2 * VRING_SIZE + line_size);
+        while (p1 < end) {
+            asm volatile("dc cvac, %0" ::"r"(p1) : "memory");
+            p1 += line_size;
         }
         asm volatile("dsb sy" ::: "memory");
     }
 
-    /* 通知设备前再读一次 */
+    /* 提交到 avail 环：只需要写链头索引 */
+    u16 avail_idx = vnet.tx_avail->idx;
+    vnet.tx_avail->ring[avail_idx % VRING_SIZE] = head_idx % VRING_SIZE;
+    vnet.tx_avail->idx = avail_idx + 1;
+
+    /* clean avail 环 */
     {
-        volatile u64 *p = (volatile u64 *)&vnet.tx_desc[idx].addr;
-        guest_puts("[dbg] before notify: tx_desc[0].addr = 0x");
-        puts_hex(*p, 16);
-        guest_puts("\n");
+        u64 line_size = 64;
+        u64 p1 = (u64)vnet.tx_avail & ~(line_size - 1);
+        u64 end = (u64)((u8 *)vnet.tx_avail + 6 + 2 * VRING_SIZE + line_size);
+        while (p1 < end) {
+            asm volatile("dc cvac, %0" ::"r"(p1) : "memory");
+            p1 += line_size;
+        }
+        asm volatile("dsb sy" ::: "memory");
     }
 
     /* 通知设备 */
     mmio_write32(vnet.base + VIRTIO_MMIO_QUEUE_NOTIFY, 1);
 
-    /* 调试：从 mmio 返回后，再读一次 desc[0] */
-    {
-        volatile u64 *p = (volatile u64 *)&vnet.tx_desc[idx].addr;
-        guest_puts("[dbg] after notify: tx_desc[0].addr = 0x");
-        puts_hex(*p, 16);
-        guest_puts("\n");
-    }
-
-    tx_desc_idx++;
     return 0;
 }
 
-/* 检查 rx 是否有包 */
+/* 检查 rx 是否有包（支持多描述符链）
+ * 返回收到的数据包长度，0 表示没有包
+ */
 static int virtio_net_rx_poll(u8 *buf, int buf_len)
 {
     if (!vnet.ready)
@@ -497,28 +539,51 @@ static int virtio_net_rx_poll(u8 *buf, int buf_len)
     if (vnet.rx_used->idx == vnet.rx_last_used)
         return 0;
 
-    /* 取一个已用描述符 */
+    /* 取一个已用链的头描述符索引 */
     struct vring_used_elem *elem =
         &vnet.rx_used->ring[vnet.rx_last_used % VRING_SIZE];
     u16 desc_idx = (u16)elem->id;
-    int pkt_len = elem->len;
+    int total_len = elem->len;
 
-    if (pkt_len > buf_len)
-        pkt_len = buf_len;
+    int copy_len = total_len < buf_len ? total_len : buf_len;
+    int remaining = copy_len;
+    u8 *dst = buf;
+    u16 cur = desc_idx;
 
-    /* 拷贝数据 */
-    u8 *src = (u8 *)(u64)vnet.rx_desc[desc_idx].addr;
-    for (int i = 0; i < pkt_len; i++)
-        buf[i] = src[i];
+    /* 遍历描述符链，从多个描述符拼接数据 */
+    while (remaining > 0) {
+        u8 *src = (u8 *)(u64)vnet.rx_desc[cur].addr;
+        int frag_len = remaining < (int)vnet.rx_desc[cur].len ? remaining : (int)vnet.rx_desc[cur].len;
+        for (int i = 0; i < frag_len; i++)
+            dst[i] = src[i];
+        dst += frag_len;
+        remaining -= frag_len;
+
+        if (!(vnet.rx_desc[cur].flags & VRING_DESC_F_NEXT))
+            break;
+        cur = vnet.rx_desc[cur].next;
+    }
 
     vnet.rx_last_used++;
 
-    /* 归还描述符到 avail 环 */
+    /* 归还整条链到 avail 环（只需要写链头索引） */
     u16 avail_idx = vnet.rx_avail->idx;
     vnet.rx_avail->ring[avail_idx % VRING_SIZE] = desc_idx;
     vnet.rx_avail->idx = avail_idx + 1;
 
-    return pkt_len;
+    /* clean avail 环 cache */
+    {
+        u64 line_size = 64;
+        u64 p = (u64)vnet.rx_avail & ~(line_size - 1);
+        u64 end = (u64)((u8 *)vnet.rx_avail + 6 + 2 * VRING_SIZE + line_size);
+        while (p < end) {
+            asm volatile("dc cvac, %0" ::"r"(p) : "memory");
+            p += line_size;
+        }
+        asm volatile("dsb sy" ::: "memory");
+    }
+
+    return total_len;
 }
 
 /* virtio-net 中断处理 */
@@ -541,47 +606,192 @@ static void virtio_net_loopback_test(void)
 {
     guest_puts("virtio-net: starting loopback test...\n");
 
-    /* 构造测试包 */
-    u8 tx_pkt[64];
-    for (int i = 0; i < 64; i++)
-        tx_pkt[i] = (u8)(i * 2 + 1);
+    /* ===== 测试 1: 小包 64 字节（单描述符） ===== */
+    {
+        u8 tx_pkt[64];
+        for (int i = 0; i < 64; i++)
+            tx_pkt[i] = (u8)(i * 2 + 1);
 
-    /* 发送 */
-    if (virtio_net_tx(tx_pkt, 64) < 0) {
-        guest_puts("virtio-net: tx failed\n");
-        return;
-    }
+        if (virtio_net_tx(tx_pkt, 64) < 0) {
+            guest_puts("virtio-net: test1 tx failed\n");
+            return;
+        }
 
-    /* 轮询接收 (因为环回, 应该马上收到) */
-    u8 rx_pkt[64];
-    int rx_len = 0;
-    for (int i = 0; i < 1000; i++) {
-        rx_len = virtio_net_rx_poll(rx_pkt, 64);
-        if (rx_len > 0)
-            break;
-    }
+        u8 rx_pkt[64];
+        int rx_len = 0;
+        for (int i = 0; i < 10000; i++) {
+            rx_len = virtio_net_rx_poll(rx_pkt, 64);
+            if (rx_len > 0)
+                break;
+        }
 
-    if (rx_len == 0) {
-        guest_puts("virtio-net: loopback test FAILED (no rx)\n");
-        return;
-    }
+        if (rx_len == 0) {
+            guest_puts("virtio-net: test1 FAILED (no rx, 64B)\n");
+            return;
+        }
 
-    /* 验证数据 */
-    int match = 1;
-    for (int i = 0; i < 64 && i < rx_len; i++) {
-        if (rx_pkt[i] != tx_pkt[i]) {
-            match = 0;
-            break;
+        int match = 1;
+        for (int i = 0; i < 64 && i < rx_len; i++) {
+            if (rx_pkt[i] != tx_pkt[i]) {
+                match = 0;
+                break;
+            }
+        }
+
+        if (match && rx_len == 64) {
+            guest_puts("virtio-net: test1 PASSED (64 bytes, single desc)\n");
+        } else {
+            guest_puts("virtio-net: test1 FAILED (len=");
+            puts_dec(rx_len);
+            guest_puts(", data mismatch)\n");
+            return;
         }
     }
 
-    if (match && rx_len == 64) {
-        guest_puts("virtio-net: loopback test PASSED (64 bytes)\n");
-    } else {
-        guest_puts("virtio-net: loopback test FAILED (len=");
-        puts_dec(rx_len);
-        guest_puts(", data mismatch)\n");
+    /* ===== 测试 2: 大包 1024 字节（多描述符链，4 个描述符） ===== */
+    {
+        u8 tx_pkt[1024];
+        for (int i = 0; i < 1024; i++)
+            tx_pkt[i] = (u8)(i & 0xff);
+
+        guest_puts("virtio-net: test2 sending 1024 bytes (4 desc chain)...\n");
+
+        if (virtio_net_tx(tx_pkt, 1024) < 0) {
+            guest_puts("virtio-net: test2 tx failed\n");
+            return;
+        }
+
+        u8 rx_pkt[1024];
+        int rx_len = 0;
+        for (int i = 0; i < 10000; i++) {
+            rx_len = virtio_net_rx_poll(rx_pkt, 1024);
+            if (rx_len > 0)
+                break;
+        }
+
+        if (rx_len == 0) {
+            guest_puts("virtio-net: test2 FAILED (no rx, 1024B)\n");
+            return;
+        }
+
+        if (rx_len != 1024) {
+            guest_puts("virtio-net: test2 FAILED (wrong len=");
+            puts_dec(rx_len);
+            guest_puts(")\n");
+            return;
+        }
+
+        int match = 1;
+        int first_mismatch = -1;
+        for (int i = 0; i < 1024; i++) {
+            if (rx_pkt[i] != tx_pkt[i]) {
+                match = 0;
+                first_mismatch = i;
+                break;
+            }
+        }
+
+        if (match) {
+            guest_puts("virtio-net: test2 PASSED (1024 bytes, 4-desc chain)\n");
+        } else {
+            guest_puts("virtio-net: test2 FAILED (data mismatch at ");
+            puts_dec(first_mismatch);
+            guest_puts(" tx=");
+            puts_hex(tx_pkt[first_mismatch], 2);
+            guest_puts(" rx=");
+            puts_hex(rx_pkt[first_mismatch], 2);
+            guest_puts(")\n");
+            return;
+        }
     }
+
+    /* ===== 测试 3: 边界包 256 字节（刚好一个描述符） ===== */
+    {
+        u8 tx_pkt[256];
+        for (int i = 0; i < 256; i++)
+            tx_pkt[i] = (u8)(255 - i);
+
+        if (virtio_net_tx(tx_pkt, 256) < 0) {
+            guest_puts("virtio-net: test3 tx failed\n");
+            return;
+        }
+
+        u8 rx_pkt[256];
+        int rx_len = 0;
+        for (int i = 0; i < 10000; i++) {
+            rx_len = virtio_net_rx_poll(rx_pkt, 256);
+            if (rx_len > 0)
+                break;
+        }
+
+        if (rx_len == 0) {
+            guest_puts("virtio-net: test3 FAILED (no rx, 256B)\n");
+            return;
+        }
+
+        int match = 1;
+        for (int i = 0; i < 256; i++) {
+            if (rx_pkt[i] != tx_pkt[i]) {
+                match = 0;
+                break;
+            }
+        }
+
+        if (match && rx_len == 256) {
+            guest_puts("virtio-net: test3 PASSED (256 bytes, 1 desc boundary)\n");
+        } else {
+            guest_puts("virtio-net: test3 FAILED (len=");
+            puts_dec(rx_len);
+            guest_puts(", data mismatch)\n");
+            return;
+        }
+    }
+
+    /* ===== 测试 4: 边界包 257 字节（跨 2 个描述符） ===== */
+    {
+        u8 tx_pkt[257];
+        for (int i = 0; i < 257; i++)
+            tx_pkt[i] = (u8)(i * 3 + 7);
+
+        guest_puts("virtio-net: test4 sending 257 bytes (2 desc chain)...\n");
+
+        if (virtio_net_tx(tx_pkt, 257) < 0) {
+            guest_puts("virtio-net: test4 tx failed\n");
+            return;
+        }
+
+        u8 rx_pkt[257];
+        int rx_len = 0;
+        for (int i = 0; i < 10000; i++) {
+            rx_len = virtio_net_rx_poll(rx_pkt, 257);
+            if (rx_len > 0)
+                break;
+        }
+
+        if (rx_len == 0) {
+            guest_puts("virtio-net: test4 FAILED (no rx, 257B)\n");
+            return;
+        }
+
+        int match = 1;
+        for (int i = 0; i < 257; i++) {
+            if (rx_pkt[i] != tx_pkt[i]) {
+                match = 0;
+                break;
+            }
+        }
+
+        if (match && rx_len == 257) {
+            guest_puts("virtio-net: test4 PASSED (257 bytes, 2-desc chain)\n");
+        } else {
+            guest_puts("virtio-net: test4 FAILED (len=");
+            puts_dec(rx_len);
+            guest_puts(", data mismatch)\n");
+            return;
+        }
+    }
+
+    guest_puts("virtio-net: ALL loopback tests PASSED!\n");
 }
 
 /* ---------- ivshmem 驱动 ---------- */
@@ -840,6 +1050,61 @@ void guest_main(void)
     ivshmem_pingpong_test();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
+
+    while (1) {
+        asm volatile("wfi" ::: "memory");
+    }
+}
+
+/*
+ * Guest 次核入口（虚拟 SMP 的第二个 vCPU）
+ *
+ * 主核负责初始化 MMU / GIC Distributor / 设备驱动 / 运行测试；
+ * 次核只需要初始化自己的：
+ *   - MMU（开启 cache，同一个页表）
+ *   - GIC CPU interface（per-CPU）
+ *   - 虚拟定时器（per-CPU）
+ * 然后进入主循环。
+ *
+ * 注意：BSS 清零由主核负责，次核不重复清零，
+ * 否则会把主核已经初始化的数据又清零。
+ */
+void guest_secondary_main(void)
+{
+    u64 vmid = guest_vmid();
+    u64 mpidr = SYSREG_READ(mpidr_el1);
+    int cpu_id = (int)(mpidr & 0xFF);
+
+    /* 次核也需要开启 MMU（同一个页表，等值映射） */
+    mmu_init();
+
+    guest_puts("[vcpu");
+    puts_dec(cpu_id);
+    guest_puts("] guest: hello from secondary CPU (vm");
+    puts_dec(vmid);
+    guest_puts(")\n");
+
+    /* 初始化虚拟 GIC CPU interface（per-CPU） */
+    gic_vcpu_init();
+    guest_puts("[vcpu");
+    puts_dec(cpu_id);
+    guest_puts("] guest: virtual GIC CPU interface initialized\n");
+
+    /* 初始化虚拟定时器（per-CPU） */
+    vtimer_start();
+    guest_puts("[vcpu");
+    puts_dec(cpu_id);
+    guest_puts("] guest: virtual timer started\n");
+
+    /* 开中断 */
+    asm volatile("msr daifclr, #2" ::: "memory");
+    guest_puts("[vcpu");
+    puts_dec(cpu_id);
+    guest_puts("] guest: interrupts enabled\n");
+
+    guest_puts("[vcpu");
+    puts_dec(cpu_id);
+    guest_puts("] guest: entering main loop\n");
 
     while (1) {
         asm volatile("wfi" ::: "memory");

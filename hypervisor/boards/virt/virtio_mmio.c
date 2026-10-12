@@ -14,6 +14,34 @@
 #include "common/utils.h"
 
 /*
+ * SMP 自旋锁：保护 virtio 设备状态的并发访问。
+ *
+ * 同一 VM 的多个 vCPU 可能同时访问 virtio 设备（MMIO 读写），
+ * 必须串行化所有设备寄存器和 vring 的操作，避免数据竞争。
+ *
+ * 使用 ldaxr/stxr 独占指令实现 ticketless 自旋锁，
+ * 带 acquire/release 语义保证内存顺序。
+ */
+static inline void virtio_dev_lock(struct virtio_mmio_dev *dev)
+{
+    unsigned int ok;
+    asm volatile(
+        "1: ldaxr w0, [%1]\n"
+        "   cbnz w0, 1b\n"
+        "   mov  w0, #1\n"
+        "   stxr %w0, w0, [%1]\n"
+        "   cbnz %w0, 1b\n"
+        : "=&r"(ok)
+        : "r"(&dev->lock)
+        : "x0", "memory");
+}
+
+static inline void virtio_dev_unlock(struct virtio_mmio_dev *dev)
+{
+    asm volatile("stlr wzr, [%0]" ::"r"(&dev->lock) : "memory");
+}
+
+/*
  * 计算 vring 各部分大小 (legacy 布局)
  *
  * 对齐规则 (virtio spec):
@@ -100,54 +128,69 @@ void virtio_mmio_init(struct virtio_mmio_dev *dev,
 
 uint32_t virtio_mmio_read(struct virtio_mmio_dev *dev, uint32_t offset)
 {
+    uint32_t val = 0;
+
+    virtio_dev_lock(dev);
+
     switch (offset) {
     case VIRTIO_MMIO_MAGIC_VALUE:
-        return VIRTIO_MMIO_MAGIC_VAL;
+        val = VIRTIO_MMIO_MAGIC_VAL;
+        break;
 
     case VIRTIO_MMIO_VERSION:
-        return VIRTIO_MMIO_VER_VAL;
+        val = VIRTIO_MMIO_VER_VAL;
+        break;
 
     case VIRTIO_MMIO_DEVICE_ID:
-        return dev->dev_id;
+        val = dev->dev_id;
+        break;
 
     case VIRTIO_MMIO_VENDOR_ID:
-        return VIRTIO_MMIO_VENDOR_VAL;
+        val = VIRTIO_MMIO_VENDOR_VAL;
+        break;
 
     case VIRTIO_MMIO_HOST_FEATURES: {
         uint32_t sel = dev->host_features_sel;
         if (sel < 2)
-            return dev->host_features[sel];
-        return 0;
+            val = dev->host_features[sel];
+        break;
     }
 
     case VIRTIO_MMIO_QUEUE_NUM_MAX:
         if (dev->queue_sel < dev->num_queues)
-            return VIRTQUEUE_MAX_SIZE;
-        return 0;
+            val = VIRTQUEUE_MAX_SIZE;
+        break;
 
     case VIRTIO_MMIO_QUEUE_PFN:
         if (dev->queue_sel < dev->num_queues)
-            return dev->vqs[dev->queue_sel].pfn;
-        return 0;
+            val = dev->vqs[dev->queue_sel].pfn;
+        break;
 
     case VIRTIO_MMIO_INTERRUPT_STATUS:
-        return dev->irq_status;
+        val = dev->irq_status;
+        break;
 
     case VIRTIO_MMIO_STATUS:
-        return dev->status;
+        val = dev->status;
+        break;
 
     default:
         /* 设备特定配置寄存器 */
         if (offset >= VIRTIO_MMIO_DEVICE_CONFIG && dev->ops && dev->ops->read_config)
-            return dev->ops->read_config(dev, offset - VIRTIO_MMIO_DEVICE_CONFIG);
-        return 0;
+            val = dev->ops->read_config(dev, offset - VIRTIO_MMIO_DEVICE_CONFIG);
+        break;
     }
+
+    virtio_dev_unlock(dev);
+    return val;
 }
 
 /* ---------- MMIO 寄存器写 ---------- */
 
 void virtio_mmio_write(struct virtio_mmio_dev *dev, uint32_t offset, uint32_t val)
 {
+    virtio_dev_lock(dev);
+
     switch (offset) {
     case VIRTIO_MMIO_HOST_FEATURES_SEL:
         dev->host_features_sel = val;
@@ -213,6 +256,8 @@ void virtio_mmio_write(struct virtio_mmio_dev *dev, uint32_t offset, uint32_t va
             dev->ops->write_config(dev, offset - VIRTIO_MMIO_DEVICE_CONFIG, val);
         break;
     }
+
+    virtio_dev_unlock(dev);
 }
 
 /* ---------- 中断注入 ---------- */

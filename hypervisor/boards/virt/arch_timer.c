@@ -36,8 +36,9 @@
 #include "common/utils.h"
 static unsigned long timer_freq = 0;
 
-/* 全局 tick 计数（每 100Hz tick = 1 秒） */
-static volatile unsigned long hyp_tick_count = 0;
+/* 全局 tick 计数（每 100Hz tick = 1 秒）
+ * SMP：按物理核分开计数，各自每秒打一条心跳 */
+static volatile unsigned long hyp_tick_count[MAX_CPUS];
 
 /*
  * 读取计数器频率
@@ -75,6 +76,7 @@ unsigned long get_physical_timer_count(void)
 void handle_timer_irq(void)
 {
     unsigned long interval;
+    int cpu = smp_processor_id();
 
     /* 计算下一次中断的间隔（以 ticks 为单位） */
     interval = get_timer_frequency() / HYP_TIMER_HZ;
@@ -86,14 +88,15 @@ void handle_timer_irq(void)
     WRITE_SYSREG(interval, CNTHP_TVAL_EL2);
 
     /* 增加 tick 计数 */
-    hyp_tick_count++;
+    hyp_tick_count[cpu]++;
 
     /* 每秒打印一次（验证定时器中断在正常工作） */
-    if (hyp_tick_count % HYP_TIMER_HZ == 0) {
-        printf("[tick %lu] Hypervisor is alive at EL2\n", hyp_tick_count);
+    if (hyp_tick_count[cpu] % HYP_TIMER_HZ == 0) {
+        printf("[tick %lu] Hypervisor is alive at EL2 (cpu%d)\n",
+               hyp_tick_count[cpu], cpu);
     }
 
-    /* 调用调度器的 tick 函数（可能触发任务调度） */
+    /* 调度器的 tick 函数（可能触发任务调度） */
     timer_tick();
 }
 

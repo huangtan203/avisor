@@ -17,16 +17,17 @@
 
 #define NR_TASKS 64
 
-#define FIRST_TASK task[0]
-#define LAST_TASK  task[NR_TASKS - 1]
+/* SMP 支持：最大 CPU 数 */
+#define MAX_CPUS 2
 
 #define TASK_RUNNING 0
 #define TASK_ZOMBIE  1
 
+/* task_struct::flags：镜像加载完成（Stage 2 页表就绪）
+ * 共享页表的次级 vCPU 依赖此标志判断主 vCPU 是否加载完毕 */
+#define TASK_MM_READY 0x1
+
 struct board_ops;
-extern struct task_struct *current;
-extern struct task_struct *task[NR_TASKS];
-extern int nr_tasks;
 
 struct cpu_context {
 	unsigned long x19;
@@ -169,7 +170,8 @@ struct task_struct {
 	long counter;
 	long priority;
 	long preempt_count;
-	long pid; // used as VMID
+	long pid; // per-CPU 任务表内的索引
+	unsigned long vmid; // 全局 VMID（同一 VM 的多个 vCPU 共享，用于 VTTBR/TLB）
 	unsigned long flags;
 	char name[36];
 	const struct board_ops *board_ops;
@@ -179,9 +181,75 @@ struct task_struct {
 	struct task_stat stat;
 	struct task_console console;
 	struct vm_virt_state virt; /* per-VM 虚拟化状态（Phase 3） */
+    int vcpu_id;    /* 虚拟 CPU ID（SMP VM 的第几个 vCPU） */
+    int phys_cpu;   /* 绑定的物理 CPU ID */
 };
 
+/* per-CPU 调度器状态
+ * 每个物理核有自己的 current / task 表 / nr_tasks / rr_start
+ * 任务不跨核迁移，VM 的 vCPU 绑定到固定物理核
+ *
+ * 注意：必须定义在 task_struct 之后（含完整结构体字段 init_task）
+ */
+struct cpu_sched_state {
+    struct task_struct *curr;  /* 当前运行的任务（避免和 current 宏名冲突） */
+    struct task_struct *task[NR_TASKS];
+    int nr_tasks;
+    int rr_start;       /* 轮转调度起点 */
+    struct task_struct init_task;  /* 本核的 idle 任务 */
+};
+
+extern struct cpu_sched_state cpu_state[MAX_CPUS];
+
+/* 获取当前 CPU ID（读 MPIDR 的 aff0 字段）
+ *
+ * 注意：用宏而不是 inline 函数，避免某些编译器对 asm volatile
+ * 的优化导致返回值不正确。MPIDR_EL1 的 aff0 字段即 CPU ID。
+ */
+#define smp_processor_id() ({                              \
+    unsigned long __mpidr;                                 \
+    asm volatile("mrs %0, mpidr_el1" : "=r"(__mpidr));    \
+    (int)(__mpidr & 0xFF);                                 \
+})
+
+/*
+ * 当前核的 current 指针（宏：便于替换为 per-CPU 版本）
+ *
+ * 注意：不要用 `task` 或 `nr_tasks` 作为宏名——它们和代码中
+ * 大量的函数参数名 / 局部变量名冲突（C 预处理器会全部替换）。
+ * 需要访问 per-CPU 任务表时，直接写 cpu_state[smp_processor_id()].task
+ * 或用下面的 get_cpu_tasks() / get_cpu_nr_tasks() 内联函数。
+ */
+#define current  (cpu_state[smp_processor_id()].curr)
+
+static inline struct task_struct **get_cpu_tasks(void)
+{
+    return cpu_state[smp_processor_id()].task;
+}
+
+static inline int get_cpu_nr_tasks(void)
+{
+    return cpu_state[smp_processor_id()].nr_tasks;
+}
+
+/* 为了减少代码改动量，保留 task / nr_tasks 作为 get_cpu_tasks()/get_cpu_nr_tasks()
+ * 的别名，但只能在不会和标识符冲突的上下文中使用（如 .c 文件里）。
+ *
+ * 实际上由于很多函数参数名就是 `task`，我们不用宏，而是在每个 .c 文件
+ * 开头用局部的 #define 或者直接写 cpu_state[...] 形式。
+ *
+ * 为了最小化改动，这里还是提供两个宏，但文件名/参数名中含 `task` 的
+ * 会有问题——我们在那些文件里手动改用 cpu_state[...]。
+ */
+#define CPU_TASK_TABLE   (cpu_state[smp_processor_id()].task)
+#define CPU_NR_TASKS     (cpu_state[smp_processor_id()].nr_tasks)
+
+#define FIRST_TASK CPU_TASK_TABLE[0]
+#define LAST_TASK  CPU_TASK_TABLE[NR_TASKS - 1]
+
 extern void sched_init(void);
+extern void sched_init_primary(void);
+extern void sched_init_secondary(int cpu);
 extern void schedule(void);
 extern void timer_tick(void);
 extern void preempt_disable(void);
@@ -195,10 +263,11 @@ extern void show_task_list(void);
 
 #define INIT_TASK                                                              \
 	{                                                                      \
-		/* cpu_context */ { 0 }, /* state etc */ 0, 0, 1, 0, 0, 0, "", \
-			0, 0, /* mm */ { 0 }, /* cpu_sysregs */ { 0 },         \
+		/* cpu_context */ { 0 }, /* state etc */ 0, 0, 1, 0, 0,        \
+			/* vmid */ 0, /* flags */ 0, "", 0, 0,                 \
+			/* mm */ { 0 }, /* cpu_sysregs */ { 0 },               \
 			/* stat */ { 0 }, /* console */ { 0 },                 \
-			/* virt */ { 0 },                                      \
+			/* virt */ { 0 }, /* vcpu_id */ 0, /* phys_cpu */ 0,   \
 	}
 
 #endif

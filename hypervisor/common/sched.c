@@ -16,39 +16,61 @@
 #include "common/utils.h"
 
 static struct task_struct init_task = INIT_TASK;
-struct task_struct *current = &(init_task);
+struct cpu_sched_state cpu_state[MAX_CPUS];
 
-struct task_struct *task[NR_TASKS] = {
-	&(init_task),
-};
+/* 初始化 CPU0 的调度器状态（在 hypervisor_main 早期调用） */
+void sched_init_primary(void)
+{
+    int cpu = 0;
+    cpu_state[cpu].curr = &cpu_state[cpu].init_task;
+    cpu_state[cpu].init_task = init_task;  /* 拷贝初始值 */
+    cpu_state[cpu].task[0] = &cpu_state[cpu].init_task;
+    cpu_state[cpu].nr_tasks = 1;
+    cpu_state[cpu].rr_start = 0;
 
-int nr_tasks = 1;
+    /*
+     * 预先初始化所有其他 CPU 的调度器基础状态（idle task + nr_tasks=1）。
+     * 这样主核可以在次核启动之前就把任务创建到对应 CPU 的任务表上
+     * （pid 从 1 开始分配，task[0] 始终是 idle task）。
+     *
+     * 次核启动后调用 sched_init_secondary() 只会设置 curr 指针，
+     * 不会修改 task[] 和 nr_tasks（任务已经在那了）。
+     */
+    for (int i = 1; i < MAX_CPUS; i++) {
+        cpu_state[i].init_task = (struct task_struct)INIT_TASK;
+        cpu_state[i].task[0] = &cpu_state[i].init_task;
+        cpu_state[i].nr_tasks = 1;
+        cpu_state[i].rr_start = 0;
+        cpu_state[i].curr = NULL;  /* 次核启动后才设置 */
+    }
+}
+
+/* 初始化次核的调度器状态（在次核入口调用）
+ *
+ * 注意：task[] 和 nr_tasks 已经由主核的 sched_init_primary() 预初始化了
+ * （主核在次核启动前就可能在该核上创建任务）。这里只设置 curr 指针
+ * 和 rr_start，确保次核从 idle task 开始调度。
+ */
+void sched_init_secondary(int cpu)
+{
+    cpu_state[cpu].curr = &cpu_state[cpu].init_task;
+    cpu_state[cpu].rr_start = 0;
+}
 
 void _schedule(void)
 {
 	int next, c;
-
 	struct task_struct *p;
-
-	/*
-	 * 轮转起点（Phase 3 调度公平性修复）：
-	 *
-	 * 原实现按固定索引 0,1,2... 扫描，counter 相同时永远选
-	 * 索引小的任务（init_task 是 0 号）——多个 VM 同优先级时，
-	 * 重算 counter 后总是同一个 VM 先跑，产生系统性偏置。
-	 *
-	 * 修复：扫描从"上次选中任务的下一个"开始，相同 counter 时
-	 * 轮流胜出，实现真正的轮转公平。
-	 */
-	static int rr_start = 0;
+    int cpu = smp_processor_id();
+    int *rr_start = &cpu_state[cpu].rr_start;
 
 	while (1) {
 		c = -1;
 		next = 0;
 
 		for (int i = 0; i < NR_TASKS; i++) {
-			int idx = (rr_start + i) % NR_TASKS;
-			p = task[idx];
+			int idx = (*rr_start + i) % NR_TASKS;
+			p = cpu_state[cpu].task[idx];
 
 			if (p && p->state == TASK_RUNNING && p->counter > c) {
 				c = p->counter;
@@ -60,7 +82,7 @@ void _schedule(void)
 			break;
 
 		for (int i = 0; i < NR_TASKS; i++) {
-			p = task[i];
+			p = cpu_state[cpu].task[i];
 
 			if (p)
 				p->counter = (p->counter >> 1) + p->priority;
@@ -68,9 +90,9 @@ void _schedule(void)
 	}
 
 	/* 下次扫描从本次选中者的下一个任务开始 */
-	rr_start = (next + 1) % NR_TASKS;
+	*rr_start = (next + 1) % NR_TASKS;
 
-	switch_to(task[next]);
+	switch_to(cpu_state[cpu].task[next]);
 }
 
 void schedule(void)
@@ -145,9 +167,10 @@ void timer_tick()
 
 void exit_task()
 {
+    int cpu = smp_processor_id();
 	for (int i = 0; i < NR_TASKS; i++) {
-		if (task[i] == current) {
-			task[i]->state = TASK_ZOMBIE;
+		if (cpu_state[cpu].task[i] == current) {
+			cpu_state[cpu].task[i]->state = TASK_ZOMBIE;
 			break;
 		}
 	}
@@ -165,16 +188,23 @@ void set_cpu_sysregs(struct task_struct *tsk)
 	 * VMID 复用时旧条目必然错误。切换前保守失效当前 VMID 的
 	 * 全部 EL1 翻译条目（tlbi vmalle1 失效的是"当前 VTTBR 的
 	 * VMID"——此时 VTTBR 还未切换，清的正是即将离开的 VM）。
+	 *
+	 * SMP：last_vmid 必须按物理核分开记录——两个核各自维护
+	 * 自己的 TLB/上一次加载的 VMID，共享一个变量会导致某个核
+	 * 误判"VMID 没变"而跳过 TLB 失效（内存隔离被破坏）。
 	 */
-	static unsigned long last_vmid = ~0UL;
+	static unsigned long last_vmid[MAX_CPUS] = {
+		[0 ... MAX_CPUS - 1] = ~0UL,
+	};
+	int cpu = smp_processor_id();
 
-	if ((unsigned long)tsk->pid != last_vmid) {
+	if (tsk->vmid != last_vmid[cpu]) {
 		asm volatile("tlbi vmalle1" ::: "memory");
 		asm volatile("dsb ish" ::: "memory");
-		last_vmid = (unsigned long)tsk->pid;
+		last_vmid[cpu] = tsk->vmid;
 	}
 
-	set_stage2_pgd(tsk->mm.first_table, tsk->pid);
+	set_stage2_pgd(tsk->mm.first_table, tsk->vmid);
 	restore_sysregs(&tsk->cpu_sysregs);
 }
 
@@ -208,12 +238,13 @@ const char *task_state_str[] = {
 
 void show_task_list(void)
 {
+    int cpu = smp_processor_id();
 	printf("%3s %12s %8s %7s %8s %7s %7s %7s %7s %7s\n", "id", "name",
 	       "state", "pages", "saved-pc", "wfx", "hvc", "sysreg", "pf",
 	       "mmio");
 
-	for (int i = 0; i < nr_tasks; i++) {
-		struct task_struct *tsk = task[i];
+	for (int i = 0; i < cpu_state[cpu].nr_tasks; i++) {
+		struct task_struct *tsk = cpu_state[cpu].task[i];
 		printf("%3d %12s %8s %7d %8x %7d %7d %7d %7d %7d\n", tsk->pid,
 		       tsk->name ? tsk->name : "", task_state_str[tsk->state],
 		       tsk->mm.user_pages_count, task_pt_regs(tsk)->pc,

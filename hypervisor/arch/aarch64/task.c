@@ -55,6 +55,14 @@ static void prepare_task(loader_func_t loader, void *arg)
 	if (loader(arg, regs) < 0)
 		PANIC("failed to load");
 
+	/*
+	 * 标记镜像加载完成（Stage 2 页表就绪）。
+	 * 共享同一 VM 页表的次级 vCPU（shared_vm_loader）在
+	 * 自旋等待此标志——必须带 barrier 保证页表写入先于标志可见。
+	 */
+	current->flags |= TASK_MM_READY;
+	asm volatile("dmb ish" ::: "memory");
+
 	set_cpu_sysregs(current);
 
 	INFO("loaded");
@@ -85,6 +93,16 @@ void increment_current_pc(int ilen)
 
 int create_task(loader_func_t loader, void *arg)
 {
+	/* 默认创建在当前 CPU 上 */
+	return create_task_on_cpu(smp_processor_id(), loader, arg);
+}
+
+/* 全局 VMID 分配器（同一 VM 的多个 vCPU 共享一个 vmid） */
+static unsigned long next_vmid = 1;
+
+/* 在指定 CPU 上创建任务（用于 SMP 场景） */
+int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
+{
 	struct task_struct *p;
 
 	p = (struct task_struct *)allocate_page();
@@ -97,44 +115,41 @@ int create_task(loader_func_t loader, void *arg)
 	p->cpu_context.x20 = (unsigned long)loader;
 	p->cpu_context.x21 = (unsigned long)arg;
 	p->flags = 0;
-	p->priority = current->priority;
+	p->priority = 1;  /* 默认优先级，和 idle task 一致 */
 	p->state = TASK_RUNNING;
 	p->counter = p->priority;
+	p->vmid = next_vmid++;  /* 全局唯一；多 vCPU VM 由调用方覆盖为相同值 */
+	p->vcpu_id = 0;
+	p->phys_cpu = cpu;
 	(void)strncpy(p->name, "VM", 36);
 
-#ifndef PLATFORM_VIRT
-	p->board_ops = &bcm2837_board_ops;
+#ifdef PLATFORM_VIRT
+	p->board_ops = &virt_board_ops;
 	if (HAVE_FUNC(p->board_ops, initialize))
 		p->board_ops->initialize(p);
 #else
-	/* virt 平台：Phase 2 的设备模型（CNTVOFF 快照等） */
-	p->board_ops = &virt_board_ops;
+	p->board_ops = &bcm2837_board_ops;
 	if (HAVE_FUNC(p->board_ops, initialize))
 		p->board_ops->initialize(p);
 #endif
 
 	prepare_initial_sysregs();
 	memcpy(&p->cpu_sysregs, &initial_sysregs, sizeof(struct cpu_sysregs));
+
+	/*
+	 * 设置虚拟 MPIDR（Guest 读 mpidr_el1 时返回这个值）。
+	 * 虚拟 SMP 的不同 vCPU 需要不同的 MPIDR，Guest 借此
+	 * 区分自己是第几个 vCPU。aff0 字段 = vcpu_id。
+	 */
+	p->cpu_sysregs.mpidr_el1 = (unsigned long)p->vcpu_id;
 
 	p->cpu_context.pc = (unsigned long)switch_from_kthread;
 	p->cpu_context.sp = (unsigned long)childregs;
-	int pid = nr_tasks++;
-	task[pid] = p;
-	p->pid = pid;
 
-#ifndef PLATFORM_VIRT
-	p->board_ops = &bcm2837_board_ops;
-	if (HAVE_FUNC(p->board_ops, initialize))
-		p->board_ops->initialize(p);
-#else
-	/* virt 平台：Phase 2 的设备模型（CNTVOFF 快照等） */
-	p->board_ops = &virt_board_ops;
-	if (HAVE_FUNC(p->board_ops, initialize))
-		p->board_ops->initialize(p);
-#endif
-
-	prepare_initial_sysregs();
-	memcpy(&p->cpu_sysregs, &initial_sysregs, sizeof(struct cpu_sysregs));
+	/* 添加到指定 CPU 的任务表 */
+	int pid = cpu_state[cpu].nr_tasks++;
+	cpu_state[cpu].task[pid] = p;
+	p->pid = pid;  /* pid 是 per-CPU 的，多核间可能重复 */
 
 	init_task_console(p);
 
@@ -158,5 +173,6 @@ void flush_task_console(struct task_struct *tsk)
 
 void init_initial_task()
 {
-	(void)strncpy(task[0]->name, "HV", 36);
+    int cpu = smp_processor_id();
+	(void)strncpy(cpu_state[cpu].task[0]->name, "HV", 36);
 }

@@ -142,6 +142,7 @@
 
 /* 函数声明 */
 void gic_init(void);
+void gic_init_secondary(void);
 void gic_enable_irq(unsigned int irq);
 void gic_disable_irq(unsigned int irq);
 void gic_set_priority(unsigned int irq, unsigned int priority);

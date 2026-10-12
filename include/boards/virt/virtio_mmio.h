@@ -140,6 +140,11 @@ struct virtio_mmio_dev {
 
     /* 所属 VM */
     struct task_struct *vm;
+
+    /* SMP 锁：保护整个设备状态的并发访问
+     * 同一 VM 的多个 vCPU 可能同时访问 virtio 设备，
+     * 必须串行化 MMIO 读写和队列操作。 */
+    volatile unsigned int lock;
 };
 
 /* ---------- 通用 virtio MMIO 接口 ---------- */

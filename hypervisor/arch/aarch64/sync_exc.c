@@ -113,7 +113,7 @@ void handle_hvc64(unsigned long hvc_nr)
 		char c = (char)(regs->regs[0] & 0xff);
 
 		if (at_line_start)
-			printf("[vm%lu] ", current->pid);
+			printf("[vm%lu] ", current->vmid);
 		printf("%c", c);
 		at_line_start = (c == '\n');
 		break;
@@ -124,8 +124,9 @@ void handle_hvc64(unsigned long hvc_nr)
 		regs->regs[0] = get_timer_frequency();
 		break;
 	case HVC_GET_VMID:
-		/* 告诉 Guest 自己的 VM 编号（多 VM 演示用） */
-		regs->regs[0] = current->pid;
+		/* 告诉 Guest 自己的 VM 编号（多 VM 演示用）
+		 * 用全局 vmid：虚拟 SMP 的多个 vCPU 返回相同编号 */
+		regs->regs[0] = current->vmid;
 		break;
 #endif
 	default:
@@ -174,6 +175,14 @@ void handle_trap_system(unsigned long esr)
 		DEFINE_SYSREG_MSR(csselr_el1, 1, 0, 0, 0);
 	} else if ((op0 & 2) && dir == 1) {
 		DEFINE_SYSREG_MRS(actlr_el1, 0, 1, 0, 1);
+		/*
+		 * MPIDR_EL1 (S3_0_C0_C0_5)：虚拟 SMP 的 vCPU 身份。
+		 *
+		 * HCR.TID1=1 使 guest 读 MPIDR 陷入 EL2。每个 vCPU 的
+		 * 身份保存在 cpu_sysregs.mpidr_el1（创建任务时按
+		 * vcpu_id 设置），guest 借此区分主/次 vCPU。
+		 */
+		DEFINE_SYSREG_MRS(mpidr_el1, 0, 0, 0, 5);
 		DEFINE_SYSREG_MRS(id_pfr0_el1, 0, 0, 1, 0);
 		DEFINE_SYSREG_MRS(id_pfr1_el1, 0, 0, 1, 1);
 		DEFINE_SYSREG_MRS(id_mmfr0_el1, 0, 0, 1, 4);

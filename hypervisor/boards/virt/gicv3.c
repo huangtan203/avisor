@@ -26,6 +26,7 @@
 #include "boards/virt/gicv3.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
+#include "common/sched.h"
 #include "common/utils.h"
 
 /*
@@ -175,11 +176,11 @@ static void gicd_init(void)
 }
 
 /*
- * GICv3 Redistributor 初始化（当前 CPU 的）
+ * GICv3 Redistributor 初始化（指定 CPU 的）
  */
-static void gicr_init(void)
+static void gicr_init(int cpu_id)
 {
-    uint64_t gicr_base = gic_get_redist_base(0);  /* CPU0 */
+    uint64_t gicr_base = gic_get_redist_base(cpu_id);
     uint64_t sgi_base = gicr_base + GICR_SGI_BASE;
 
     /*
@@ -284,28 +285,44 @@ static void gic_cpuif_init(void)
 }
 
 /*
- * GICv3 总初始化入口
+ * GICv3 总初始化入口（主核 CPU0：Distributor + 本核 Redistributor + CPU 接口）
  */
 void gic_init(void)
 {
     gicd_init();   /* Distributor */
-    gicr_init();   /* Redistributor (CPU0) */
+    gicr_init(0);  /* Redistributor (CPU0) */
     gic_cpuif_init(); /* CPU Interface */
 
     INFO("GICv3 initialized.");
 }
 
 /*
+ * GICv3 次核初始化（SMP）
+ *
+ * Distributor 是全局共享的（gic_init 已配置），
+ * 次核只需要初始化自己的 Redistributor 和 CPU Interface。
+ * 必须在次核上下文中调用（访问本核的系统寄存器）。
+ */
+void gic_init_secondary(void)
+{
+    gicr_init(smp_processor_id());
+    gic_cpuif_init();
+
+    INFO("GICv3 secondary CPU%d initialized.", smp_processor_id());
+}
+
+/*
  * 使能一个中断
  *
- * 对于 SGI/PPI (0-31)，操作 Redistributor 的寄存器
+ * 对于 SGI/PPI (0-31)，操作【当前 CPU】的 Redistributor
  * 对于 SPI (>=32)，操作 Distributor 的寄存器
  */
 void gic_enable_irq(unsigned int irq)
 {
     if (irq < 32) {
         /* SGI or PPI: 操作当前 CPU 的 Redistributor */
-        uint64_t sgi_base = gic_get_redist_base(0) + GICR_SGI_BASE;
+        uint64_t sgi_base =
+            gic_get_redist_base(smp_processor_id()) + GICR_SGI_BASE;
         put32(sgi_base + GICR_ISENABLER0, 1 << irq);
     } else {
         /* SPI: 操作 Distributor */
@@ -321,7 +338,8 @@ void gic_enable_irq(unsigned int irq)
 void gic_disable_irq(unsigned int irq)
 {
     if (irq < 32) {
-        uint64_t sgi_base = gic_get_redist_base(0) + GICR_SGI_BASE;
+        uint64_t sgi_base =
+            gic_get_redist_base(smp_processor_id()) + GICR_SGI_BASE;
         put32(sgi_base + GICR_ICENABLER0, 1 << irq);
     } else {
         unsigned int reg_idx = irq / 32;

@@ -44,9 +44,45 @@ static inline struct page_pool *get_page_pool(void)
 paddr_t get_free_page(struct page_pool *pool);
 void free_page(struct page_pool *pool, paddr_t p);
 
+/*
+ * 页池自旋锁（SMP）
+ *
+ * 两个物理核可能并发进入 demand paging（各自的缺页异常都会
+ * 调 allocate_task_page），不锁住的扫描/置位 memap 会把同一
+ * 物理页发给两个 VM——内存隔离直接被破坏。
+ *
+ * 中断路径不会分配页面，锁内无需关中断。
+ */
+static volatile unsigned int page_pool_lock = 0;
+
+static inline void page_pool_lock_acquire(void)
+{
+	unsigned int ok;
+
+	asm volatile(
+		"1: ldaxr w0, [%1]\n"
+		"   cbnz w0, 1b\n"       /* 已锁：自旋等释放 */
+		"   mov  w0, #1\n"
+		"   stxr %w0, w0, [%1]\n" /* 独占写 1，状态写入 %0 */
+		"   cbnz %w0, 1b\n"      /* 独占失败：重试 */
+		: "=&r"(ok)
+		: "r"(&page_pool_lock)
+		: "x0", "memory");
+}
+
+static inline void page_pool_lock_release(void)
+{
+	/* stlr 带 release 语义，保证锁内写入先于解锁可见 */
+	asm volatile("stlr wzr, [%0]" ::"r"(&page_pool_lock) : "memory");
+}
+
 void *allocate_page()
 {
-	paddr_t page = get_free_page(get_page_pool());
+	paddr_t page;
+
+	page_pool_lock_acquire();
+	page = get_free_page(get_page_pool());
+	page_pool_lock_release();
 
 	if (page == 0) {
 		return 0;
@@ -57,12 +93,18 @@ void *allocate_page()
 
 void deallocate_page(void *page)
 {
+	page_pool_lock_acquire();
 	free_page(get_page_pool(), TO_PADDR(page));
+	page_pool_lock_release();
 }
 
 void *allocate_task_page(struct task_struct *task, vaddr_t va)
 {
-	paddr_t page = get_free_page(get_page_pool());
+	paddr_t page;
+
+	page_pool_lock_acquire();
+	page = get_free_page(get_page_pool());
+	page_pool_lock_release();
 
 	if (page == 0) {
 		return 0;

@@ -25,3 +25,6 @@ struct page_pool *get_virt_page_pool(void);
 
 /* virt 平台的 VM 设备模型（Phase 2） */
 extern const struct board_ops virt_board_ops;
+
+/* 次级 vCPU 挂接主 vCPU 的设备数据（虚拟 SMP） */
+void virt_attach_secondary(struct task_struct *tsk, struct task_struct *master);

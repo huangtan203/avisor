@@ -18,11 +18,13 @@
  */
 
 #include "common/mm.h"
+#include "common/printf.h"
 #include "common/sched.h"
 #include "common/task.h"
 #include "common/utils.h"
 
 #include "boards/virt/guest_loader.h"
+#include "boards/virt/virt_board.h"
 
 /* 内嵌 Guest 镜像的边界（guest_image.S 中定义） */
 extern char el1_test_begin[];
@@ -70,6 +72,44 @@ int embedded_binary_loader(void *arg, struct pt_regs *regs)
 	 * sp 不在这里设置：kernel_exit 不会恢复 pt_regs.sp，
 	 * Guest 的 start.S 会自己设栈（GUEST_STACK_TOP）。
 	 */
+	regs->sp = 0;
+
+	return 0;
+}
+
+/*
+ * 共享 VM 页表的次级 vCPU 加载器（虚拟 SMP 的第二个 vCPU）
+ *
+ * 学习要点：
+ *   一个虚拟多核 VM 的所有 vCPU 必须看到同一块内存：
+ *     - 同一份 Stage 2 页表（mm.first_table 指向同一物理页）
+ *     - 同一个 VMID（VTTBR/TLB 标签）
+ *     - 同一个 CNTVOFF 基准（虚拟时间一致）
+ *
+ *   镜像本身由主 vCPU 的 embedded_binary_loader 拷贝一次；
+ *   次级 vCPU 只需要"挂接"到同一份页表并从同一入口启动。
+ *
+ *   同步：主 vCPU 的加载是惰性的（首次被调度时才执行），
+ *   这里自旋等待主 vCPU 置起 TASK_MM_READY 标志。
+ *   两个核各自独立调度，主 vCPU 的加载一定会完成，不会死锁。
+ */
+int shared_vm_loader(void *arg, struct pt_regs *regs)
+{
+	struct shared_vm_loader_args *args = arg;
+	struct task_struct *volatile master = args->master;
+
+	/* 等待主 vCPU 完成镜像加载（Stage 2 页表就绪） */
+	while (!(master->flags & TASK_MM_READY))
+		asm volatile("yield" ::: "memory");
+
+	/* 挂接到同一份 Stage 2 页表 + 设备模型 + 时间基准 */
+	current->mm = master->mm;
+	virt_attach_secondary(current, master);
+
+	(void)strncpy(current->name, "el1_test", 36);
+
+	/* 和主 vCPU 相同的入口：guest start.S 里按 MPIDR 分流 */
+	regs->pc = args->entry_point;
 	regs->sp = 0;
 
 	return 0;

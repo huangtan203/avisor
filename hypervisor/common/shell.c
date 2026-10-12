@@ -476,7 +476,7 @@ static int32_t shell_cmd_vmc(int32_t argc, char **argv)
 	if (tsk_id == 0)
 		return 0;
 
-	if (tsk_id > nr_tasks - 1)
+	if (tsk_id > (int)CPU_NR_TASKS - 1)
 		return -EINVAL;
 
 	/* Output that switching to Service VM shell */
@@ -485,7 +485,7 @@ static int32_t shell_cmd_vmc(int32_t argc, char **argv)
 	shell_puts(temp_str);
 
 	uart_forwarded_task = tsk_id;
-	tsk = task[uart_forwarded_task];
+	tsk = CPU_TASK_TABLE[uart_forwarded_task];
 	flush_task_console(tsk);
 	if (tsk->state == TASK_RUNNING)
 		flush_task_console(tsk);

@@ -385,7 +385,7 @@ static void virt_initialize(struct task_struct *tsk)
     memzero(devs, sizeof(*devs));
     tsk->board_data = devs;
 
-    int vmid = (int)tsk->pid;
+    int vmid = (int)tsk->vmid;
 
     /* 初始化 virtio-net 设备 */
     init_virtio_net_device(devs, tsk, vmid);
@@ -405,6 +405,29 @@ static void virt_initialize(struct task_struct *tsk)
     ivshmem_init(&devs->ivshmem, tsk, peer_id,
                  ivshmem_shmem_pa, VIRTIO_IVSHMEM_MEM_SIZE,
                  VIRTIO_IVSHMEM_REG_BASE, VIRTIO_IVSHMEM_MEM_BASE);
+}
+
+/*
+ * 次级 vCPU 挂接到主 vCPU 的设备数据（虚拟 SMP）
+ *
+ * 一个虚拟多核 VM 的所有 vCPU 共享：
+ *   - 同一份设备模型（virtio-net、ivshmem 是 VM 级别的，不是 vCPU 级别的）
+ *   - 同一个 CNTVOFF 基准（虚拟时间一致）
+ *   - 各自独立的 vGIC CPU 接口 / vtimer 状态（这些是 per-vCPU 的）
+ */
+void virt_attach_secondary(struct task_struct *tsk, struct task_struct *master)
+{
+    /* 共享主 vCPU 的设备模型（virtio-net、ivshmem 等 VM 级别状态） */
+    tsk->board_data = master->board_data;
+
+    /* 同一个虚拟时间基准 */
+    tsk->mm.cntvoff = master->mm.cntvoff;
+
+    /* vGIC CPU 接口是 per-vCPU 的，独立初始化 */
+    tsk->virt.gic_vmcr = (0xF8UL << ICH_VMCR_VPMR_SHIFT) | ICH_VMCR_VENG1;
+    tsk->virt.vtimer_pending = 0;
+    tsk->virt.cntv_cval = 0;
+    tsk->virt.cntv_ctl = 0;
 }
 
 /* ---------- 世界切换 ---------- */

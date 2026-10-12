@@ -53,13 +53,107 @@
 
 .section ".text.boot"
 .globl _start
+
+/* C 语言中定义的 SMP 启动标志 */
+.extern smp_boot_flag
+
 _start:
     mrs x0, mpidr_el1
     /* Check processor id */
     and x0, x0, #0xFF
-    /* Hang for all non-primary CPU */
+    /* 主核走 master 路径，次核走 secondary 路径 */
     cbz x0, master
+    b secondary_entry
+
+/*
+ * 次核启动入口
+ * 次核也需要判断 EL 级别，降到 EL2，然后等待主核的启动信号
+ */
+secondary_entry:
+    /* 判断当前 EL */
+    mrs x0, CurrentEL
+    lsr x0, x0, #2
+    cmp x0, #3
+    beq secondary_el3
+    cmp x0, #2
+    beq secondary_el2
+    /* EL1 直接挂起 */
     b proc_hang
+
+secondary_el3:
+    /* 从 EL3 降到 EL2（次核） */
+    ldr x0, =0x8027613B    /* HCR_VALUE */
+    msr hcr_el2, x0
+    ldr x0, =SCR_VALUE
+    msr scr_el3, x0
+    ldr x0, =SPSR_VALUE
+    msr spsr_el3, x0
+    adr x0, secondary_el2
+    msr elr_el3, x0
+    eret
+
+/*
+ * PSCI 启动的次核入口（从 EL2 开始，MMU 已关闭）
+ * 全局符号，供 C 代码的 psci_cpu_on 调用。
+ */
+.globl secondary_psci_entry
+secondary_psci_entry:
+    b secondary_el2
+
+secondary_el2:
+    /* 关闭 MMU 和缓存（次核初始状态） */
+    ldr x0, =SCTLR_VALUE_MMU_DISABLED
+    msr sctlr_el2, x0
+    isb
+
+    /* 计算 CPU ID */
+    mrs x0, mpidr_el1
+    and x0, x0, #0xFF
+
+    /* 设置次核栈（每个核 16KB 栈空间）
+     * CPU0 栈: LOW_MEMORY
+     * CPU1 栈: LOW_MEMORY - 0x4000
+     */
+    ldr x1, =LOW_MEMORY
+    mov x2, #0x4000       /* 16KB per CPU */
+    mul x2, x0, x2
+    sub x1, x1, x2
+    mov sp, x1
+
+    /* 等待主核的启动信号（smp_boot_flag == cpu_id） */
+    /* 先存 cpu_id 到 x19（callee-saved） */
+    mov x19, x0
+
+secondary_wait:
+    ldr x0, =smp_boot_flag
+    ldr x0, [x0]
+    cmp x0, x19
+    b.ne secondary_wait
+
+    /* 收到启动信号，开启 MMU，跳到次核 C 入口 */
+    /* 先设置页表基址（和主核共享同一份页表） */
+    adrp x0, pg_dir
+    msr ttbr0_el2, x0
+    ldr x0, =(TCR_VALUE)
+    msr tcr_el2, x0
+    ldr x0, =(VTCR_VALUE)
+    msr vtcr_el2, x0
+    ldr x0, =(MAIR_VALUE)
+    msr mair_el2, x0
+    tlbi alle2
+    dsb sy
+    isb
+
+    /* 开启 MMU + I-cache + D-cache */
+    ldr x0, =(SCTLR_MMU_ENABLED | (1 << 2) | (1 << 12))
+    dsb ish
+    isb
+    msr sctlr_el2, x0
+    isb
+
+    /* 跳到次核 C 入口 */
+    bl hypervisor_secondary_main
+    b .
 
 proc_hang:
     wfe

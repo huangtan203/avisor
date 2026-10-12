@@ -35,6 +35,7 @@ typedef int (*loader_func_t)(void *, struct pt_regs *regs);
 
 struct pt_regs *task_pt_regs(struct task_struct *);
 int create_task(loader_func_t, void *);
+int create_task_on_cpu(int cpu, loader_func_t, void *);
 void init_task_console(struct task_struct *);
 int is_uart_forwarded_task(struct task_struct *);
 void flush_task_console(struct task_struct *);
