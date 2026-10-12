@@ -208,6 +208,13 @@ static void gicr_init(int cpu_id)
     put32(sgi_base + GICR_ICENABLER0, 0xFFFFFFFF);
 
     /*
+     * 3.1 使能所有 SGI（0-15，核间软中断）
+     *     SGI 是核间通信（IPI）的基础，每个核都需要开启。
+     *     PPI（16-31）仍保持禁用，由具体驱动（如定时器）按需使能。
+     */
+    put32(sgi_base + GICR_ISENABLER0, 0x0000FFFF);
+
+    /*
      * 4. 清除所有 SGI + PPI 中断的挂起状态
      */
     put32(sgi_base + GICR_ICPENDR0, 0xFFFFFFFF);
@@ -385,43 +392,25 @@ void gic_eoi_irq(unsigned int irq)
 /*
  * 发送 SGI（核间中断）
  *
- * ICC_SGI1R_EL1 格式：
- *   [23:0]   目标列表（target list）或亲和值
- *   [24]     保留
- *   [25]     IRM（中断路由模式：0 = 列表模式，1 = 全部）
- *   [26]     保留
- *   [27]     RS（路由模式：0 = 旧版，1 = 亲和）
- *   [31:28]  SGI 中断号
- *   [39:32]  Aff0（亲和等级 0）
- *   [47:40]  Aff1
- *   [55:48]  Aff2
- *   [63:56]  Aff3
+ * AArch64 ICC_SGI1R_EL1 格式（GICv3 亲和路由 ARE_NS=1）：
+ *   [55:48]  Aff3
+ *   [47:44]  RS     RangeSelector（RSS=0 时 RES0）
+ *   [40]     IRM    中断路由模式：1 = 广播给除自身外的所有 PE
+ *   [39:32]  Aff2
+ *   [27:24]  INTID  SGI 中断号 (0-15)
+ *   [23:16]  Aff1
+ *   [15:0]   TargetList  aff0 位图：bit n 对应 aff0=n 的 PE
  *
- * 简单起见，我们用"发送给所有 CPU"的模式（IRM=1）
+ * QEMU virt 下所有 CPU 的 Aff1/Aff2/Aff3 均为 0，仅 aff0 区分
+ * （CPU0 aff0=0, CPU1 aff0=1），故用 TargetList 的 bit 指定目标核。
  */
 void gic_send_sgi(unsigned int cpu_id, unsigned int sgi_id)
 {
     uint64_t sgi_val;
 
-    /*
-     * 这里用最简单的模式：
-     *  - 旧版路由 (RS=0)
-     *  - 目标列表模式 (IRM=0)
-     *  - 目标 CPU 由 target list 指定
-     *
-     * 注意：在 GICv3 亲和路由模式下，正确的做法是用 Aff0/Aff1/Aff2/Aff3
-     * 但为了简化，QEMU 的 GICv3 也兼容旧的 target list 方式。
-     *
-     * 实际上在 ARE 模式下，应该用 ICC_SGI1R_EL1 的亲和格式。
-     * 这里我们用亲和模式（RS=1），CPU0 的亲和值是 0.0.0.0
-     */
-
-    sgi_val = ((uint64_t)(sgi_id & 0xF) << 24)  /* INTID */
-            | ((uint64_t)1 << 40)               /* Aff1 = 1 (表示CPU 0) */
-            | ((uint64_t)1 << 0);                /* 目标列表第 0 位 */
-
-    /* 更简单的做法：发给所有 CPU (IRM=1) */
-    sgi_val = ((uint64_t)(sgi_id & 0xF) << 24) | (1ULL << 40);
+    sgi_val = ((uint64_t)(sgi_id & 0xF) << 24)   /* INTID [27:24] */
+            | (1ULL << (cpu_id & 0xF));            /* TargetList: bit cpu_id */
 
     icc_sgi1r_write(sgi_val);
+    asm volatile("isb" ::: "memory");
 }

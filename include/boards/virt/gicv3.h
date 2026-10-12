@@ -140,6 +140,12 @@
 #define PPI_HYP_VIRT_TIMER  26   /* EL2 虚拟定时器 (GICv3 里叫 EL2 Physical Timer) */
 #define PPI_EL2_PHYS_TIMER  26   /* EL2 物理定时器 (PPI #26) */
 
+/* SGI 中断号（0-15，Software Generated Interrupt，核间软中断）
+ * 由 ICC_SGI1R_EL1 触发，用于核间通信（IPI）。
+ */
+#define SGI_IPI_NOTIFY      0   /* 通用核间通知 IPI */
+#define SGI_IPI_TEST        1   /* 核间通信 ping-pong 测试 */
+
 /* 函数声明 */
 void gic_init(void);
 void gic_init_secondary(void);

@@ -23,6 +23,7 @@
 #include "common/debug.h"
 #include "common/entry.h"
 #include "common/sched.h"
+#include "common/smp.h"
 #include "common/timer.h"
 #include "common/utils.h"
 
@@ -127,6 +128,21 @@ void handle_irq(void)
         break;
 
     default:
+        /*
+         * SGI（0-15）核间软中断：分发到 SMP IPI 处理。
+         * SGI 是核间通信的基础，处理完走末尾统一 EOI。
+         */
+        if (irq < 16) {
+            smp_ipi_handle(irq);
+            /*
+             * SGI 是边沿触发中断：split EOI 模式下必须显式 DIR
+             * 解除激活，否则该 SGI 号一直保持 active，无法再次触发。
+             * （与 PPI #26 定时器相同的处理方式。）
+             */
+            WRITE_SYSREG64(irq, ICC_DIR_EL1);
+            asm volatile("isb");
+            break;
+        }
         WARN("Unknown IRQ: %u", irq);
         break;
     }

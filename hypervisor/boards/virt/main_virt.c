@@ -38,6 +38,7 @@
 #include "common/mm.h"
 #include "common/printf.h"
 #include "common/sched.h"
+#include "common/smp.h"
 #include "common/task.h"
 #include "common/timer.h"
 #include "common/utils.h"
@@ -163,6 +164,10 @@ void hypervisor_main()
     enable_irq();
     printf("[7] Interrupts enabled (IRQ + FIQ)\n");
 
+    /* 主核就绪（用于核间通信握手；主核不发给自己，此处仅标记） */
+    asm volatile("dmb ish" ::: "memory");
+    smp_online[0] = 1;
+
     /*
      * 8. 创建 Guest VM（SMP 任务分配）
      *
@@ -258,9 +263,19 @@ void hypervisor_main()
         }
     }
 
-    /* 给次核一点时间启动 */
-    for (volatile int i = 0; i < 2000000; i++)
-        asm volatile("nop");
+    /*
+     * 等待次核就绪（smp_online[1] == 1），再做核间通信测试。
+     * 次核在 hypervisor_secondary_main 开中断后置起该标志。
+     * 用 wfe 等待：次核置标志后 sev 唤醒；即便 sev 丢失，主核
+     * 自身的 100Hz 定时器 tick 也会周期性唤醒它重新检查。
+     */
+    while (!smp_online[1])
+        asm volatile("wfe" ::: "memory");
+    asm volatile("dmb ish" ::: "memory");
+
+    printf("\n[cpu0] CPU1 is online, testing SGI IPI...\n");
+    printf("[cpu0] IPI: sending SGI#%d (ping) to CPU1\n", SGI_IPI_TEST);
+    smp_send_ipi(1, SGI_IPI_TEST);
 
     printf("\nAll core systems online. Entering scheduler loop...\n");
     printf("CPU0: idle + VM1(vcpu0 + VM2_vcpu0\n");
@@ -323,6 +338,11 @@ void hypervisor_secondary_main(void)
     enable_interrupt_controller();
     enable_irq();
     printf("[cpu%d] Interrupts enabled\n", cpu);
+
+    /* 标记本核就绪，唤醒主核（主核在 wfe 等待 smp_online[cpu]） */
+    asm volatile("dmb ish" ::: "memory");
+    smp_online[cpu] = 1;
+    asm volatile("sev" ::: "memory");
 
     printf("[cpu%d] Entering scheduler loop...\n", cpu);
 
