@@ -44,6 +44,7 @@ typedef int bool;
 #define HVC_CONSOLE_PUTC   1
 #define HVC_GET_TIMER_FREQ 2
 #define HVC_GET_VMID       3
+#define HVC_PCI_DEBUG      4
 
 /* ---- 内联汇编访问系统寄存器 ---- */
 

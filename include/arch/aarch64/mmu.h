@@ -55,6 +55,18 @@
 	(MM_TYPE_PAGE | MM_STAGE2_ACCESS | MM_STAGE2_SH | MM_STAGE2_AP_NONE | \
 	 MM_STAGE2_DEVICE_MEMATTR)
 
+/*
+ * Device 内存 + 完全访问权限（PCI 直通用）
+ *
+ * 与 MMU_STAGE2_MMIO_PAGE_FLAGS 的区别：后者 AP=00（无访问权限），
+ * 用于让 MMIO 地址陷入 EL2 做 trap-and-emulate；直通则需要 Guest
+ * 直接访问真实设备，因此用 AP=11（读/写） + device 内存属性。
+ */
+#define MMU_STAGE2_DEVICE_PAGE_FLAGS                                          \
+	(MM_TYPE_PAGE | MM_STAGE2_ACCESS | MM_STAGE2_SH | MM_STAGE2_AP |      \
+	 MM_STAGE2_DEVICE_MEMATTR)
+
+
 #define TCR_T0SZ   (64 - 48)
 #define TCR_TG0_4K (0 << 14)
 #define TCR_VALUE  (TCR_T0SZ | TCR_TG0_4K)

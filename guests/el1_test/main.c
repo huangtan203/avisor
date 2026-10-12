@@ -901,6 +901,90 @@ static void ivshmem_pingpong_test(void)
     }
 }
 
+/* ---------- PCI 直通 edu 驱动 ---------- */
+
+#define EDU_BAR0_BASE      0x10000000UL   /* edu BAR0 (直通映射) */
+#define EDU_ID_REG         0x00
+#define EDU_LIVENESS_REG   0x04
+#define EDU_FACTORIAL_REG  0x08
+#define EDU_STATUS_REG     0x20
+#define EDU_IRQ_STATUS     0x24
+#define EDU_IRQ_RAISE      0x60
+#define EDU_IRQ_ACK        0x64
+
+#define PCI_EDU_IRQ        50              /* 虚拟 SPI（hypervisor 转发） */
+
+static volatile int edu_irq_received = 0;
+static volatile u32 edu_irq_status_val = 0;
+
+static void edu_test(void)
+{
+    u32 id, live, fact;
+    int timeout;
+
+    guest_puts("edu: probing device at BAR0=0x10000000...\n");
+
+    /* 1. identification（应为 0x010000ed） */
+    id = mmio_read32(EDU_BAR0_BASE + EDU_ID_REG);
+    guest_puts("edu: identification=0x");
+    puts_hex(id, 8);
+    guest_puts("\n");
+    if (id != 0x010000ed) {
+        guest_puts("edu: FAILED (bad identification)\n");
+        return;
+    }
+
+    /* 2. liveness：写入读回按位取反 */
+    mmio_write32(EDU_BAR0_BASE + EDU_LIVENESS_REG, 0xdeadbeef);
+    live = mmio_read32(EDU_BAR0_BASE + EDU_LIVENESS_REG);
+    if (live == ~0xdeadbeefu) {
+        guest_puts("edu: liveness PASSED (0x");
+        puts_hex(live, 8);
+        guest_puts(")\n");
+    } else {
+        guest_puts("edu: liveness FAILED (0x");
+        puts_hex(live, 8);
+        guest_puts(")\n");
+        return;
+    }
+
+    /* 3. factorial：计算 10! = 3628800 */
+    mmio_write32(EDU_BAR0_BASE + EDU_FACTORIAL_REG, 10);
+    timeout = 10000000;
+    while ((mmio_read32(EDU_BAR0_BASE + EDU_STATUS_REG) & 0x1) && timeout-- > 0)
+        asm volatile("nop");
+    fact = mmio_read32(EDU_BAR0_BASE + EDU_FACTORIAL_REG);
+    guest_puts("edu: factorial(10)=");
+    puts_dec(fact);
+    guest_puts(" (expect 3628800)\n");
+    if (fact == 3628800)
+        guest_puts("edu: factorial PASSED\n");
+    else
+        guest_puts("edu: factorial FAILED\n");
+
+    /* 4. INTx 中断转发测试 */
+    guest_puts("edu: starting INTx interrupt test...\n");
+    edu_irq_received = 0;
+    /* 清残留 irq_status */
+    mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, 0xffffffff);
+    /* 写非零值到 raise 寄存器 -> 拉高 INTA -> 物理 SPI 35 -> 虚拟 SPI 50 */
+    mmio_write32(EDU_BAR0_BASE + EDU_IRQ_RAISE, 0x12345678);
+
+    timeout = 10000000;
+    while (!edu_irq_received && timeout-- > 0)
+        asm volatile("nop");
+
+    if (edu_irq_received) {
+        guest_puts("edu: INTx interrupt PASSED (irq_status=0x");
+        puts_hex(edu_irq_status_val, 8);
+        guest_puts(")\n");
+    } else {
+        guest_puts("edu: INTx interrupt FAILED (timeout)\n");
+        /* 让 hypervisor dump 中断链路状态（GIC/edu/LR），定位断点 */
+        hvc_call(HVC_PCI_DEBUG, 0);
+    }
+}
+
 /* ---------- IRQ 处理 ---------- */
 
 void guest_irq_handler(void)
@@ -926,6 +1010,12 @@ void guest_irq_handler(void)
         virtio_net_irq_handler();
     } else if (intid == IVSHMEM_IRQ) {
         ivshmem_irq_handler();
+    } else if (intid == PCI_EDU_IRQ) {
+        /* 先拉低物理 INTx 线（清 irq_status），再走末尾统一虚拟 EOI，
+         * 避免 HW 联动去活物理中断后电平仍未清除导致重触发风暴 */
+        edu_irq_status_val = mmio_read32(EDU_BAR0_BASE + EDU_IRQ_STATUS);
+        mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, edu_irq_status_val);
+        edu_irq_received = 1;
     }
 
     icc_eoir1_write(iar);
@@ -1048,6 +1138,12 @@ void guest_main(void)
     guest_puts("\n--- Test 2: ivshmem ---\n");
     ivshmem_init();
     ivshmem_pingpong_test();
+
+    /* 测试 3: PCI 直通 edu（仅 VM1 直通了该设备） */
+    if (vmid == 1) {
+        guest_puts("\n--- Test 3: PCI passthrough (edu) ---\n");
+        edu_test();
+    }
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 

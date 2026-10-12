@@ -400,6 +400,39 @@ __create_page_tables:
     cmp x5, x6
     b.ls 2b
 
+    /*
+     * ---- 映射 PCI BAR0 窗口（0x10000000，2MB，device） ----
+     * Phase 7 PCI 直通：Hypervisor 自身需要访问 edu 的 MMIO（验证/调试），
+     * 也覆盖了 Guest 会访问的 BAR0 区域。
+     * PMD index = 0x10000000 >> 21 = 128
+     */
+    mov x4, #VIRT_PCIE_MMIO_BASE    /* phys base */
+    lsr x4, x4, #SECTION_SHIFT
+    mov x5, #MMU_DEVICE_FLAGS
+    orr x4, x5, x4, lsl #SECTION_SHIFT
+    mov x5, #(VIRT_PCIE_MMIO_BASE >> SECTION_SHIFT)
+    str x4, [x3, x5, lsl #3]
+
+    /*
+     * ---- 映射 PCI ECAM（0x3f000000，16MB = 8 sections，device） ----
+     * ECAM 是 PCIe 增强配置访问机制，Hypervisor 用它枚举 edu 并编程 BAR。
+     * PMD index = 0x3f000000 >> 21 = 504（连续 8 个 entry）
+     */
+    mov x4, #VIRT_PCIE_ECAM_BASE     /* phys base */
+    lsr x4, x4, #SECTION_SHIFT
+    mov x5, #MMU_DEVICE_FLAGS
+    orr x4, x5, x4, lsl #SECTION_SHIFT
+
+    mov x5, #(VIRT_PCIE_ECAM_BASE >> SECTION_SHIFT)  /* start PMD index */
+    and x5, x5, #(PTRS_PER_TABLE - 1)
+    add x6, x5, #7                  /* end PMD index (8 sections) */
+
+3:  str x4, [x3, x5, lsl #3]
+    add x5, x5, #1
+    add x4, x4, #SECTION_SIZE
+    cmp x5, x6
+    b.ls 3b
+
     /* 恢复返回地址 */
     mov x30, x29
     ret

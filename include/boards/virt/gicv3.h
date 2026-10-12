@@ -46,7 +46,7 @@
 #define GICD_IPRIORITYR(n)  (GICD_BASE + 0x0400 + (n) * 4)  /* 中断优先级 */
 #define GICD_ITARGETSR(n)   (GICD_BASE + 0x0800 + (n) * 4)  /* 中断目标CPU (GICv2) */
 #define GICD_ICFGR(n)       (GICD_BASE + 0x0C00 + (n) * 4)  /* 中断配置 */
-#define GICD_IROUTER(n)     (GICD_BASE + 0x6000 + (n) * 8)  /* 中断路由 (GICv3) */
+#define GICD_IROUTER(n)     (GICD_BASE + 0x6000 + (n) * 8)  /* 中断路由 (GICv3)，n 为完整 INTID(32-1019) */
 
 /* GICD_CTLR 位 */
 #define GICD_CTLR_ENABLE_G0       (1 << 0)   /* 使能 Group 0 */
@@ -119,6 +119,15 @@
 /* ICC_IGRPEN1_EL1: Group 1 中断使能 */
 #define ICC_IGRPEN1_EL1    S3_0_C12_C12_7
 
+/* ICC_RPR_EL1: 运行优先级寄存器（当前 CPU 的运行优先级） */
+#define ICC_RPR_EL1        S3_0_C12_C11_3
+
+/* ICC_HPPIR1_EL1: 最高优先级挂起中断寄存器（Group 1） */
+#define ICC_HPPIR1_EL1     S3_0_C12_C12_2
+
+/* ICC_AP1R0_EL1: Active Priority Register, Group 1 */
+#define ICC_AP1R0_EL1      S3_0_C12_C9_0
+
 /* ICC_SRE_EL2: 系统寄存器使能（EL2）
  * 必须先设置 SRE=1，才能通过系统寄存器访问 ICC 接口
  * 否则 GIC 处于 MMIO 兼容模式（GICv2 风格）
@@ -155,6 +164,13 @@ void gic_set_priority(unsigned int irq, unsigned int priority);
 unsigned int gic_ack_irq(void);
 void gic_eoi_irq(unsigned int irq);
 void gic_send_sgi(unsigned int cpu_id, unsigned int sgi_id);
+
+/*
+ * 把指定 SPI 中断（全局中断号，>=32）路由到指定 CPU。
+ * GICv3 亲和路由模式下通过 GICD_IROUTER 完成。
+ * 用于 PCI 直通：把 edu 的 INTx 物理中断路由到 CPU0。
+ */
+void gic_set_spi_target(unsigned int irq, unsigned int cpu_id);
 
 /* 获取当前 CPU 的 GICR 基地址 */
 uint64_t gic_get_redist_base(int cpu_id);

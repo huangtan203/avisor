@@ -35,6 +35,39 @@
 #define VIRT_MMIO_BASE     0x08000000UL   /* MMIO 外设起始物理地址 */
 #define VIRT_MMIO_SIZE     0x02000000UL   /* MMIO 外设区域大小 (32MB) */
 
+/*
+ * PCIe / PCI 直通相关布局（QEMU virt, highmem=off）
+ *
+ * 学习要点：
+ *   highmem=off 时，QEMU 把 PCI 相关的所有地址都压在 4GB 以下，
+ *   这样它们可以被 Stage 2 的 2^38 IPA 空间直接映射（等值映射）。
+ *     - ECAM：PCIe 增强配置访问机制，用于读/写设备配置空间
+ *     - MMIO 窗口：设备 BAR 映射的目标地址范围
+ */
+#define VIRT_PCIE_ECAM_BASE  0x3f000000UL   /* ECAM 配置空间基址 */
+#define VIRT_PCIE_ECAM_SIZE  0x01000000UL   /* ECAM 大小 (16MB) */
+#define VIRT_PCIE_MMIO_BASE  0x10000000UL   /* PCI MMIO 窗口基址 */
+#define VIRT_PCIE_MMIO_SIZE  0x2eff0000UL   /* PCI MMIO 窗口大小 (752MB) */
+
+/*
+ * edu 教育设备（QEMU -device edu）直通参数
+ *
+ *   vendor/device = 0x1234 / 0x11e8（QEMU 内置 edu 设备的固定 ID）
+ *   BAR0 = 1MB MMIO，编程到 PCI MMIO 窗口起始地址 0x10000000
+ *   INTx 中断号不能硬编码：QEMU virt 的 gpex 主桥用标准 PCI swizzle
+ *   （host_pin = (device_pin + slot) & 3）把设备 INTx 旋到主桥的
+ *   INTA/B/C/D 线，再分别接到 GIC SPI 3/4/5/6。edu 通常枚举到
+ *   slot 2，其 INTA 旋到主桥 INTC -> SPI 5 -> GIC 全局中断号 37。
+ *   因此中断号必须在枚举后动态计算（见 pci.c 的 pci_edu_intx_irq）。
+ */
+#define PCI_EDU_VENDOR       0x1234UL
+#define PCI_EDU_DEVICE       0x11e8UL
+#define PCI_EDU_BAR0_IPA     0x10000000UL   /* 编程到 BAR0 的地址 */
+#define PCI_EDU_BAR0_SIZE    0x00100000UL   /* edu BAR0 大小 (1MB) */
+
+/* virt 主桥 INTA 对应的 GIC SPI 号（INTA/B/C/D = SPI 3/4/5/6） */
+#define VIRT_PCIE_INTX_SPI_BASE  3
+
 #include "common/mm.h"
 
 /*

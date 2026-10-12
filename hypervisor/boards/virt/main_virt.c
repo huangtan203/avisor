@@ -51,6 +51,7 @@
 #include "boards/virt/guest_loader.h"
 #include "boards/virt/virt_board.h"
 #include "boards/virt/base.h"
+#include "boards/virt/pci.h"
 
 /*
  * main_virt.c 中创建的任务都在 CPU0 上，用 cpu0_task 快速访问。
@@ -137,6 +138,11 @@ void hypervisor_main()
 
     vgic_init();
     printf("[4] vGIC enabled (virtual CPU interface, LR injection)\n");
+
+    /* 4.5 初始化 PCI 直通（必须在创建 VM 之前，使 virt_initialize
+     * 调用 pci_passthrough_map 时 edu 已枚举完成） */
+    pci_init();
+    printf("[4.5] PCI passthrough initialized (edu device)\n");
 
     /* 5. 初始化 EL2 物理定时器（100Hz 调度 tick，PPI #26） */
     timer_init();

@@ -113,9 +113,11 @@
 #define ICH_VMCR_EL2 S3_4_C12_C11_7 /* 虚拟机控制（PMR/BPR/GRPEN 后端） */
 #define ICH_LR0_EL2  S3_4_C12_C12_0 /* List Register 0 */
 #define ICH_LR1_EL2  S3_4_C12_C12_1 /* List Register 1 */
+#define ICH_LR2_EL2  S3_4_C12_C12_2 /* List Register 2 (PCI INTx HW+EOI) */
 
-/* LR 数量（我们使用的数量，实际硬件可能更多） */
-#define NR_VGIC_LRS   2
+/* LR 数量（我们使用的数量，实际硬件可能更多）
+ * Phase 7 扩展为 3：LR0=vtimer, LR1=软件注入, LR2=PCI INTx HW+EOI */
+#define NR_VGIC_LRS   3
 
 /* ICH_HCR_EL2 位 */
 #define ICH_HCR_EL2_EN (1 << 0) /* 使能虚拟 CPU 接口 */
@@ -125,7 +127,13 @@
 #define ICH_VMCR_VPMR_SHIFT 24     /* ICC_PMR_EL1 在 bits[31:24] */
 
 /* ICH_LR<n>_EL2 位（与 QEMU/KVM 的编码一致） */
-#define ICH_LR_EOI     (1UL << 41) /* guest EOIR 时硬件去活对应物理中断 */
+/*
+ * 注意：pINTID 字段占据 bits [41:32]。对 HW 映射中断（ICH_LR_HW=1），
+ * Linux/KVM 只设置 ICH_LR_HW 和 (pintid << 32)，绝不设置 bit 41。
+ * bit 41 仅在"软件模拟的电平触发虚拟中断（无 HW 映射）"时才用作 EOI 位。
+ */
+#define ICH_LR_PHYS_ID_SHIFT 32        /* pINTID 字段起始位 */
+#define ICH_LR_PHYS_ID_MASK  (0x3ffUL << 32) /* pINTID 字段掩码 [41:32] */
 #define ICH_LR_GROUP1  (1UL << 60) /* 虚拟中断属于 Group 1 */
 #define ICH_LR_HW      (1UL << 61) /* 映射到物理中断（pINTID [41:32]） */
 #define ICH_LR_PENDING (1UL << 62) /* state: pending（state 字段 [63:62]） */

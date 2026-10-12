@@ -20,6 +20,7 @@ static inline uint64_t read_lr(int idx)
     switch (idx) {
     case 0: return READ_SYSREG64(ICH_LR0_EL2);
     case 1: return READ_SYSREG64(ICH_LR1_EL2);
+    case 2: return READ_SYSREG64(ICH_LR2_EL2);
     default: return 0;
     }
 }
@@ -29,6 +30,7 @@ static inline void write_lr(int idx, uint64_t val)
     switch (idx) {
     case 0: WRITE_SYSREG64(val, ICH_LR0_EL2); break;
     case 1: WRITE_SYSREG64(val, ICH_LR1_EL2); break;
+    case 2: WRITE_SYSREG64(val, ICH_LR2_EL2); break;
     }
 }
 
@@ -111,6 +113,28 @@ void vgic_inject_virq_hw(uint32_t vintid, uint32_t pintid)
 }
 
 /*
+ * 注入 HW 映射的虚拟中断（PCI INTx 直通，固定 LR2）
+ *
+ * 与 vgic_inject_virq_hw 完全一致，只是固定使用 LR2。
+ *
+ * 关键：绝不设置 bit 41（pINTID 字段的 MSB）。对 HW 映射中断
+ * （ICH_LR_HW=1），Guest 写虚拟 EOIR 时硬件会自动 deactivate
+ * 链接的物理中断（pINTID），无需也不应手动置 EOI 位——
+ * 否则会破坏 pINTID 字段本身。
+ */
+void vgic_inject_virq_hw_eoi(uint32_t vintid, uint32_t pintid)
+{
+    uint64_t lr = ((uint64_t)vintid & 0xffffffffULL) /* vINTID [31:0] */
+                  | ((uint64_t)pintid << 32)          /* pINTID [41:32] */
+                  | ICH_LR_GROUP1                     /* Group 1 */
+                  | ICH_LR_HW                         /* 硬件映射模式 */
+                  | ICH_LR_PENDING;                   /* state = pending */
+
+    write_lr(2, lr);
+    asm volatile("isb");
+}
+
+/*
  * 读取 LR0 当前内容（调试用）
  */
 uint64_t vgic_get_lr0(void)
@@ -128,8 +152,13 @@ uint64_t vgic_get_lr0(void)
  */
 int vgic_inject_virq(uint32_t vintid)
 {
-    /* 从 LR1 开始查找空闲 LR（LR0 预留给 vtimer） */
-    for (int i = 1; i < NR_VGIC_LRS; i++) {
+    /*
+     * 从 LR1 开始查找空闲 LR：
+     *   LR0 预留给 vtimer（HW 映射）
+     *   LR2 预留给 PCI INTx（HW+EOI 映射）
+     * 软件注入只使用 LR1。
+     */
+    for (int i = 1; i < NR_VGIC_LRS - 1; i++) {
         uint64_t lr = read_lr(i);
         if ((lr & ICH_LR_STATE_MASK) == 0) {
             /* 空闲：写入 pending 状态的虚拟中断 */

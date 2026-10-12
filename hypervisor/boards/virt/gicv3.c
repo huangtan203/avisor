@@ -414,3 +414,33 @@ void gic_send_sgi(unsigned int cpu_id, unsigned int sgi_id)
     icc_sgi1r_write(sgi_val);
     asm volatile("isb" ::: "memory");
 }
+
+/*
+ * 把指定 SPI 中断路由到指定 CPU（GICv3 亲和路由，通过 IROUTER）
+ *
+ * GICD_IROUTER<n> 是 64 位寄存器，低 32 位编码目标亲和：
+ *   [7:0]   Aff0
+ *   [15:8]  Aff1
+ *   [23:16] Aff2
+ *   [31:24] Aff3
+ * 高 32 位为保留（写 0）。QEMU virt 只用到 Aff0（cpu_id）。
+ *
+ * 注意：GICD_IROUTER 按【完整 INTID】编址：offset = 0x6000 + 8*INTID，
+ * 第一个 SPI（INTID 32）位于 0x6100；INTID < 32（SGI/PPI）的槽位
+ * RAZ/WI（QEMU 对这类写入直接忽略）。因此参数 irq 必须直接用全局
+ * 中断号（>=32）索引，不能先减 32 转成 SPI 序号。
+ */
+void gic_set_spi_target(unsigned int irq, unsigned int cpu_id)
+{
+    if (irq < 32)
+        return;
+
+    uint64_t router = GICD_IROUTER(irq);
+
+    uint32_t aff = (cpu_id & 0xFF);  /* Aff0；QEMU virt 只用 aff0 */
+
+    put32(router, aff);
+    put32(router + 4, 0);  /* Aff3:Aff2:Aff1 高位清零 */
+
+    asm volatile("dsb sy" ::: "memory");
+}

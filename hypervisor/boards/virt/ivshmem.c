@@ -116,8 +116,8 @@ void ivshmem_mmio_write(struct ivshmem_dev *dev, uint32_t offset, uint32_t val)
         struct vm_virt_state *virt = &target->vm->virt;
         int injected = 0;
 
-        /* 找一个空闲 LR（从 1 开始，LR0 留给 vtimer） */
-        for (int i = 1; i < NR_VGIC_LRS; i++) {
+        /* 找一个空闲 LR（LR1；LR0=vtimer，LR2=PCI INTx） */
+        for (int i = 1; i < NR_VGIC_LRS - 1; i++) {
             if ((virt->gic_lr[i] & ICH_LR_STATE_MASK) == 0) {
                 virt->gic_lr[i] =
                     ((uint64_t)VIRQ_IVSHMEM & 0xffffffffULL)

@@ -22,3 +22,4 @@
 #define HVC_CONSOLE_PUTC 1 /* x0 = 字符，输出到 Hypervisor 控制台 */
 #define HVC_GET_TIMER_FREQ 2 /* 返回值 x0 = 定时器频率（Hz） */
 #define HVC_GET_VMID 3 /* 返回值 x0 = 当前 VM 的 ID（pid，Phase 3） */
+#define HVC_PCI_DEBUG 4 /* PCI 直通中断链路诊断 dump（Phase 7 调试用） */

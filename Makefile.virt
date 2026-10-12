@@ -119,10 +119,11 @@ kernel8.img: $(LINKER_FILE) $(OBJ_FILES)
 .PHONY: run
 run: kernel8.img
 	qemu-system-aarch64 \
-		-M virt,virtualization=on,gic-version=3 \
+		-M virt,virtualization=on,gic-version=3,highmem=off \
 		-cpu max \
-		-smp 1 \
+		-smp 2 \
 		-m 1G \
+		-device edu \
 		-kernel $(OUTDIR)/kernel8.img \
 		-nographic \
 		-serial mon:stdio
@@ -137,10 +138,11 @@ debug: kernel8.img
 	@echo "  (gdb) continue"
 	@echo ""
 	qemu-system-aarch64 \
-		-M virt,virtualization=on,gic-version=3 \
+		-M virt,virtualization=on,gic-version=3,highmem=off \
 		-cpu max \
-		-smp 1 \
+		-smp 2 \
 		-m 1G \
+		-device edu \
 		-kernel $(OUTDIR)/kernel8.img \
 		-nographic \
 		-serial mon:stdio \

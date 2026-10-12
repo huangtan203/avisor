@@ -23,6 +23,8 @@
 #include "boards/virt/vgic.h"
 #include "boards/virt/virtio_mmio.h"
 #include "boards/virt/ivshmem.h"
+#include "boards/virt/pci.h"
+#include "boards/virt/base.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/mm.h"
 #include "common/types.h"
@@ -405,6 +407,14 @@ static void virt_initialize(struct task_struct *tsk)
     ivshmem_init(&devs->ivshmem, tsk, peer_id,
                  ivshmem_shmem_pa, VIRTIO_IVSHMEM_MEM_SIZE,
                  VIRTIO_IVSHMEM_REG_BASE, VIRTIO_IVSHMEM_MEM_BASE);
+
+    /*
+     * Phase 7：PCI 直通。仅 VM1 直通 edu 设备（ECAM + BAR0）。
+     * 前提：main_virt.c 在创建任何 VM 之前已调用 pci_init()，
+     * 因此这里 edu_found 已确定。
+     */
+    if (tsk->vmid == 1)
+        pci_passthrough_map(tsk);
 }
 
 /*
@@ -434,11 +444,12 @@ void virt_attach_secondary(struct task_struct *tsk, struct task_struct *master)
 
 static void virt_leaving_vm(struct task_struct *tsk)
 {
-	uint64_t lr0, ctl;
+	uint64_t lr0, lr2, ctl;
 
 	/* 1. 保存虚拟 GIC 接口全部状态（VMCR + 所有 LR） */
 	vgic_save_state(&tsk->virt);
 	lr0 = tsk->virt.gic_lr[0];
+	lr2 = tsk->virt.gic_lr[2];
 
 	/*
 	 * 2. 若 LR0 是 vtimer 的 HW 映射且非 invalid，
@@ -449,6 +460,22 @@ static void virt_leaving_vm(struct task_struct *tsk)
 
 		if (pintid == PPI_VIRT_TIMER) {
 			WRITE_SYSREG64(PPI_VIRT_TIMER, ICC_DIR_EL1);
+			asm volatile("isb");
+		}
+	}
+
+	/*
+	 * 2b. 若 LR2 是 PCI INTx 的 HW 映射且非 invalid，
+	 *     强制 deactivate 对应的物理 SPI（edu INTx，中断号在
+	 *     pci_init 由 pin+slot swizzle 运行时计算）。
+	 *     防止离开 VM 时物理 INTx 仍 active 导致后续中断丢失。
+	 */
+	if (pci_edu_intx_irq != 0 && (lr2 & ICH_LR_HW) &&
+	    (lr2 & ICH_LR_STATE_MASK)) {
+		uint32_t pintid = (uint32_t)(lr2 >> 32) & 0x3ff;
+
+		if (pintid == pci_edu_intx_irq) {
+			WRITE_SYSREG64(pci_edu_intx_irq, ICC_DIR_EL1);
 			asm volatile("isb");
 		}
 	}

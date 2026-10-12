@@ -19,9 +19,21 @@ struct vm_virt_state;
 #define VIRQ_VTIMER     27  /* 虚拟定时器 PPI */
 #define VIRQ_VIRTIO_NET 48  /* virtio-net SPI (用户自定义，>32) */
 #define VIRQ_IVSHMEM    49  /* ivshmem doorbell SPI */
+#define VIRQ_PCI_EDU    50  /* PCI 直通 edu INTx 转发的虚拟 SPI */
 
 void vgic_init(void);
 void vgic_inject_virq_hw(uint32_t vintid, uint32_t pintid);
+
+/*
+ * 向当前 Guest 注入一个 HW 映射的虚拟中断（PCI INTx 直通用，固定 LR2）
+ *
+ * 与 vgic_inject_virq_hw 语义一致：ICH_LR_HW=1，pINTID 放 bits[41:32]。
+ * Guest 写虚拟 EOIR 时硬件自动 deactivate 对应物理中断（HW 联动），
+ * 这是电平触发 INTx 转发的关键——避免物理中断一直 active 导致重触发风暴。
+ * 固定使用 LR2（LR0=vtimer，LR1=软件注入）。
+ */
+void vgic_inject_virq_hw_eoi(uint32_t vintid, uint32_t pintid);
+
 uint64_t vgic_get_lr0(void);
 
 /*

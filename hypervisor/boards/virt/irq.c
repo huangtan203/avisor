@@ -19,6 +19,7 @@
 #include "boards/virt/pl011_uart.h"
 #include "boards/virt/arch_timer.h"
 #include "boards/virt/vgic.h"
+#include "boards/virt/pci.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
 #include "common/entry.h"
@@ -87,6 +88,32 @@ void handle_irq(void)
 
     /* 虚假中断：没有真正的中断，直接返回 */
     if (irq == GIC_SPURIOUS_IRQ) {
+        return;
+    }
+
+    /*
+     * PCI INTx 直通转发（edu 设备，Phase 7）。
+     *
+     * 物理中断号在枚举时由 pin+slot swizzle 算出，是运行时变量
+     * （pci_edu_intx_irq），因此不能用 switch 的常量 case 标签。
+     *
+     * 仅注入给直通该设备的 VM1；idle 或 VM2 等其他上下文直接去活
+     * 物理中断——电平触发的 INTx 线仍为高，GIC 会立刻重新 pending，
+     * 等 VM1 再次被调度时即可送达（避免电平中断卡在 active 状态）。
+     *
+     * split EOI + HW 联动：写 EOIR 只降优先级，物理中断保持 active，
+     * 由 Guest 写虚拟 EOIR 时经 LR2 的 HW 映射自动去活。
+     */
+    if (pci_edu_intx_irq != 0 && irq == pci_edu_intx_irq) {
+        if (current && current->pid != 0 && current->vmid == 1) {
+            vgic_inject_virq_hw_eoi(VIRQ_PCI_EDU, pci_edu_intx_irq);
+            gic_eoi_irq(irq);
+            return;  // 跳过末尾公共处理，由 HW 联动去活物理 INTx
+        }
+        /* 非目标 VM 上下文：显式去活，否则电平中断无法再次触发 */
+        WRITE_SYSREG64(pci_edu_intx_irq, ICC_DIR_EL1);
+        asm volatile("isb");
+        gic_eoi_irq(irq);
         return;
     }
 

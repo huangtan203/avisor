@@ -18,6 +18,7 @@
 
 #ifdef PLATFORM_VIRT
 #include "boards/virt/arch_timer.h"
+#include "boards/virt/pci.h"
 #endif
 
 const char *sync_error_reasons[] = {
@@ -127,6 +128,10 @@ void handle_hvc64(unsigned long hvc_nr)
 		/* 告诉 Guest 自己的 VM 编号（多 VM 演示用）
 		 * 用全局 vmid：虚拟 SMP 的多个 vCPU 返回相同编号 */
 		regs->regs[0] = current->vmid;
+		break;
+	case HVC_PCI_DEBUG:
+		/* PCI 直通中断链路诊断 dump（Phase 7 调试用） */
+		pci_debug_dump();
 		break;
 #endif
 	default:
