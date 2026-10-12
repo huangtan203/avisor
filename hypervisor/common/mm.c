@@ -274,6 +274,11 @@ int handle_mem_abort(vaddr_t addr, uint64_t esr)
 		map_stage2_page(current, ipa & PAGE_MASK, page,
 				MMU_STAGE2_PAGE_FLAGS);
 		current->stat.pf_count++;
+
+		/* 调试：打印 demand paging 信息 */
+		INFO("demand page: vm=%d ipa=0x%lx pa=0x%lx (total pf=%d)",
+		     current->pid, ipa & PAGE_MASK, page, current->stat.pf_count);
+
 		return 0;
 	}
 

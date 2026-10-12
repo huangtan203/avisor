@@ -412,13 +412,77 @@ static int virtio_net_tx(const u8 *data, int len)
     vnet.tx_desc[idx].flags = 0;
     vnet.tx_desc[idx].next = 0;
 
+    /* 调试：写回后自己读一遍验证 */
+    volatile u64 *dbg_addr = (volatile u64 *)&vnet.tx_desc[idx].addr;
+    volatile u32 *dbg_len = (volatile u32 *)&vnet.tx_desc[idx].len;
+    guest_puts("[dbg] tx_desc[");
+    puts_dec(idx);
+    guest_puts("] self-check: addr=0x");
+    puts_hex(*dbg_addr, 16);
+    guest_puts(" len=");
+    puts_dec(*dbg_len);
+    guest_puts("\n");
+
+    /* 调试：尝试 clean dcache 到内存 */
+    {
+        u64 line_size = 64;  /* 假设 64 字节 cache line */
+        u64 p = (u64)vnet.tx_desc & ~(line_size - 1);
+        u64 end = (u64)(vnet.tx_desc + VRING_SIZE);
+        while (p < end) {
+            asm volatile("dc cvac, %0" ::"r"(p) : "memory");
+            p += line_size;
+        }
+        /* 也 clean avail 环 */
+        p = (u64)vnet.tx_avail & ~(line_size - 1);
+        end = (u64)((u8 *)vnet.tx_avail + 6 + 2 * VRING_SIZE + line_size);
+        while (p < end) {
+            asm volatile("dc cvac, %0" ::"r"(p) : "memory");
+            p += line_size;
+        }
+        asm volatile("dsb sy" ::: "memory");
+        guest_puts("[dbg] dcache cleaned\n");
+    }
+
     /* 提交到 avail 环 */
     u16 avail_idx = vnet.tx_avail->idx;
     vnet.tx_avail->ring[avail_idx % VRING_SIZE] = idx;
     vnet.tx_avail->idx = avail_idx + 1;
 
+    /* 调试：读回 avail idx */
+    guest_puts("[dbg] tx_avail->idx after write = ");
+    puts_dec(vnet.tx_avail->idx);
+    guest_puts("\n");
+
+    /* 调试：clean avail ring cache */
+    {
+        u64 line_size = 64;
+        u64 p = (u64)vnet.tx_avail & ~(line_size - 1);
+        u64 end = (u64)((u8 *)vnet.tx_avail + 6 + 2 * VRING_SIZE + line_size);
+        while (p < end) {
+            asm volatile("dc cvac, %0" ::"r"(p) : "memory");
+            p += line_size;
+        }
+        asm volatile("dsb sy" ::: "memory");
+    }
+
+    /* 通知设备前再读一次 */
+    {
+        volatile u64 *p = (volatile u64 *)&vnet.tx_desc[idx].addr;
+        guest_puts("[dbg] before notify: tx_desc[0].addr = 0x");
+        puts_hex(*p, 16);
+        guest_puts("\n");
+    }
+
     /* 通知设备 */
     mmio_write32(vnet.base + VIRTIO_MMIO_QUEUE_NOTIFY, 1);
+
+    /* 调试：从 mmio 返回后，再读一次 desc[0] */
+    {
+        volatile u64 *p = (volatile u64 *)&vnet.tx_desc[idx].addr;
+        guest_puts("[dbg] after notify: tx_desc[0].addr = 0x");
+        puts_hex(*p, 16);
+        guest_puts("\n");
+    }
 
     tx_desc_idx++;
     return 0;
@@ -659,14 +723,98 @@ void guest_irq_handler(void)
 
 /* ---------- 主函数 ---------- */
 
+/* ---- MMU 初始化 (等值映射，开启 cache) ---- */
+
+/* Level 1 页表 (4KB 对齐)，用 1GB block 映射 */
+static u64 __attribute__((aligned(4096))) guest_pg_dir[512];
+
+#define MMU_MAIR_DEV     0  /* AttrIndx = 0: Device-nGnRnE */
+#define MMU_MAIR_NORM    1  /* AttrIndx = 1: Normal WB RA WA */
+
+#define PTE_TYPE_BLOCK   1
+#define PTE_AF           (1UL << 10)
+#define PTE_SH_INNER     (3UL << 8)
+
+static void mmu_init(void)
+{
+    /* MAIR_EL1
+     * Attr 0: 0x00 -> Device-nGnRnE
+     * Attr 1: 0xFF -> Normal, Outer WB RA WA, Inner WB RA WA
+     */
+    u64 mair = (0x00ULL << (8 * 0)) | (0xFFULL << (8 * 1));
+    SYSREG_WRITE(mair_el1, mair);
+
+    /* TCR_EL1
+     * T0SZ = 25 (39-bit input, start at Level 1)
+     * TG0 = 00 (4KB granule)
+     * IPS = 000 (32-bit PA, 4GB)
+     */
+    u64 tcr = (25 << 0)    /* T0SZ = 25 -> 39-bit input address */
+            | (0 << 14)    /* TG0 = 4KB */
+            | (0 << 32)    /* IPS = 32-bit PA */
+            | (1 << 23)    /* EPD0 = 0, enable TTBR0 */
+            | (1 << 20)    /* TBI0 = 0 */
+            ;
+    SYSREG_WRITE(tcr_el1, tcr);
+
+    /* 初始化 Level 1 页表：1GB block 映射，等值映射 */
+    /* entry 0: 0x00000000-0x3FFFFFFF -> Device (MMIO 区域) */
+    guest_pg_dir[0] = (0x00000000ULL & ~0x3FFFFFFFULL)  /* output addr */
+                    | (MMU_MAIR_DEV << 2)               /* AttrIndx */
+                    | PTE_AF
+                    | PTE_TYPE_BLOCK;
+
+    /* entry 1: 0x40000000-0x7FFFFFFF -> Normal cacheable (RAM) */
+    guest_pg_dir[1] = (0x40000000ULL & ~0x3FFFFFFFULL)  /* output addr */
+                    | (MMU_MAIR_NORM << 2)              /* AttrIndx */
+                    | PTE_SH_INNER                      /* Inner Shareable */
+                    | PTE_AF
+                    | PTE_TYPE_BLOCK;
+
+    /* entries 2-511: 不映射 (PTE=0) */
+
+    /* TTBR0_EL1: 指向页表 */
+    u64 ttbr0 = (u64)guest_pg_dir;
+    SYSREG_WRITE(ttbr0_el1, ttbr0);
+
+    /* 确保所有之前的操作完成 */
+    asm volatile("dsb sy" ::: "memory");
+    asm volatile("isb" ::: "memory");
+
+    /* 开启 MMU + 数据 cache + 指令 cache
+     * M=1 (bit 0), C=1 (bit 2), I=1 (bit 12)
+     */
+    u64 sctlr = SYSREG_READ(sctlr_el1);
+    sctlr |= (1 << 0) | (1 << 2) | (1 << 12);  /* M | C | I */
+    SYSREG_WRITE(sctlr_el1, sctlr);
+
+    asm volatile("isb" ::: "memory");
+}
+
 void guest_main(void)
 {
     u64 vmid = guest_vmid();
+
+    /* 先初始化 MMU（开启 cache，解决与 hypervisor 的 cache 一致性问题） */
+    mmu_init();
 
     guest_puts("\nguest: hello from EL1!\n");
     guest_puts("guest: I am VM ");
     puts_dec(vmid);
     guest_puts(", running on aVisor hypervisor (Phase 4)\n");
+
+    {
+        u64 sctlr = SYSREG_READ(sctlr_el1);
+        guest_puts("guest: SCTLR_EL1 = 0x");
+        puts_hex(sctlr, 16);
+        guest_puts(" (M=");
+        puts_dec((sctlr >> 0) & 1);
+        guest_puts(" C=");
+        puts_dec((sctlr >> 2) & 1);
+        guest_puts(" I=");
+        puts_dec((sctlr >> 12) & 1);
+        guest_puts(")\n");
+    }
 
     /* 初始化虚拟 GIC */
     gic_vcpu_init();

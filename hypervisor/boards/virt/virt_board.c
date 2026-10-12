@@ -156,6 +156,8 @@ static int write_rx_packet(struct virtio_mmio_dev *dev,
 {
     struct virtqueue *rxq = &dev->vqs[NET_VQ_RX];
 
+    INFO("virtio-net: rx pfn=0x%x num=%d", rxq->pfn, rxq->num);
+
     if (!vq_has_avail(dev, rxq))
         return -1;
 
@@ -190,6 +192,7 @@ static int write_rx_packet(struct virtio_mmio_dev *dev,
     }
 
     vq_add_used(dev, rxq, (uint16_t)desc_head, written);
+
     virtio_mmio_inject_irq(dev, VIRTIO_IRQ_USED_BUFFER);
     return 0;
 }

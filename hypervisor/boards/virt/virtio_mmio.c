@@ -270,54 +270,121 @@ int vq_read_desc(struct virtio_mmio_dev *dev, struct virtqueue *vq,
 
     uint64_t desc_base = vq_desc_base(vq);
     uint64_t desc_addr = desc_base + desc_idx * 16;
-    uint64_t addr;
-    uint32_t len;
-    uint16_t flags, next;
 
-    if (vq_copy_from_guest(dev, desc_addr, &addr, 8) != 8)
-        return -1;
-    if (vq_copy_from_guest(dev, desc_addr + 8, &len, 4) != 4)
-        return -1;
-    if (vq_copy_from_guest(dev, desc_addr + 12, &flags, 2) != 2)
-        return -1;
-    if (vq_copy_from_guest(dev, desc_addr + 14, &next, 2) != 2)
+    /*
+     * 一次性读取整个 16 字节描述符。
+     * 不要分开多次读（addr / len / flags / next 各读一次），
+     * 因为多次小粒度读取在某些 cache 配置下会出现第一次读到零的问题。
+     */
+    struct vring_desc {
+        uint64_t addr;
+        uint32_t len;
+        uint16_t flags;
+        uint16_t next;
+    } desc;
+
+    if (vq_copy_from_guest(dev, desc_addr, &desc, sizeof(desc)) != sizeof(desc))
         return -1;
 
-    if (addr_out)  *addr_out  = addr;
-    if (len_out)   *len_out   = len;
-    if (flags_out) *flags_out = flags;
-    if (next_out)  *next_out  = next;
+    if (addr_out)  *addr_out  = desc.addr;
+    if (len_out)   *len_out   = desc.len;
+    if (flags_out) *flags_out = desc.flags;
+    if (next_out)  *next_out  = desc.next;
 
     return 0;
 }
 
+static void *ipa_to_hv_va(struct task_struct *vm, uint64_t ipa, int *writable);
+static void dcache_invalidate_range(void *start, size_t len);
+static void dcache_clean_range(void *start, size_t len);
+
 void vq_add_used(struct virtio_mmio_dev *dev, struct virtqueue *vq,
                  uint16_t desc_idx, uint32_t len)
 {
-    if (!vq->ready)
-        return;
+	if (!vq->ready)
+		return;
 
-    uint64_t used_base = vq_used_base(vq);
-    uint16_t idx;
+	uint64_t used_base = vq_used_base(vq);
+	uint64_t page_ipa = used_base & PAGE_MASK;
+	uint64_t page_off = used_base & (PAGE_SIZE - 1);
+	void *page_va;
 
-    /* 读 used->idx */
-    if (vq_copy_from_guest(dev, used_base + 2, &idx, sizeof(idx)) != sizeof(idx))
-        return;
+	/* 确保页面已映射（used 环 guest 不会先访问，需要 hypervisor 主动分配） */
+	page_va = ipa_to_hv_va(dev->vm, page_ipa, NULL);
+	if (!page_va) {
+		page_va = allocate_task_page(dev->vm, page_ipa);
+		if (!page_va)
+			return;
+	}
 
-    /* 写 used->ring[idx % num] */
-    uint16_t ring_idx = idx % vq->num;
-    uint64_t ring_entry = used_base + 4 + ring_idx * 8;
-    uint32_t id = desc_idx;
+	uint16_t idx = *(volatile uint16_t *)((char *)page_va + page_off + 2);
+	uint16_t ring_idx = idx % vq->num;
+	uint64_t ring_off = page_off + 4 + ring_idx * 8;
 
-    vq_copy_to_guest(dev, ring_entry, &id, 4);
-    vq_copy_to_guest(dev, ring_entry + 4, &len, 4);
+	/* 写 ring entry */
+	*(volatile uint32_t *)((char *)page_va + ring_off) = desc_idx;
+	*(volatile uint32_t *)((char *)page_va + ring_off + 4) = len;
 
-    /* 增加 used->idx */
-    idx++;
-    vq_copy_to_guest(dev, used_base + 2, &idx, sizeof(idx));
+	/* 更新 idx */
+	idx++;
+	*(volatile uint16_t *)((char *)page_va + page_off + 2) = idx;
+
+	/* 确保数据写回内存（guest 以 non-cacheable 方式读） */
+	dcache_clean_range(page_va, PAGE_SIZE);
 }
 
 /* ---------- Guest 内存访问 (阶段 2 翻译) ---------- */
+
+/*
+ * Cache 维护辅助函数：按 VA 做 cache 操作
+ * ARMv8 data cache line size 通常是 64 字节（从 CTR_EL0 读取）
+ */
+static inline uint64_t get_dcache_line_size(void)
+{
+    uint64_t ctr;
+    asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    /* DminLine: bits [19:16], log2(number of words) */
+    return 4UL << ((ctr >> 16) & 0xf);
+}
+
+static void dcache_invalidate_range(void *start, size_t len)
+{
+    uint64_t line_size = get_dcache_line_size();
+    uintptr_t p = (uintptr_t)start & ~(line_size - 1);
+    uintptr_t end = (uintptr_t)start + len;
+
+    while (p < end) {
+        /*
+         * 用 ivac (Invalidate to PoC) 而不是 civac。
+         *
+         * 注意：只有在确定内存中的数据比 cache 中的更新时才用 ivac。
+         * 当 Stage 2 映射为 Non-cacheable 时，guest 写直接到内存，
+         * 而 hypervisor cache 中可能有旧数据（如 demand paging 时
+         * memzero 的零）。此时 ivac 丢弃 hypervisor cache 中的旧数据，
+         * 下次读时从内存加载最新数据。
+         *
+         * 不能用 civac：因为 civac 会先 clean（写回内存），
+         * 这会把 hypervisor cache 中的旧数据（零）写回内存，
+         * 覆盖 guest 刚写的新数据！
+         */
+        asm volatile("dc ivac, %0" ::"r"(p) : "memory");
+        p += line_size;
+    }
+    asm volatile("dsb sy" ::: "memory");
+}
+
+static void dcache_clean_range(void *start, size_t len)
+{
+    uint64_t line_size = get_dcache_line_size();
+    uintptr_t p = (uintptr_t)start & ~(line_size - 1);
+    uintptr_t end = (uintptr_t)start + len;
+
+    while (p < end) {
+        asm volatile("dc cvac, %0" ::"r"(p) : "memory");
+        p += line_size;
+    }
+    asm volatile("dsb sy" ::: "memory");
+}
 
 /*
  * 通过阶段 2 页表将 guest IPA 转换为 hypervisor 虚拟地址
@@ -375,8 +442,23 @@ int vq_copy_from_guest(struct virtio_mmio_dev *dev,
         int w;
 
         src = ipa_to_hv_va(dev->vm, guest_ipa, &w);
-        if (!src)
-            break;
+        if (!src) {
+            /*
+             * 页面尚未映射：主动做 demand paging。
+             * 读未映射的页面会返回零（新分配的页面是 zeroed 的），
+             * 这与 guest 未写入的语义一致。
+             */
+            src = allocate_task_page(dev->vm, guest_ipa & PAGE_MASK);
+            if (!src)
+                break;
+        }
+
+        /*
+         * Invalidate cache before reading guest memory.
+         * Guest 写入后数据在内存中，但 hypervisor cache 可能有旧数据，
+         * 需要 invalidate cache 强制从内存重新加载。
+         */
+        dcache_invalidate_range(src, chunk);
 
         memcpy(dst, src, chunk);
         copied += chunk;
@@ -400,10 +482,26 @@ int vq_copy_to_guest(struct virtio_mmio_dev *dev,
         int w;
 
         dst = ipa_to_hv_va(dev->vm, guest_ipa, &w);
-        if (!dst)
-            break;
+        if (!dst) {
+            /*
+             * 页面尚未映射：主动做 demand paging。
+             * 例如 used 环的页面 guest 不会先访问，
+             * hypervisor 写的时候需要先分配。
+             */
+            dst = allocate_task_page(dev->vm, guest_ipa & PAGE_MASK);
+            if (!dst)
+                break;
+        }
 
         memcpy(dst, src, chunk);
+
+        /*
+         * Clean cache after writing to guest memory.
+         * 把 cache 中的数据写回到内存，
+         * 确保 Guest 以 non-cacheable 方式读的时候能看到最新数据。
+         */
+        dcache_clean_range(dst, chunk);
+
         copied += chunk;
         guest_ipa += chunk;
         src = (const char *)src + chunk;
