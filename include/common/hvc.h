@@ -38,3 +38,6 @@
 /* Phase 12: 虚拟 SGI（vSGI）hypercall */
 #define HVC_VSGI_SEND       40  /* 发送虚拟 SGI：x0=target_vcpu_id x1=sgi_id，返回 0/-1 */
 #define HVC_VSGI_GET_CPUID  41  /* 获取当前 vCPU ID，返回 vcpu_id */
+
+/* Phase 15: 虚拟 GICD 测试 hypercall */
+#define HVC_GICD_INJECT     42  /* x0=vintid，直接经 vgic_inject_virq 注入，返回 0/-1 */

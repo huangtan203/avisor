@@ -22,8 +22,30 @@ struct vm_virt_state;
 #define VIRQ_IVSHMEM    49  /* ivshmem doorbell SPI */
 #define VIRQ_PCI_EDU    50  /* PCI 直通 edu INTx 转发的虚拟 SPI */
 
+/*
+ * Phase 15: 虚拟 GIC Distributor (GICD) 状态
+ *
+ * GICv3 的 CPU 接口 (ICC_*_EL1) 由硬件自动虚拟化（直通），但
+ * Distributor (GICD) 是 MMIO 设备，Guest 访问会 trap 到 EL2，
+ * 必须软件模拟（trap-and-emulate）。这里保存每个 VM 的 GICD 状态，
+ * 核心是 SPI 使能位图，用于在注入虚拟 SPI 时做 enable 门控。
+ */
+struct vgic_dist {
+    uint32_t ctlr;             /* GICD_CTLR：全局使能 + 亲和路由 */
+    uint32_t spi_enable[32];   /* GICD_ISENABLERn：INTID 0..1023 使能位图 */
+};
+
 void vgic_init(void);
 void vgic_inject_virq_hw(uint32_t vintid, uint32_t pintid);
+
+/*
+ * Phase 15: 虚拟 GICD 寄存器读写模拟（trap-and-emulate）
+ *   offset 为相对 GICD 基址 (0x08000000) 的偏移。
+ *   由 virt_board 的 MMIO 分派调用。
+ */
+void vgicd_init(struct vgic_dist *d);
+uint32_t vgicd_read(struct vgic_dist *d, uint32_t offset);
+void vgicd_write(struct vgic_dist *d, uint32_t offset, uint32_t val);
 
 /*
  * 向当前 Guest 注入一个 HW 映射的虚拟中断（PCI INTx 直通用，固定 LR2）

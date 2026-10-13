@@ -44,3 +44,8 @@ struct task_struct *virt_find_vcpu(int vmid, int vcpu_id);
 
 /* 向同 VM 的指定 vCPU 注入虚拟中断 */
 int virt_inject_virq_to_vcpu(int vmid, int vcpu_id, uint32_t vintid);
+
+/* Phase 15: 查询指定 VM 的虚拟 SPI 是否在 GICD 中被使能
+ * （返回 1=使能/放行，0=禁用；SGI/PPI/LPI 等非 GICD 门控范围恒返回 1）
+ * 供 vgic.c 注入路径做 enable 门控。 */
+int virt_vgicd_spi_enabled(struct task_struct *vm, uint32_t vintid);

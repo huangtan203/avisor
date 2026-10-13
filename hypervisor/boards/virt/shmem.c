@@ -24,6 +24,7 @@
 #include "arch/aarch64/mmu.h"
 #include "boards/virt/virt_mm.h"
 #include "boards/virt/vgic.h"
+#include "boards/virt/virt_board.h"
 
 #define SHM_MAX_COUNT       8       /* 最多 8 个共享内存区 */
 #define SHM_MAX_ATTACH      4       /* 每个 shm 最多 attach 4 个 VM */
@@ -270,6 +271,10 @@ int shm_notify(int shmid)
     for (int i = 0; i < SHM_MAX_ATTACH; i++) {
         struct task_struct *vm = shm->attach[i].vm;
         if (vm && vm != current && vm->state != TASK_ZOMBIE) {
+            /* Phase 15: GICD 门控——目标 SPI (60) 被禁用则跳过注入 */
+            if (!virt_vgicd_spi_enabled(vm, SHM_NOTIFY_VIRQ))
+                continue;
+
             /*
              * 如果目标 VM 正在运行（当前 CPU 上就是它），
              * 直接注入 vIRQ。

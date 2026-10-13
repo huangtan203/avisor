@@ -42,6 +42,9 @@
 /* Phase 9: vITS 虚拟 ITS 寄存器地址（trap-and-emulate） */
 #define VIRT_VITS_BASE    0x0C000000UL
 #define VIRT_VITS_SIZE    0x00010000UL   /* 64KB */
+/* Phase 15: 虚拟 GICD 寄存器地址（trap-and-emulate，物理 GICD 同址） */
+#define VIRT_VGICD_BASE   0x08000000UL
+#define VIRT_VGICD_SIZE   0x00010000UL   /* 64KB */
 
 /* ivshmem 共享内存物理地址（从页池分配） */
 static uint64_t ivshmem_shmem_pa = 0;
@@ -70,6 +73,9 @@ struct virt_vm_devices {
 
     /* Phase 9: vITS（虚拟 ITS）状态 */
     struct vits_state vits;
+
+    /* Phase 15: 虚拟 GIC Distributor (GICD) 状态 */
+    struct vgic_dist vgicd;
 };
 
 /* ---------- 页面分配池 ---------- */
@@ -282,6 +288,10 @@ static int virt_is_mmio_addr(struct task_struct *tsk, unsigned long ipa)
 {
     (void)tsk;
 
+    /* Phase 15: 虚拟 GICD 寄存器区域（trap-and-emulate） */
+    if (ipa >= VIRT_VGICD_BASE && ipa < VIRT_VGICD_BASE + VIRT_VGICD_SIZE)
+        return 1;
+
     /* virtio-net MMIO 区域 */
     if (ipa >= VIRTIO_NET_BASE && ipa < VIRTIO_NET_BASE + VIRTIO_NET_SIZE)
         return 1;
@@ -313,6 +323,12 @@ static unsigned long virt_mmio_read(struct task_struct *tsk,
     if (!devs)
         return 0;
 
+    /* Phase 15: 虚拟 GICD 寄存器读 */
+    if (ipa >= VIRT_VGICD_BASE && ipa < VIRT_VGICD_BASE + VIRT_VGICD_SIZE) {
+        uint32_t offset = (uint32_t)(ipa - VIRT_VGICD_BASE);
+        return vgicd_read(&devs->vgicd, offset);
+    }
+
     /* virtio-net */
     if (ipa >= VIRTIO_NET_BASE && ipa < VIRTIO_NET_BASE + VIRTIO_NET_SIZE) {
         uint32_t offset = (uint32_t)(ipa - VIRTIO_NET_BASE);
@@ -340,6 +356,13 @@ static void virt_mmio_write(struct task_struct *tsk,
     struct virt_vm_devices *devs = get_vm_devices(tsk);
     if (!devs)
         return;
+
+    /* Phase 15: 虚拟 GICD 寄存器写 */
+    if (ipa >= VIRT_VGICD_BASE && ipa < VIRT_VGICD_BASE + VIRT_VGICD_SIZE) {
+        uint32_t offset = (uint32_t)(ipa - VIRT_VGICD_BASE);
+        vgicd_write(&devs->vgicd, offset, (uint32_t)val);
+        return;
+    }
 
     /* virtio-net */
     if (ipa >= VIRTIO_NET_BASE && ipa < VIRTIO_NET_BASE + VIRTIO_NET_SIZE) {
@@ -431,6 +454,9 @@ static void virt_initialize(struct task_struct *tsk)
     ivshmem_init(&devs->ivshmem, tsk, peer_id,
                  ivshmem_shmem_pa, VIRTIO_IVSHMEM_MEM_SIZE,
                  VIRTIO_IVSHMEM_REG_BASE, VIRTIO_IVSHMEM_MEM_BASE);
+
+    /* Phase 15: 初始化虚拟 GICD（默认所有 SPI 使能） */
+    vgicd_init(&devs->vgicd);
 
     /* Phase 9: 初始化 vITS（虚拟 ITS）
      * 仅为直通了 PCI 设备的 VM（VM1）启用 vITS，
@@ -612,6 +638,22 @@ int virt_inject_virq_to_vcpu(int vmid, int vcpu_id, uint32_t vintid)
         return -1;
 
     return vgic_inject_virq_to_vm(target, vintid);
+}
+
+/*
+ * Phase 15: 查询指定 VM 的虚拟 SPI 是否在 GICD 中被使能
+ *
+ * 供 vgic.c 的 vgic_inject_virq() 做 enable 门控。SGI/PPI/LPI 等
+ * 非 GICD SPI 门控范围的中断由调用方保证不走到这里（或此处恒放行）。
+ */
+int virt_vgicd_spi_enabled(struct task_struct *vm, uint32_t vintid)
+{
+    struct virt_vm_devices *devs =
+        (struct virt_vm_devices *)vm->board_data;
+    if (!devs)
+        return 1;  /* 无设备模型（如 idle）时默认放行 */
+
+    return (devs->vgicd.spi_enable[vintid >> 5] >> (vintid & 31)) & 1;
 }
 
 /* ---------- board ops ---------- */

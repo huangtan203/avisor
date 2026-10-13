@@ -9,6 +9,7 @@
  */
 
 #include "boards/virt/vgic.h"
+#include "boards/virt/virt_board.h"
 #include "boards/virt/gicv3.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
@@ -97,6 +98,86 @@ void vgic_init(void)
 }
 
 /*
+ * Phase 15: 虚拟 GICD 初始化
+ *
+ * 默认所有 SPI 使能（spi_enable 全 1），保持向后兼容：现有设备 SPI
+ * （virtio 48 / ivshmem 49 / edu 50 / shm 60）无需 Guest 显式使能即可工作。
+ * Guest 之后可通过 ICENABLER/ISENABLER 自行开关。
+ */
+void vgicd_init(struct vgic_dist *d)
+{
+    if (!d)
+        return;
+
+    /* Group1 NS 使能 + 亲和路由使能 */
+    d->ctlr = GICD_CTLR_ENABLE_G1NS | GICD_CTLR_ARE_NS;
+    for (int i = 0; i < 32; i++)
+        d->spi_enable[i] = 0xFFFFFFFFu;
+}
+
+/*
+ * Phase 15: 虚拟 GICD 寄存器读（offset 相对 0x08000000）
+ */
+uint32_t vgicd_read(struct vgic_dist *d, uint32_t offset)
+{
+    if (!d)
+        return 0;
+
+    if (offset == 0x0000)
+        return d->ctlr;                 /* GICD_CTLR */
+    if (offset == 0x0004)
+        return 0x1F;                    /* GICD_TYPER: ITLinesNumber=31 */
+    if (offset == 0x0008)
+        return 0x43B;                   /* GICD_IIDR */
+
+    /* IGROUPR(n): 0x0080 + n*4，全部返回 Group 1 */
+    if (offset >= 0x0080 && offset < 0x0100 && ((offset - 0x0080) & 3) == 0)
+        return 0xFFFFFFFFu;
+
+    /* ISENABLER(n): 0x0100 + n*4 */
+    if (offset >= 0x0100 && offset < 0x0180 && ((offset - 0x0100) & 3) == 0)
+        return d->spi_enable[(offset - 0x0100) >> 2];
+
+    /* IPRIORITYR(n): 默认优先级 0xA0 */
+    if (offset >= 0x0400 && offset < 0x0800 && ((offset - 0x0400) & 3) == 0)
+        return 0xA0A0A0A0u;
+
+    /* 其余（ICENABLER/ISPENDR/ICPENDR/ICFGR/IROUTER 等）读 0 */
+    return 0;
+}
+
+/*
+ * Phase 15: 虚拟 GICD 寄存器写（offset 相对 0x08000000）
+ */
+void vgicd_write(struct vgic_dist *d, uint32_t offset, uint32_t val)
+{
+    if (!d)
+        return;
+
+    if (offset == 0x0000) {
+        /* GICD_CTLR：只保留使能 + 亲和路由位 */
+        d->ctlr = val & (GICD_CTLR_ENABLE_G0 | GICD_CTLR_ENABLE_G1NS |
+                         GICD_CTLR_ENABLE_G1S | GICD_CTLR_ARE_NS |
+                         GICD_CTLR_ARE_S);
+        return;
+    }
+
+    /* ISENABLER(n): 0x0100 + n*4，置位使能 */
+    if (offset >= 0x0100 && offset < 0x0180 && ((offset - 0x0100) & 3) == 0) {
+        d->spi_enable[(offset - 0x0100) >> 2] |= val;
+        return;
+    }
+
+    /* ICENABLER(n): 0x0180 + n*4，清除使能 */
+    if (offset >= 0x0180 && offset < 0x0200 && ((offset - 0x0180) & 3) == 0) {
+        d->spi_enable[(offset - 0x0180) >> 2] &= ~val;
+        return;
+    }
+
+    /* 其余（IGROUPR/IPRIORITYR/ICFGR/ISPENDR/IROUTER 等）忽略写 */
+}
+
+/*
  * 向当前 Guest 注入一个虚拟中断（HW 直通映射模式）
  *
  * 用于 vtimer 等有对应物理中断的场景。固定使用 LR0。
@@ -151,14 +232,19 @@ uint64_t vgic_get_lr0(void)
  *
  * 返回 0 成功，-1 没有空闲 LR
  */
-int vgic_inject_virq(uint32_t vintid)
+/*
+ * 纯软件注入（不经过 GICD 门控）——内部实现。
+ *
+ * 从 LR1 开始查找空闲 LR：
+ *   LR0 预留给 vtimer（HW 映射）
+ *   LR2 预留给 PCI INTx（HW+EOI 映射）
+ * 软件注入只使用 LR1。
+ *
+ * 与 GICD 门控解耦：vITS 的 LPI 注入、vSGI 注入都走这里，
+ * 它们由 ITS / SGI 各自的使能语义管理，不受 GICD SPI enable 门控。
+ */
+static int vgic_inject_virq_raw(uint32_t vintid)
 {
-    /*
-     * 从 LR1 开始查找空闲 LR：
-     *   LR0 预留给 vtimer（HW 映射）
-     *   LR2 预留给 PCI INTx（HW+EOI 映射）
-     * 软件注入只使用 LR1。
-     */
     for (int i = 1; i < NR_VGIC_LRS - 1; i++) {
         uint64_t lr = read_lr(i);
         if ((lr & ICH_LR_STATE_MASK) == 0) {
@@ -180,6 +266,25 @@ int vgic_inject_virq(uint32_t vintid)
             return 0;
     }
     return -1;  /* 没有空闲 LR */
+}
+
+/*
+ * 纯软件注入虚拟中断（设备 SPI 入口，带 GICD enable 门控）
+ *
+ * 用于 virtio、ivshmem、edu MSI 等纯软件设备向当前 VM 注入 SPI。
+ * 若目标虚拟 SPI 在 GICD 中被 Guest 禁用（ICENABLER），则丢弃并返回 -1，
+ * 模拟真实 GICD 对禁用 SPI 的屏蔽行为。
+ *
+ * 返回 0 成功，-1 被门控丢弃或没有空闲 LR
+ */
+int vgic_inject_virq(uint32_t vintid)
+{
+    /* SPI (32-1019) 受 GICD enable 门控；SGI/PPI/LPI 不在此列 */
+    if (vintid >= 32 && vintid < 1020 &&
+        !virt_vgicd_spi_enabled(current, vintid))
+        return -1;
+
+    return vgic_inject_virq_raw(vintid);
 }
 
 /*
@@ -267,9 +372,10 @@ int vgic_inject_virq_to_vm(struct task_struct *vm, uint32_t vintid)
     if (!vm || vm->state == TASK_ZOMBIE)
         return -1;
 
-    /* 情况 1：目标就是当前运行的 vCPU，直接写本核硬件 LR */
+    /* 情况 1：目标就是当前运行的 vCPU，直接写本核硬件 LR
+     * （走 raw：LPI/vSGI 经此路径，不受 GICD SPI enable 门控） */
     if (vm == current && vm->pid != 0)
-        return vgic_inject_virq(vintid);
+        return vgic_inject_virq_raw(vintid);
 
     /* 情况 3：跨核——mailbox + 物理 SGI 交给目标核处理 */
     if (vm->phys_cpu != smp_processor_id()) {
@@ -316,8 +422,9 @@ void vgic_ipi_update_handle(void)
         vm->virt.vgic_ipi_pending = 0;
 
         if (cpu_state[cpu].curr == vm) {
-            /* 目标正在运行：写硬件 LR，立即送达 */
-            vgic_inject_virq(vintid);
+            /* 目标正在运行：写硬件 LR，立即送达
+             * （走 raw：LPI/vSGI 经此路径，不受 GICD SPI enable 门控） */
+            vgic_inject_virq_raw(vintid);
         } else {
             /* 目标未运行：写 saved state，下次调度恢复时生效 */
             vgic_inject_saved(&vm->virt, vintid);

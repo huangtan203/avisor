@@ -21,6 +21,7 @@
 #include "boards/virt/pci.h"
 #include "boards/virt/virt_mm.h"
 #include "boards/virt/virt_board.h"
+#include "boards/virt/vgic.h"
 #include "boards/virt/shmem.h"
 #endif
 
@@ -203,6 +204,13 @@ void handle_hvc64(unsigned long hvc_nr)
 	}
 	case HVC_VSGI_GET_CPUID:
 		regs->regs[0] = current->vcpu_id;
+		break;
+
+	/* Phase 15: 虚拟 GICD 测试 hypercall——直接经 vgic_inject_virq
+	 * 注入指定虚拟 SPI（带 GICD enable 门控），返回值 0=注入成功，
+	 * -1=被 GICD 门控丢弃或 LR 无空闲。供 guest 验证 trap-and-emulate。 */
+	case HVC_GICD_INJECT:
+		regs->regs[0] = vgic_inject_virq((uint32_t)regs->regs[0]);
 		break;
 #endif
 	default:

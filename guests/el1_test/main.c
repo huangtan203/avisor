@@ -114,6 +114,127 @@ static void gic_vcpu_init(void)
     icc_igrpen1_write(1);
 }
 
+/* ---------- Phase 15: 虚拟 GICD (trap-and-emulate) ---------- */
+
+#define GICD_BASE           0x08000000UL
+#define GICD_CTLR           (GICD_BASE + 0x0000)
+#define GICD_TYPER          (GICD_BASE + 0x0004)
+#define GICD_IIDR           (GICD_BASE + 0x0008)
+#define GICD_ISENABLER(n)   (GICD_BASE + 0x0100 + (n) * 4)
+#define GICD_ICENABLER(n)   (GICD_BASE + 0x0180 + (n) * 4)
+
+#define GICD_CTLR_ENABLE_G1NS   (1 << 1)
+#define GICD_CTLR_ARE_NS        (1 << 4)
+
+/* 虚拟 GICD 测试接收标志 */
+static volatile int vgicd_irq_received = 0;
+
+static inline int vgicd_inject(u32 vintid)
+{
+    return (int)hvc_call(HVC_GICD_INJECT, (u64)vintid);
+}
+
+/*
+ * 初始化虚拟 GICD（演示 trap-and-emulate 写）：
+ *   读 GICD_CTLR 确认 Hypervisor 默认已使能 Group1 NS + 亲和路由，
+ *   若未使能则写回使能位（幂等）。
+ */
+static void gic_dist_init(void)
+{
+    u32 ctlr = mmio_read32(GICD_CTLR);
+    guest_puts("gicd: GICD_CTLR = 0x");
+    puts_hex(ctlr, 8);
+    guest_puts("\n");
+
+    if (!(ctlr & GICD_CTLR_ENABLE_G1NS)) {
+        mmio_write32(GICD_CTLR, GICD_CTLR_ENABLE_G1NS | GICD_CTLR_ARE_NS);
+        guest_puts("gicd: GICD_CTLR enabled Group1 NS\n");
+    }
+}
+
+/*
+ * Phase 15: 虚拟 GICD (trap-and-emulate) 测试
+ *
+ * 验证 Hypervisor 对 GIC Distributor MMIO 的软件模拟：
+ *   1. 读 TYPER / IIDR，确认模拟值
+ *   2. 读 ISENABLER，确认默认所有 SPI 使能
+ *   3. ICENABLER 禁用测试 SPI -> HVC_GICD_INJECT 被门控返回 -1 且收不到中断
+ *   4. ISENABLER 重新使能 -> HVC_GICD_INJECT 返回 0 且收到中断
+ */
+static void phase15_vgicd_test(void)
+{
+    guest_puts("\n========================================\n");
+    guest_puts("  Phase 15: Virtual GICD emulation\n");
+    guest_puts("========================================\n");
+
+    /* 1. 读标识寄存器，验证 trap-and-emulate 读 */
+    u32 typer = mmio_read32(GICD_TYPER);
+    u32 iidr = mmio_read32(GICD_IIDR);
+    guest_puts("gicd: GICD_TYPER = 0x");
+    puts_hex(typer, 8);
+    guest_puts(", GICD_IIDR = 0x");
+    puts_hex(iidr, 8);
+    guest_puts("\n");
+
+    int spi_idx = VGICD_TEST_VIRQ >> 5;         /* 52 >> 5 = 1 */
+    u32 spi_bit = 1u << (VGICD_TEST_VIRQ & 31); /* bit 20 */
+
+    /* 2. 默认所有 SPI 使能，确认测试 SPI 使能位为 1 */
+    u32 en = mmio_read32(GICD_ISENABLER(spi_idx));
+    guest_puts("gicd: ISENABLER[1] = 0x");
+    puts_hex(en, 8);
+    guest_puts(" (SPI 52 enabled = ");
+    puts_dec((en & spi_bit) ? 1 : 0);
+    guest_puts(")\n");
+
+    /* 3. 禁用测试 SPI，验证注入被门控丢弃 */
+    guest_puts("gicd: disabling SPI 52 via ICENABLER...\n");
+    mmio_write32(GICD_ICENABLER(spi_idx), spi_bit);
+
+    vgicd_irq_received = 0;
+    int ret = vgicd_inject(VGICD_TEST_VIRQ);
+
+    /* 稍等，确认禁用期间没有中断送达 */
+    int timeout = 100000;
+    while (timeout-- > 0)
+        asm volatile("nop");
+
+    guest_puts("gicd: inject while disabled -> ret=");
+    puts_dec(ret);
+    guest_puts(", irq_received=");
+    puts_dec(vgicd_irq_received);
+    guest_puts("\n");
+
+    if (ret == -1 && vgicd_irq_received == 0)
+        guest_puts("gicd: gating PASSED (disabled SPI dropped)\n");
+    else
+        guest_puts("gicd: gating FAILED\n");
+
+    /* 4. 重新使能测试 SPI，验证注入正常送达 */
+    guest_puts("gicd: re-enabling SPI 52 via ISENABLER...\n");
+    mmio_write32(GICD_ISENABLER(spi_idx), spi_bit);
+
+    vgicd_irq_received = 0;
+    ret = vgicd_inject(VGICD_TEST_VIRQ);
+
+    timeout = 10000000;
+    while (!vgicd_irq_received && timeout-- > 0)
+        asm volatile("nop");
+
+    guest_puts("gicd: inject while enabled -> ret=");
+    puts_dec(ret);
+    guest_puts(", irq_received=");
+    puts_dec(vgicd_irq_received);
+    guest_puts("\n");
+
+    if (ret == 0 && vgicd_irq_received)
+        guest_puts("gicd: inject PASSED (enabled SPI delivered)\n");
+    else
+        guest_puts("gicd: inject FAILED\n");
+
+    guest_puts("\nPhase 15: ALL tests done\n");
+}
+
 /* ---------- 虚拟定时器 ---------- */
 
 static u64 timer_freq;
@@ -1839,6 +1960,9 @@ void guest_irq_handler(void)
     } else if (intid == SHM_NOTIFY_VIRQ) {
         /* 共享内存通知中断（Phase 10） */
         shm_notify_received = 1;
+    } else if (intid == VGICD_TEST_VIRQ) {
+        /* Phase 15: 虚拟 GICD 测试中断 */
+        vgicd_irq_received = 1;
     } else if (intid < 16) {
         /* Phase 12: SGI（软件生成中断，vSGI 测试用）
          * SGI INTID 范围 0-15。
@@ -1993,6 +2117,9 @@ void guest_main(void)
     gic_vcpu_init();
     guest_puts("guest: virtual GIC CPU interface initialized\n");
 
+    /* 初始化虚拟 GIC Distributor（Phase 15 trap-and-emulate） */
+    gic_dist_init();
+
     /* 初始化虚拟定时器 */
     vtimer_start();
     guest_puts("guest: virtual timer started\n");
@@ -2033,6 +2160,9 @@ void guest_main(void)
      * 需要次 vCPU 配合。Phase 14 起两个 VM 都是双核，
      * 两个 vCPU 都会进入，内部用 cpuid 区分主/次角色 */
     phase12_vsgi_test();
+
+    /* 测试 8: Phase 15 虚拟 GICD 模拟（trap-and-emulate） */
+    phase15_vgicd_test();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 

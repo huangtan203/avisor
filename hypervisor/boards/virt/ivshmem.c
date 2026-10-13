@@ -7,6 +7,7 @@
 
 #include "boards/virt/ivshmem.h"
 #include "boards/virt/vgic.h"
+#include "boards/virt/virt_board.h"
 #include "arch/aarch64/sysregs.h"
 #include "arch/aarch64/mmu.h"
 #include "common/mm.h"
@@ -140,6 +141,10 @@ void ivshmem_mmio_write(struct ivshmem_dev *dev, uint32_t offset, uint32_t val)
         /* 目标就是当前 VM，直接注入硬件 LR */
         vgic_inject_virq(VIRQ_IVSHMEM);
     } else {
+        /* Phase 15: GICD 门控——目标 SPI 被禁用则丢弃 */
+        if (!virt_vgicd_spi_enabled(target->vm, VIRQ_IVSHMEM))
+            return;
+
         /* 目标不是当前 VM，修改其保存的状态 */
         struct vm_virt_state *virt = &target->vm->virt;
         int injected = 0;

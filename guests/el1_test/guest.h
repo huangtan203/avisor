@@ -61,8 +61,14 @@ typedef int bool;
 #define HVC_VSGI_SEND       40  /* x0=target_vcpu_id x1=sgi_id，返回 0/-1 */
 #define HVC_VSGI_GET_CPUID  41  /* 返回当前 vCPU ID */
 
+/* Phase 15: 虚拟 GICD 测试 hypercall */
+#define HVC_GICD_INJECT     42  /* x0=vintid，直接注入虚拟 SPI，返回 0/-1 */
+
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60
+
+/* Phase 15: 虚拟 GICD 测试用虚拟 SPI（避开 48/49/50/60 已有设备 SPI） */
+#define VGICD_TEST_VIRQ     52
 
 /* ---- 内联汇编访问系统寄存器 ---- */
 
