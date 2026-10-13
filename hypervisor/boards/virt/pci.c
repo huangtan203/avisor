@@ -17,6 +17,7 @@
 #include "boards/virt/pci.h"
 #include "boards/virt/base.h"
 #include "boards/virt/gicv3.h"
+#include "boards/virt/its.h"
 #include "arch/aarch64/mmu.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/mm.h"
@@ -26,14 +27,38 @@
 /* PCI 配置空间寄存器偏移 */
 #define PCI_CFG_VENDOR_ID  0x00
 #define PCI_CFG_DEVICE_ID  0x02
+#define PCI_CFG_STATUS     0x06
 #define PCI_CFG_COMMAND    0x04
 #define PCI_CFG_BAR0       0x10
 #define PCI_CFG_INTR       0x3c  /* interrupt line[7:0] / pin[15:8] */
+#define PCI_CFG_CAP_PTR    0x34  /* Capabilities Pointer */
 
 /* Command 寄存器位 */
 #define PCI_CMD_IO         (1 << 0)
 #define PCI_CMD_MEMORY     (1 << 1)
 #define PCI_CMD_BUSMASTER  (1 << 2)
+#define PCI_CMD_INTX_DIS   (1 << 10) /* INTx Disable */
+
+/* Status 寄存器位 */
+#define PCI_STAT_CAP_LIST  (1 << 4)  /* Capabilities List */
+
+/* Capability IDs */
+#define PCI_CAP_ID_MSI     0x05
+#define PCI_CAP_ID_MSIX    0x11
+
+/* MSI Capability 寄存器偏移（32 位消息地址模式） */
+#define PCI_MSI_CTRL       0x02  /* Message Control（offset 相对于 cap 头部） */
+#define PCI_MSI_ADDR_LO    0x04  /* Message Address（32位） */
+#define PCI_MSI_DATA       0x08  /* Message Data（32位） */
+#define PCI_MSI_MASK       0x0c  /* Mask Bits（可选，取决于 MSC） */
+#define PCI_MSI_PEND       0x10  /* Pending Bits（可选） */
+
+/* MSI Message Control 位 */
+#define PCI_MSI_CTRL_EN          (1 << 0)   /* MSI Enable */
+#define PCI_MSI_CTRL_MMC_SHIFT   1          /* Multiple Message Capable（位宽） */
+#define PCI_MSI_CTRL_MME_SHIFT   4          /* Multiple Message Enable */
+#define PCI_MSI_CTRL_64BIT       (1 << 7)   /* 64-bit Address */
+#define PCI_MSI_CTRL_MASK        (1 << 8)   /* Per-vector Masking */
 
 /* edu 设备位置（枚举时填充） */
 static unsigned int edu_bus;
@@ -51,6 +76,13 @@ static int edu_found = 0;
  * 0 表示 edu 未找到（不转发中断）。
  */
 unsigned int pci_edu_intx_irq = 0;
+
+/*
+ * edu MSI 相关变量（Phase 8）
+ */
+static int edu_msi_cap_off = 0;   /* MSI Capability 在配置空间中的偏移（0=不存在） */
+unsigned int pci_edu_lpi_base = 0;  /* edu MSI 对应的 LPI 基址（0=未配置） */
+unsigned int pci_edu_msi_enabled = 0; /* MSI 是否已启用 */
 
 /*
  * ECAM 配置空间地址计算
@@ -171,6 +203,114 @@ void pci_init(void)
     gic_enable_irq(pci_edu_intx_irq);
     INFO("PCI: edu INTx (GIC %u) routed to CPU0 and enabled",
          pci_edu_intx_irq);
+
+    /*
+     * 5. MSI 配置（Phase 8）
+     *
+     * 优先使用 MSI 代替 INTx：
+     *   - 探测 MSI Capability
+     *   - ITS 建立 device/collection/interrupt 映射
+     *   - 写 MSI 消息地址 + 数据
+     *   - 使能 MSI，禁用 INTx
+     */
+    {
+        /* 5.1 检查 Status 寄存器的 Capabilities List 位 */
+        uint32_t status = pci_config_read(edu_bus, edu_dev, edu_func,
+                                          PCI_CFG_STATUS);
+        if (!(status & PCI_STAT_CAP_LIST)) {
+            INFO("PCI: edu has no capability list, use INTx only");
+            return;
+        }
+
+        /* 5.2 读取 Cap Pointer，遍历 capability 列表找 MSI */
+        uint8_t cap_off = (uint8_t)pci_config_read(edu_bus, edu_dev, edu_func,
+                                                    PCI_CFG_CAP_PTR);
+        while (cap_off != 0 && cap_off != 0xFF) {
+            uint32_t cap_hdr = pci_config_read(edu_bus, edu_dev, edu_func,
+                                               cap_off);
+            uint8_t cap_id = (uint8_t)(cap_hdr & 0xFF);
+            uint8_t next_ptr = (uint8_t)((cap_hdr >> 8) & 0xFF);
+
+            if (cap_id == PCI_CAP_ID_MSI) {
+                edu_msi_cap_off = cap_off;
+                break;
+            }
+            cap_off = next_ptr;
+        }
+
+        if (edu_msi_cap_off == 0) {
+            INFO("PCI: edu has no MSI capability, use INTx only");
+            return;
+        }
+
+        /* 5.3 读 MSI Message Control 寄存器 */
+        uint32_t msi_ctrl = pci_config_read(edu_bus, edu_dev, edu_func,
+                                            edu_msi_cap_off + PCI_MSI_CTRL);
+        int is_64bit = (msi_ctrl & PCI_MSI_CTRL_64BIT) ? 1 : 0;
+        int mme_shift = (msi_ctrl >> PCI_MSI_CTRL_MMC_SHIFT) & 0x7;
+        unsigned int max_vectors = 1 << mme_shift;
+
+        INFO("PCI: edu MSI cap at 0x%x (%s-bit, max %u vectors)",
+             edu_msi_cap_off, is_64bit ? "64" : "32", max_vectors);
+
+        /* 5.4 ITS 建立映射，分配 LPI */
+        unsigned int lpi_base = its_setup_pci_msi(
+            edu_bus, edu_dev, edu_func, max_vectors, 0);
+
+        if (lpi_base == 0) {
+            WARN("PCI: ITS MSI setup failed, fall back to INTx");
+            return;
+        }
+        pci_edu_lpi_base = lpi_base;
+
+        /* 5.5 写 MSI 消息地址（32 位 PA，高 32 位为 0）和消息数据 */
+        uint64_t msi_addr = its_get_msi_address();
+        uint32_t msi_data = its_get_msi_data(0);  /* eventID = 0 */
+        /* Message Data 是 16 位字段：读-改-写避免越界覆盖相邻寄存器 */
+        unsigned int data_off = is_64bit ? (edu_msi_cap_off + 0x0c)
+                                         : (edu_msi_cap_off + PCI_MSI_DATA);
+        uint32_t old = pci_config_read(edu_bus, edu_dev, edu_func, data_off);
+        pci_config_write(edu_bus, edu_dev, edu_func, data_off,
+                         (old & 0xFFFF0000) | (msi_data & 0xFFFF));
+
+        if (is_64bit) {
+            /* 64 位地址：ADDR_LO 在 0x04，ADDR_HI 在 0x08 */
+            pci_config_write(edu_bus, edu_dev, edu_func,
+                             edu_msi_cap_off + PCI_MSI_ADDR_LO,
+                             (uint32_t)(msi_addr & 0xFFFFFFFF));
+            pci_config_write(edu_bus, edu_dev, edu_func,
+                             edu_msi_cap_off + PCI_MSI_ADDR_LO + 4,
+                             (uint32_t)(msi_addr >> 32));
+        } else {
+            /* 32 位地址：ADDR 在 0x04 */
+            pci_config_write(edu_bus, edu_dev, edu_func,
+                             edu_msi_cap_off + PCI_MSI_ADDR_LO,
+                             (uint32_t)(msi_addr & 0xFFFFFFFF));
+        }
+
+        /* 5.6 使能 MSI，同时禁用 INTx（置位 INTx Disable 位） */
+        msi_ctrl = pci_config_read(edu_bus, edu_dev, edu_func,
+                                   edu_msi_cap_off + PCI_MSI_CTRL);
+        /* MME = 0（1 个向量），MSI Enable = 1 */
+        msi_ctrl &= ~(0x7 << PCI_MSI_CTRL_MME_SHIFT);
+        msi_ctrl |= PCI_MSI_CTRL_EN;
+        pci_config_write(edu_bus, edu_dev, edu_func,
+                         edu_msi_cap_off + PCI_MSI_CTRL, msi_ctrl);
+
+        /* 禁用 INTx（Command 寄存器 bit 10） */
+        uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func,
+                                       PCI_CFG_COMMAND);
+        cmd |= PCI_CMD_INTX_DIS;
+        pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND, cmd);
+
+        /* INTx 模式已不再使用：同时把物理 INTx SPI 关掉，
+         * 避免 stray pending（设备侧 INTx Disable 后线不会再拉高） */
+        gic_disable_irq(pci_edu_intx_irq);
+
+        pci_edu_msi_enabled = 1;
+        INFO("PCI: edu MSI enabled (LPI base=%u, msg_addr=0x%lx msg_data=0x%x)",
+             lpi_base, msi_addr, msi_data);
+    }
 }
 
 void pci_passthrough_map(struct task_struct *vm)

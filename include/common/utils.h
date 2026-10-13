@@ -28,6 +28,8 @@ void memcpy(void *, const void *, size_t);
 extern void delay(unsigned long);
 extern void put32(unsigned long, unsigned int);
 extern unsigned int get32(unsigned long);
+extern void put64(unsigned long, unsigned long long);
+extern unsigned long long get64(unsigned long);
 extern unsigned long get_el(void);
 extern void set_stage2_pgd(unsigned long, unsigned long);
 extern void restore_sysregs(struct cpu_sysregs *);

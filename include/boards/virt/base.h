@@ -24,6 +24,8 @@
 #define VIRT_GICD_BASE     0x08000000UL   /* GICv3 Distributor */
 #define VIRT_GICR_BASE     0x080A0000UL   /* GICv3 Redistributor (CPU0基址) */
 #define VIRT_GICR_STRIDE   0x20000UL      /* 每个CPU的Redistributor间距 */
+#define VIRT_GITS_BASE     0x08080000UL   /* GICv3 Interrupt Translation Service (ITS) */
+#define VIRT_GITS_SIZE     0x00020000UL   /* ITS 寄存器空间大小 (128KB) */
 #define VIRT_UART_BASE     0x09000000UL   /* PL011 UART */
 #define VIRT_RTC_BASE      0x09010000UL   /* PL031 RTC */
 #define VIRT_GPIO_BASE     0x09030000UL   /* PL061 GPIO */
@@ -100,3 +102,4 @@
 #define UART_BASE          (VA_START + VIRT_UART_BASE)
 #define GICD_BASE          (VA_START + VIRT_GICD_BASE)
 #define GICR_BASE          (VA_START + VIRT_GICR_BASE)
+#define GITS_BASE          (VA_START + VIRT_GITS_BASE)

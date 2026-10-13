@@ -20,6 +20,7 @@
 #include "boards/virt/arch_timer.h"
 #include "boards/virt/vgic.h"
 #include "boards/virt/pci.h"
+#include "boards/virt/its.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
 #include "common/entry.h"
@@ -88,6 +89,32 @@ void handle_irq(void)
 
     /* 虚假中断：没有真正的中断，直接返回 */
     if (irq == GIC_SPURIOUS_IRQ) {
+        return;
+    }
+
+    /*
+     * LPI (Locality-specific Peripheral Interrupt) 处理（Phase 8）
+     *
+     * LPI 是 MSI/MSI-X 经 ITS 翻译后产生的中断，特点：
+     *   - INTID >= 8192（GICv3 规范，QEMU 同样强制）
+     *   - 无 active 状态：读 IAR1 时硬件即清除 pending 位
+     *   - 边沿触发：MSI 写一次触发一次，EOI 后不会重触发
+     *
+     * 处理流程：
+     *   1. IAR1 读取（gic_ack_irq）已顺带清除了 pending 位
+     *   2. 若是直通设备的 MSI 且当前在目标 VM：软件注入虚拟中断
+     *      （LPI 不能用 LR 的 HW 映射模式，纯软件注入）
+     *   3. 写 EOIR 结束（LPI 无 active 状态，不需要 DIR）
+     */
+    if (irq >= 8192) {
+        if (pci_edu_msi_enabled &&
+            irq >= pci_edu_lpi_base && irq < pci_edu_lpi_base + 16) {
+            if (current && current->pid != 0 && current->vmid == 1)
+                vgic_inject_virq(VIRQ_PCI_EDU);
+        } else {
+            WARN("LPI %u dropped (no mapping)", irq);
+        }
+        gic_eoi_irq(irq);
         return;
     }
 

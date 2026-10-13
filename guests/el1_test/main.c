@@ -962,12 +962,13 @@ static void edu_test(void)
     else
         guest_puts("edu: factorial FAILED\n");
 
-    /* 4. INTx 中断转发测试 */
-    guest_puts("edu: starting INTx interrupt test...\n");
+    /* 4. 中断转发测试（Hypervisor 侧配置为 MSI/LPI 直通，Guest 无感知） */
+    guest_puts("edu: starting interrupt test (MSI)...\n");
     edu_irq_received = 0;
     /* 清残留 irq_status */
     mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, 0xffffffff);
-    /* 写非零值到 raise 寄存器 -> 拉高 INTA -> 物理 SPI 35 -> 虚拟 SPI 50 */
+    /* 写非零值到 raise 寄存器 -> 设备发 MSI -> ITS 翻译成 LPI 8192
+     * -> Hypervisor 应答后注入虚拟 SPI 50 */
     mmio_write32(EDU_BAR0_BASE + EDU_IRQ_RAISE, 0x12345678);
 
     timeout = 10000000;
@@ -975,11 +976,11 @@ static void edu_test(void)
         asm volatile("nop");
 
     if (edu_irq_received) {
-        guest_puts("edu: INTx interrupt PASSED (irq_status=0x");
+        guest_puts("edu: MSI interrupt PASSED (irq_status=0x");
         puts_hex(edu_irq_status_val, 8);
         guest_puts(")\n");
     } else {
-        guest_puts("edu: INTx interrupt FAILED (timeout)\n");
+        guest_puts("edu: MSI interrupt FAILED (timeout)\n");
         /* 让 hypervisor dump 中断链路状态（GIC/edu/LR），定位断点 */
         hvc_call(HVC_PCI_DEBUG, 0);
     }
@@ -1011,8 +1012,8 @@ void guest_irq_handler(void)
     } else if (intid == IVSHMEM_IRQ) {
         ivshmem_irq_handler();
     } else if (intid == PCI_EDU_IRQ) {
-        /* 先拉低物理 INTx 线（清 irq_status），再走末尾统一虚拟 EOI，
-         * 避免 HW 联动去活物理中断后电平仍未清除导致重触发风暴 */
+        /* 清设备侧 irq_status（MSI 模式下设备看到状态归零即安静，
+         * 之后走末尾统一虚拟 EOI 结束软件注入的虚拟中断） */
         edu_irq_status_val = mmio_read32(EDU_BAR0_BASE + EDU_IRQ_STATUS);
         mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, edu_irq_status_val);
         edu_irq_received = 1;

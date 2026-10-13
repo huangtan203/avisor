@@ -22,6 +22,14 @@ void pci_init(void);
  */
 extern unsigned int pci_edu_intx_irq;
 
+/*
+ * edu MSI 相关（Phase 8）
+ *   pci_edu_lpi_base  : MSI 分配的 LPI 基址（0=未配置 MSI）
+ *   pci_edu_msi_enabled: 1 表示 MSI 已启用（替代 INTx）
+ */
+extern unsigned int pci_edu_lpi_base;
+extern unsigned int pci_edu_msi_enabled;
+
 /* 把 edu 的 ECAM + BAR0 映射进指定 VM 的 Stage 2（MMIO 直通） */
 void pci_passthrough_map(struct task_struct *vm);
 
