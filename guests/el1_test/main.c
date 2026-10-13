@@ -914,8 +914,212 @@ static void ivshmem_pingpong_test(void)
 
 #define PCI_EDU_IRQ        50              /* 虚拟 SPI（hypervisor 转发） */
 
+/* ---------- Phase 9: vITS 虚拟 ITS 驱动 ---------- */
+
+#define VITS_BASE          0x0C000000UL   /* vITS 虚拟基地址 (IPA) */
+
+/* vITS 寄存器偏移 */
+#define VITS_CTLR          0x0000
+#define VITS_TYPER         0x0008
+#define VITS_CBASER        0x0080
+#define VITS_CWRITER       0x0088
+#define VITS_CREADR        0x0090
+#define VITS_BASER(n)      (0x0100 + (n) * 8)
+#define VITS_TRANSLATER    0x10040
+
+/* ITS 命令码 */
+#define ITS_CMD_SYNC       0x05
+#define ITS_CMD_MAPD       0x08
+#define ITS_CMD_MAPC       0x09
+#define ITS_CMD_MAPTI      0x0A
+
+/* 命令队列大小（1 页 = 128 条命令） */
+#define VITS_CMDQ_SIZE     4096
+
+/* vITS 命令队列内存（从 guest heap 分配，4KB 对齐） */
+static u64 vits_cmdq_buf[512];   /* 512 * 8 = 4096 字节 */
+
+/* vITS 设备表/集合表（简化：各 1 页） */
+static u64 vits_devtab_buf[512];
+static u64 vits_colltab_buf[512];
+
+/* vITS 命令队列写指针（字节偏移） */
+static u32 vits_cwriter = 0;
+
+/*
+ * 发送一条 vITS 命令（32 字节 = 4 x u64）
+ * 写命令到命令队列，然后写 CWRITER 触发处理
+ */
+static void vits_send_cmd(u64 d0, u64 d1, u64 d2, u64 d3)
+{
+    u64 *slot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
+    slot[0] = d0;
+    slot[1] = d1;
+    slot[2] = d2;
+    slot[3] = d3;
+    asm volatile("dsb sy" ::: "memory");
+
+    vits_cwriter += 32;
+    if (vits_cwriter >= VITS_CMDQ_SIZE)
+        vits_cwriter = 0;
+
+    mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+
+    /* 等 CREADR == CWRITER（同步处理模型） */
+    int timeout = 1000000;
+    while (mmio_read32(VITS_BASE + VITS_CREADR) != vits_cwriter &&
+           --timeout > 0)
+        asm volatile("nop");
+    if (timeout == 0)
+        guest_puts("vITS: command timeout!\n");
+}
+
+/*
+ * 初始化 vITS
+ *   - 读 TYPER 确认能力
+ *   - 配置命令队列（CBASER）
+ *   - 配置设备表/集合表（BASER0/BASER1）
+ *   - 使能 ITS（CTLR.Enabled = 1）
+ */
+static int vits_init(void)
+{
+    u32 typer_lo = mmio_read32(VITS_BASE + VITS_TYPER);
+    u32 typer_hi = mmio_read32(VITS_BASE + VITS_TYPER + 4);
+
+    guest_puts("vITS: TYPER=0x");
+    puts_hex(typer_hi, 8);
+    puts_hex(typer_lo, 8);
+    guest_puts("\n");
+
+    if (typer_lo == 0) {
+        guest_puts("vITS: device not present (TYPER=0)\n");
+        return -1;
+    }
+
+    /* 确保命令队列缓冲区 4KB 对齐 */
+    u64 cmdq_pa = (u64)vits_cmdq_buf;
+    if (cmdq_pa & 0xFFF) {
+        guest_puts("vITS: cmdq not 4KB aligned\n");
+        return -1;
+    }
+
+    /* 配置 CBASER：V=1 + PA + SIZE=0（1 页 = 4KB） */
+    u64 cbaser = (1ULL << 63) | (cmdq_pa & ~0xFFFULL) | 0;  /* SIZE=0 -> 1 page */
+    mmio_write32(VITS_BASE + VITS_CBASER, (u32)(cbaser & 0xFFFFFFFF));
+    mmio_write32(VITS_BASE + VITS_CBASER + 4, (u32)(cbaser >> 32));
+
+    /* 配置 BASER0：设备表（Device table） */
+    u64 baser0 = (1ULL << 63) | ((u64)vits_devtab_buf & ~0xFFFULL);
+    mmio_write32(VITS_BASE + VITS_BASER(0), (u32)(baser0 & 0xFFFFFFFF));
+    mmio_write32(VITS_BASE + VITS_BASER(0) + 4, (u32)(baser0 >> 32));
+
+    /* 配置 BASER1：集合表（Collection table） */
+    u64 baser1 = (1ULL << 63) | ((u64)vits_colltab_buf & ~0xFFFULL);
+    mmio_write32(VITS_BASE + VITS_BASER(1), (u32)(baser1 & 0xFFFFFFFF));
+    mmio_write32(VITS_BASE + VITS_BASER(1) + 4, (u32)(baser1 >> 32));
+
+    /* 使能 ITS */
+    mmio_write32(VITS_BASE + VITS_CTLR, 0x1);
+
+    guest_puts("vITS: initialized and enabled\n");
+    return 0;
+}
+
+/*
+ * vITS MAPC：映射 collection 到目标 CPU
+ *   icid = collection ID
+ *   procnum = 目标 Redistributor 编号
+ */
+static void vits_mapc(u16 icid, u32 procnum)
+{
+    /* dw2 = V[63] | RDBASE(procnum)[47:16] | ICID[15:0] */
+    u64 dw2 = (1ULL << 63) | ((u64)procnum << 16) | icid;
+    vits_send_cmd(ITS_CMD_MAPC, 0, dw2, 0);
+    guest_puts("vITS: MAPC icid=");
+    puts_dec(icid);
+    guest_puts(" procnum=");
+    puts_dec(procnum);
+    guest_puts("\n");
+}
+
+/*
+ * vITS MAPD：映射设备（DeviceID → ITT）
+ *   devid = 设备 ID
+ *   itt_addr = ITT 表地址（GPA）
+ *   size = ITT 大小（2^(size+1) 个事件）
+ */
+static void vits_mapd(u32 devid, u64 itt_addr, u8 size)
+{
+    u64 dw0 = ITS_CMD_MAPD | ((u64)devid << 32);
+    u64 dw1 = size;
+    /* dw2 = V[63] | ITT addr[51:8] */
+    u64 dw2 = (1ULL << 63) | (itt_addr & ~0xFFULL);
+    vits_send_cmd(dw0, dw1, dw2, 0);
+    guest_puts("vITS: MAPD devid=");
+    puts_dec(devid);
+    guest_puts(" itt_addr=0x");
+    puts_hex(itt_addr, 12);
+    guest_puts("\n");
+}
+
+/*
+ * vITS MAPTI：映射事件到 LPI
+ *   devid = 设备 ID
+ *   eventid = 事件 ID
+ *   vintid = 虚拟 LPI 号
+ *   icid = collection ID
+ */
+static void vits_mapti(u32 devid, u32 eventid, u32 vintid, u16 icid)
+{
+    u64 dw0 = ITS_CMD_MAPTI | ((u64)devid << 32);
+    /* dw1 = pINTID[63:32] | EventID[31:0] （pINTID 即 Guest 指定的 vintid） */
+    u64 dw1 = ((u64)vintid << 32) | eventid;
+    u64 dw2 = icid;
+    vits_send_cmd(dw0, dw1, dw2, 0);
+    guest_puts("vITS: MAPTI devid=");
+    puts_dec(devid);
+    guest_puts(" eventid=");
+    puts_dec(eventid);
+    guest_puts(" vintid=");
+    puts_dec(vintid);
+    guest_puts(" icid=");
+    puts_dec(icid);
+    guest_puts("\n");
+}
+
+static void vits_sync(void)
+{
+    vits_send_cmd(ITS_CMD_SYNC, 0, 0, 0);
+}
+
+/*
+ * vLPI 转换为虚拟 SPI 号（与 irq.c 中的转换公式一致）：
+ *   vSPI = 64 + (vLPI - 8192)
+ * 这是 Phase 9 MVP 的约定——Guest 的 vINTID 是虚拟 LPI 号，
+ * 但 vGIC 只有 SPI 注入能力，所以做了线性转换。
+ */
+static inline u32 vlpi_to_vspi(u32 vlpi)
+{
+    return 64 + (vlpi - 8192);
+}
+
 static volatile int edu_irq_received = 0;
 static volatile u32 edu_irq_status_val = 0;
+
+/* Phase 9: vITS MSI 测试状态 */
+static volatile int vits_irq_received = 0;
+static volatile u32 vits_irq_intid = 0;
+
+/* vITS 测试：Guest 自选 vLPI 号（虚拟 LPI） */
+#define VITS_TEST_VLPI        8200   /* 虚拟 LPI 号（Guest 自选） */
+/* 转换为虚拟 SPI 号（与 irq.c 公式一致：vSPI = 64 + (vLPI - 8192)） */
+#define VITS_TEST_VSPI        (64 + (VITS_TEST_VLPI - 8192))
+
+/* edu 设备在 PCI 总线上的 requester_id (bus 0, dev 2, func 0): (0<<8)|(2<<3)|0 = 16 */
+#define EDU_DEVID             16
+
+/* ITT 表（给 vITS MAPD 用，分配一页） */
+static u64 vits_itt_buf[512];  /* 4KB */
 
 static void edu_test(void)
 {
@@ -986,6 +1190,128 @@ static void edu_test(void)
     }
 }
 
+/*
+ * Phase 9: vITS 测试
+ *
+ * 测试流程：
+ *   1. 初始化 vITS（读 TYPER、配置 CBASER/BASER、使能）
+ *   2. 发 MAPC（collection 0 -> procnum 0）
+ *   3. 发 MAPD（devid=16 -> ITT）
+ *   4. 发 MAPTI（eventid=1 -> vLPI=8200, icid=0）
+ *   5. 通过 PCI ECAM 修改 edu 的 MSI data = 1（EventID = 1）
+ *   6. 触发 edu 中断，验证收到 VITS_TEST_VSPI 号虚拟中断
+ *   7. 恢复 MSI data = 0（不影响后续回归测试）
+ */
+static void vits_test(void)
+{
+    guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
+
+    /* 1. 初始化 vITS */
+    if (vits_init() < 0) {
+        guest_puts("vITS: FAILED (init failed)\n");
+        return;
+    }
+
+    /* 2. MAPC: collection 0 -> procnum 0 */
+    vits_mapc(0, 0);
+
+    /* 3. MAPD: devid=EDU_DEVID -> ITT */
+    vits_mapd(EDU_DEVID, (u64)vits_itt_buf, 3);  /* size=3 -> 16 events */
+
+    /* 4. MAPTI: eventid=1 -> vLPI=VITS_TEST_VLPI, icid=0
+     * 用 eventid=1 避免和 Phase 8 已配置的 eventid=0 冲突 */
+    vits_mapti(EDU_DEVID, 1, VITS_TEST_VLPI, 0);
+
+    vits_sync();
+
+    /* 5. 修改 edu 的 MSI data 为 1（EventID = 1）
+     * 通过 PCI ECAM 直接写配置空间。
+     * edu 在 bus 0, dev 2, func 0。
+     * MSI Capability 在 pci_init 里探测过，偏移由 QEMU 决定。
+     * 简化：从 Cap Pointer 开始遍历，找到 MSI Capability。
+     */
+    {
+        #define PCIE_ECAM_BASE   0x3F000000UL
+        #define PCI_CFG_CAP_PTR  0x34
+        #define PCI_CFG_STATUS   0x06
+        #define PCI_CAP_ID_MSI   0x05
+        #define PCI_MSI_DATA_OFF 0x0C  /* 32-bit 地址模式下 data 寄存器偏移 */
+
+        u32 ecam_addr = 0x3F000000 + (0 << 20) + (2 << 15) + (0 << 12);
+        u8 cap_ptr = (u8)mmio_read32(ecam_addr + PCI_CFG_CAP_PTR);
+        u8 msi_cap_off = 0;
+
+        while (cap_ptr != 0 && cap_ptr != 0xFF) {
+            u32 cap_hdr = mmio_read32(ecam_addr + cap_ptr);
+            u8 cap_id = (u8)(cap_hdr & 0xFF);
+            if (cap_id == PCI_CAP_ID_MSI) {
+                msi_cap_off = cap_ptr;
+                break;
+            }
+            cap_ptr = (u8)((cap_hdr >> 8) & 0xFF);
+        }
+
+        if (msi_cap_off == 0) {
+            guest_puts("vITS: FAILED (no MSI capability found)\n");
+            return;
+        }
+
+        guest_puts("vITS: MSI cap at offset 0x");
+        puts_hex(msi_cap_off, 2);
+        guest_puts("\n");
+
+        /* 读当前 MSI data（应该是 0，即 EventID = 0） */
+        u32 msi_data = mmio_read32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF);
+        guest_puts("vITS: current MSI data = 0x");
+        puts_hex(msi_data & 0xFFFF, 4);
+        guest_puts("\n");
+
+        /* 修改 MSI data 为 1（EventID = 1） */
+        mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF,
+                     (msi_data & 0xFFFF0000) | 1);
+
+        /* 验证写成功 */
+        u32 new_data = mmio_read32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF);
+        guest_puts("vITS: new MSI data = 0x");
+        puts_hex(new_data & 0xFFFF, 4);
+        guest_puts("\n");
+
+        /* 6. 触发 edu 中断，验证收到 VITS_TEST_VSPI 号虚拟中断 */
+        guest_puts("vITS: triggering MSI with EventID=1...\n");
+        vits_irq_received = 0;
+        vits_irq_intid = 0;
+
+        /* 清残留 irq_status */
+        mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, 0xffffffff);
+
+        /* 触发 edu 中断（写非零值到 IRQ_RAISE 寄存器） */
+        mmio_write32(EDU_BAR0_BASE + EDU_IRQ_RAISE, 0xabcdef01);
+
+        /* 等待中断 */
+        int timeout = 10000000;
+        while (!vits_irq_received && timeout-- > 0)
+            asm volatile("nop");
+
+        if (vits_irq_received && vits_irq_intid == VITS_TEST_VSPI) {
+            guest_puts("vITS: PASSED! Received vSPI ");
+            puts_dec(VITS_TEST_VSPI);
+            guest_puts(" (vLPI ");
+            puts_dec(VITS_TEST_VLPI);
+            guest_puts(")\n");
+        } else {
+            guest_puts("vITS: FAILED (received intid=");
+            puts_dec(vits_irq_intid);
+            guest_puts(", expected ");
+            puts_dec(VITS_TEST_VSPI);
+            guest_puts(")\n");
+        }
+
+        /* 7. 恢复 MSI data = 0（保持 Phase 8 兼容） */
+        mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF, msi_data);
+        guest_puts("vITS: MSI data restored\n");
+    }
+}
+
 /* ---------- IRQ 处理 ---------- */
 
 void guest_irq_handler(void)
@@ -1017,6 +1343,13 @@ void guest_irq_handler(void)
         edu_irq_status_val = mmio_read32(EDU_BAR0_BASE + EDU_IRQ_STATUS);
         mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, edu_irq_status_val);
         edu_irq_received = 1;
+    } else if (intid == VITS_TEST_VSPI) {
+        /* vITS 映射的 MSI 中断（Phase 9 测试） */
+        vits_irq_intid = intid;
+        vits_irq_received = 1;
+        /* 清设备侧 IRQ status */
+        mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK,
+                     mmio_read32(EDU_BAR0_BASE + EDU_IRQ_STATUS));
     }
 
     icc_eoir1_write(iar);
@@ -1144,6 +1477,9 @@ void guest_main(void)
     if (vmid == 1) {
         guest_puts("\n--- Test 3: PCI passthrough (edu) ---\n");
         edu_test();
+
+        /* 测试 4: vITS 虚拟 ITS（仅 VM1 有 vITS） */
+        vits_test();
     }
 
     guest_puts("\nguest: all tests done, entering main loop\n");

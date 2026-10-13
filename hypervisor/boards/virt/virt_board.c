@@ -24,6 +24,7 @@
 #include "boards/virt/virtio_mmio.h"
 #include "boards/virt/ivshmem.h"
 #include "boards/virt/pci.h"
+#include "boards/virt/vits.h"
 #include "boards/virt/base.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/mm.h"
@@ -38,6 +39,9 @@
 #define VIRTIO_IVSHMEM_REG_SIZE  0x00001000UL   /* 4KB */
 #define VIRTIO_IVSHMEM_MEM_BASE  0x0B000000UL
 #define VIRTIO_IVSHMEM_MEM_SIZE  0x00100000UL   /* 1MB */
+/* Phase 9: vITS 虚拟 ITS 寄存器地址（trap-and-emulate） */
+#define VIRT_VITS_BASE    0x0C000000UL
+#define VIRT_VITS_SIZE    0x00010000UL   /* 64KB */
 
 /* ivshmem 共享内存物理地址（从页池分配） */
 static uint64_t ivshmem_shmem_pa = 0;
@@ -63,6 +67,9 @@ struct virt_vm_devices {
 
     /* ivshmem 设备 */
     struct ivshmem_dev ivshmem;
+
+    /* Phase 9: vITS（虚拟 ITS）状态 */
+    struct vits_state vits;
 };
 
 /* ---------- 页面分配池 ---------- */
@@ -283,6 +290,10 @@ static int virt_is_mmio_addr(struct task_struct *tsk, unsigned long ipa)
     if (ipa >= VIRTIO_IVSHMEM_REG_BASE && ipa < VIRTIO_IVSHMEM_REG_BASE + VIRTIO_IVSHMEM_REG_SIZE)
         return 1;
 
+    /* Phase 9: vITS 虚拟 ITS 寄存器区域（trap-and-emulate） */
+    if (ipa >= VIRT_VITS_BASE && ipa < VIRT_VITS_BASE + VIRT_VITS_SIZE)
+        return 1;
+
     /* 注意：ivshmem 共享内存区域是真实内存映射，不是 MMIO 模拟 */
 
     return 0;
@@ -314,6 +325,12 @@ static unsigned long virt_mmio_read(struct task_struct *tsk,
         return ivshmem_mmio_read(&devs->ivshmem, offset);
     }
 
+    /* Phase 9: vITS 虚拟 ITS 寄存器读 */
+    if (ipa >= VIRT_VITS_BASE && ipa < VIRT_VITS_BASE + VIRT_VITS_SIZE) {
+        uint32_t offset = (uint32_t)(ipa - VIRT_VITS_BASE);
+        return vits_mmio_read(&devs->vits, offset);
+    }
+
     return 0;
 }
 
@@ -335,6 +352,13 @@ static void virt_mmio_write(struct task_struct *tsk,
     if (ipa >= VIRTIO_IVSHMEM_REG_BASE && ipa < VIRTIO_IVSHMEM_REG_BASE + VIRTIO_IVSHMEM_REG_SIZE) {
         uint32_t offset = (uint32_t)(ipa - VIRTIO_IVSHMEM_REG_BASE);
         ivshmem_mmio_write(&devs->ivshmem, offset, (uint32_t)val);
+        return;
+    }
+
+    /* Phase 9: vITS 虚拟 ITS 寄存器写 */
+    if (ipa >= VIRT_VITS_BASE && ipa < VIRT_VITS_BASE + VIRT_VITS_SIZE) {
+        uint32_t offset = (uint32_t)(ipa - VIRT_VITS_BASE);
+        vits_mmio_write(&devs->vits, offset, val);
         return;
     }
 }
@@ -407,6 +431,13 @@ static void virt_initialize(struct task_struct *tsk)
     ivshmem_init(&devs->ivshmem, tsk, peer_id,
                  ivshmem_shmem_pa, VIRTIO_IVSHMEM_MEM_SIZE,
                  VIRTIO_IVSHMEM_REG_BASE, VIRTIO_IVSHMEM_MEM_BASE);
+
+    /* Phase 9: 初始化 vITS（虚拟 ITS）
+     * 仅为直通了 PCI 设备的 VM（VM1）启用 vITS，
+     * 因为 vITS 的物理后端依赖物理 ITS 上已配置的设备表项。 */
+    if (tsk->vmid == 1) {
+        vits_init_vm(&devs->vits, tsk);
+    }
 
     /*
      * Phase 7：PCI 直通。仅 VM1 直通 edu 设备（ECAM + BAR0）。

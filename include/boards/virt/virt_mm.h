@@ -66,6 +66,13 @@ bool check_task_page_mapped(struct task_struct *task, vaddr_t va);
 void set_task_page_notaccessable(struct task_struct *task, vaddr_t va);
 int handle_mem_abort(vaddr_t addr, uint64_t esr);
 
+/*
+ * 遍历 VM 的 stage-2 页表，把 IPA 翻译成物理 PA。
+ * 返回 0 成功，pa 填物理地址；-1 表示未映射。
+ * （用于 vITS 命令翻译：Guest 给的是 GPA/IPA，需要转成 PA 才能下发到物理 ITS）
+ */
+int ipa_to_pa(struct task_struct *vm, paddr_t ipa, paddr_t *pa);
+
 extern paddr_t pg_dir;
 
 #endif /* __ASSEMBLER__ */

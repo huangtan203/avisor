@@ -21,6 +21,7 @@
 #include "boards/virt/vgic.h"
 #include "boards/virt/pci.h"
 #include "boards/virt/its.h"
+#include "boards/virt/vits.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
 #include "common/entry.h"
@@ -107,6 +108,56 @@ void handle_irq(void)
      *   3. 写 EOIR 结束（LPI 无 active 状态，不需要 DIR）
      */
     if (irq >= 8192) {
+        /*
+         * Phase 9: 先查 vITS 的 pLPI → (vmid, vINTID) 映射表。
+         * 若找到匹配：向目标 VM 注入对应的虚拟中断。
+         * 若没找到：回退到 Phase 8 的硬编码方式（edu 的 8192..8207 → vIRQ 50）。
+         */
+        unsigned int tgt_vmid = 0, tgt_vintid = 0;
+        if (vits_lpi_to_virq(irq, &tgt_vmid, &tgt_vintid) == 0) {
+            /* 只在当前是目标 VM 且非 idle 时注入 */
+            if (current && current->pid != 0 &&
+                current->vmid == tgt_vmid) {
+                /*
+                 * vINTID 可能是虚拟 LPI（>=8192）或虚拟 SPI（<1024）。
+                 * vGIC 的软件注入只支持 SPI 范围（LR 里写 vINTID）。
+                 * 为了简单：把 vLPI 号直接当成 vSPI 号注入（取低 10 位
+                 * 会冲突，所以约定 Guest 的 vINTID 就选 SPI 范围的，
+                 * 比如 50+，虽然 MAPTI 要求 >=8192，但我们可以做转换）。
+                 *
+                 * 简化策略：vINTID 如果 >= 8192，减去 8192 + 32 作为 SPI 号。
+                 * 但更好的方式：Guest 直接用 SPI 范围的中断号，
+                 * 我们在 vITS MAPTI 时检查并接受 < 8192 的 vINTID（非规范）。
+                 *
+                 * 已经在 vits_cmd_mapti 里限制了 vINTID >= 8192。
+                 * 这里做一个转换：vINTID - 8192 + 64（避开低号 SPI）。
+                 * 但这样 Guest 不知道实际注入的是哪个号。
+                 *
+                 * 最简单的方式：允许 vINTID 直接注入（LR 写任意值都可以，
+                 * 只要 Guest 知道是多少就行）。GICv3 的 LR 寄存器的
+                 * vINTID 字段是 10 位（vINTID[9:0]），最大 1023。
+                 * 所以 LPI 号 (>=8192) 不能直接写 LR —— 必须截断/转换。
+                 *
+                 * Phase 9 MVP 方案：Guest 指定的 vINTID 是虚拟 LPI 号，
+                 * 我们把它映射到一个虚拟 SPI 号，公式：
+                 *   vSPI = (vINTID - 8192) + 64  （从 SPI 64 开始，避开常用号）
+                 * Guest 侧需要知道这个映射规则（或我们通过某种方式告知）。
+                 *
+                 * 更简单：Guest 驱动里，用 vINTID = 8192 + X，
+                 * 实际注入的虚拟 SPI 号 = 64 + X。Guest 侧 ISR 用 64+X 来 ack。
+                 *
+                 * 先这样实现，Guest 端配合。
+                 */
+                uint32_t vspi = (tgt_vintid >= 8192)
+                                    ? (64 + (tgt_vintid - 8192))
+                                    : tgt_vintid;
+                vgic_inject_virq(vspi);
+            }
+            gic_eoi_irq(irq);
+            return;
+        }
+
+        /* Phase 8 兼容：硬编码 edu 的 8192..8207 → vIRQ 50 */
         if (pci_edu_msi_enabled &&
             irq >= pci_edu_lpi_base && irq < pci_edu_lpi_base + 16) {
             if (current && current->pid != 0 && current->vmid == 1)

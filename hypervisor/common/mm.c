@@ -326,3 +326,80 @@ int handle_mem_abort(vaddr_t addr, uint64_t esr)
 
 	return -1;
 }
+
+/*
+ * 遍历 VM 的 stage-2 页表，把 IPA 翻译成物理 PA。
+ * 返回 0 成功，pa 填物理地址（含页内偏移）；-1 表示未映射。
+ *
+ * 页表结构（3 级，4KB granule，T0SZ=16 -> 48-bit IPA）：
+ *   Level 1 (pg_dir)  : [47:30] -> 1GB block / Level 2 table
+ *   Level 2           : [29:21] -> 2MB block / Level 3 table
+ *   Level 3           : [20:12] -> 4KB page
+ *
+ * 但实际 aVisor 用的是 2 级映射（LV1_SHIFT=30, LV2_SHIFT=21，
+ * map_stage2_page 里有 lv1_table -> lv2_table -> lv3_table 三级）。
+ * 仔细看 mm.c 的 map_stage2_page：
+ *   lv1_table (first_table) -> map_stage2_table(LV1_SHIFT=30) -> lv2_table
+ *   lv2_table -> map_stage2_table(LV2_SHIFT=21) -> lv3_table
+ *   lv3_table -> map_stage2_table_entry(PAGE_SHIFT=12) -> page
+ * 所以是 3 级：L1(1GB) -> L2(2MB) -> L3(4KB page)。
+ *
+ * 每个 table entry：
+ *   bit [0] = 0 表示无效（fault）
+ *   bit [1:0] = 01 表示 block（L1/L2）
+ *   bit [1:0] = 11 表示 table / page（L3 是 page）
+ *   bits [47:PAGE_SHIFT] = 输出地址（block/page 对齐）
+ */
+int ipa_to_pa(struct task_struct *vm, paddr_t ipa, paddr_t *pa)
+{
+	paddr_t lv1_table, lv2_table, lv3_table;
+	uint64_t entry;
+
+	if (!vm || !vm->mm.first_table)
+		return -1;
+
+	lv1_table = vm->mm.first_table;
+
+	/* Level 1 */
+	{
+		uint64_t idx = (ipa >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
+		entry = ((uint64_t *)TO_VADDR(lv1_table))[idx];
+	}
+	if ((entry & 0x3) == 0)
+		return -1;  /* 未映射 */
+	if ((entry & 0x3) == 1) {
+		/* Level 1 block (1GB) */
+		*pa = (entry & ~((1ULL << LV1_SHIFT) - 1)) |
+		      (ipa & ((1ULL << LV1_SHIFT) - 1));
+		return 0;
+	}
+	/* entry & 0x3 == 3: table descriptor */
+	lv2_table = entry & PAGE_MASK;
+
+	/* Level 2 */
+	{
+		uint64_t idx = (ipa >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
+		entry = ((uint64_t *)TO_VADDR(lv2_table))[idx];
+	}
+	if ((entry & 0x3) == 0)
+		return -1;
+	if ((entry & 0x3) == 1) {
+		/* Level 2 block (2MB) */
+		*pa = (entry & ~((1ULL << LV2_SHIFT) - 1)) |
+		      (ipa & ((1ULL << LV2_SHIFT) - 1));
+		return 0;
+	}
+	/* table descriptor */
+	lv3_table = entry & PAGE_MASK;
+
+	/* Level 3 (4KB page) */
+	{
+		uint64_t idx = (ipa >> PAGE_SHIFT) & (PTRS_PER_TABLE - 1);
+		entry = ((uint64_t *)TO_VADDR(lv3_table))[idx];
+	}
+	if ((entry & 0x3) != 3)
+		return -1;  /* 无效或非 page */
+
+	*pa = (entry & PAGE_MASK) | (ipa & (PAGE_SIZE - 1));
+	return 0;
+}
