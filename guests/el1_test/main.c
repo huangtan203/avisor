@@ -852,10 +852,16 @@ static void ivshmem_pingpong_test(void)
         guest_puts("ivshmem: vm1 wrote to shared memory, sending doorbell to peer 1\n");
         ivshmem_doorbell(1);  /* peer 1 = vm2 */
 
-        /* 等 VM2 回复 */
-        int timeout = 10000000;
+        /* 等 VM2 回复
+         * 混合等待：大部分时间 nop（低开销），每隔一段时间 yield 一次
+         * 让对方有机会拿到 CPU 处理并回复。 */
+        int timeout = 1000;  /* yield 次数 */
         while (!ivshmem_irq_received && timeout-- > 0) {
-            asm volatile("nop");
+            /* 每次 yield 之间 busy wait 一小段，减少 HVC 开销 */
+            for (int i = 0; i < 10000 && !ivshmem_irq_received; i++)
+                asm volatile("nop");
+            if (!ivshmem_irq_received)
+                hvc_call(HVC_SCHED_YIELD, 0);
         }
 
         if (ivshmem_irq_received) {
@@ -871,10 +877,14 @@ static void ivshmem_pingpong_test(void)
             guest_puts("ivshmem: ping-pong test FAILED (timeout waiting for reply)\n");
         }
     } else {
-        /* VM2 等 doorbell 从 VM1 */
-        int timeout = 10000000;
+        /* VM2 等 doorbell 从 VM1
+         * 混合等待：nop + 周期性 yield */
+        int timeout = 1000;
         while (!ivshmem_irq_received && timeout-- > 0) {
-            asm volatile("nop");
+            for (int i = 0; i < 10000 && !ivshmem_irq_received; i++)
+                asm volatile("nop");
+            if (!ivshmem_irq_received)
+                hvc_call(HVC_SCHED_YIELD, 0);
         }
 
         if (ivshmem_irq_received) {
@@ -1423,6 +1433,118 @@ static void phase10_tests(void)
     guest_puts("\nPhase 10: ALL tests done\n");
 }
 
+/*
+ * Phase 11: 虚拟 SMP 测试（主核侧）
+ *
+ * 验证内容：
+ *   1. 次 vCPU 成功启动并就绪
+ *   2. 自旋锁在多 vCPU 下的正确性
+ *   3. 共享内存数据一致性
+ *
+ * 测试流程：
+ *   主核：初始化共享变量 -> 等待次核就绪 -> 发启动信号
+ *         -> 主核也参与累加 -> 等待次核完成 -> 验证结果
+ *   次核：就绪 -> 等启动信号 -> 累加 -> 完成标志
+ */
+static void phase11_smp_test(void)
+{
+    guest_puts("\n========================================\n");
+    guest_puts("  Phase 11: Virtual SMP\n");
+    guest_puts("========================================\n");
+
+    volatile u64 *ready_flag = (volatile u64 *)(SMP_TEST_ADDR + SMP_READY_FLAG_OFF);
+    volatile u64 *done_flag = (volatile u64 *)(SMP_TEST_ADDR + SMP_DONE_FLAG_OFF);
+    volatile u64 *counter = (volatile u64 *)(SMP_TEST_ADDR + SMP_COUNTER_OFF);
+    spinlock_t *lock = (spinlock_t *)(SMP_TEST_ADDR + SMP_LOCK_OFF);
+
+    /* 初始化共享变量（主核负责） */
+    *ready_flag = 0;
+    *done_flag = 0;
+    *counter = 0;
+    spin_lock_init(lock);
+    asm volatile("dmb ish" ::: "memory");
+
+    guest_puts("\n--- Test 1: Secondary vCPU bringup ---\n");
+
+    /* 发就绪信号：告诉次核可以开始了 */
+    *ready_flag = 1;
+    asm volatile("dmb ish" ::: "memory");
+
+    /* 等待次核完成（done_flag == 1）
+     * 次核会先打印一些信息，然后参与累加测试，最后置 done_flag */
+    guest_puts("smp: master waiting for secondary vCPU...\n");
+    int timeout = 50000;  /* yield 次数 */
+    while (*done_flag == 0) {
+        hvc_call(HVC_SCHED_YIELD, 0);
+        if (--timeout <= 0) break;
+    }
+
+    if (*done_flag == 0) {
+        guest_puts("smp: FAILED (secondary vCPU timeout)\n");
+        return;
+    }
+    guest_puts("smp: secondary vCPU finished\n");
+
+    /* 主核也参与累加（和次核并发）
+     * 注意：上面我们等了 done_flag，说明次核已经完成了。
+     * 为了验证并发，我们应该双方同时累加。
+     * 这里改成：主核先发 ready，主核自己也开始累加，
+     * 然后等 done_flag，最后验证。 */
+
+    /* 重新初始化，做并发测试 */
+    guest_puts("\n--- Test 2: Concurrent counter with spinlock ---\n");
+    *done_flag = 0;
+    *counter = 0;
+    spin_lock_init(lock);
+    asm volatile("dmb ish" ::: "memory");
+
+    /* 启动信号（次核看到 ready=2 就开始并发测试） */
+    *ready_flag = 2;
+    asm volatile("dmb ish" ::: "memory");
+
+    guest_puts("smp: starting concurrent counter test (each adds ");
+    puts_dec(SMP_ITERATIONS);
+    guest_puts(" times)\n");
+
+    /* 主核也累加（和次核并发） */
+    for (int i = 0; i < SMP_ITERATIONS; i++) {
+        spin_lock(lock);
+        (*counter)++;
+        spin_unlock(lock);
+    }
+
+    /* 等待次核完成 */
+    guest_puts("smp: master done, waiting for secondary...\n");
+    timeout = 50000;  /* yield 次数 */
+    while (*done_flag != 2) {
+        hvc_call(HVC_SCHED_YIELD, 0);
+        if (--timeout <= 0) break;
+    }
+
+    if (*done_flag != 2) {
+        guest_puts("smp: FAILED (secondary vCPU timeout in concurrent test)\n");
+        return;
+    }
+
+    /* 验证结果：counter 应该等于 2 * SMP_ITERATIONS */
+    u64 expected = (u64)SMP_ITERATIONS * 2;
+    guest_puts("smp: counter = ");
+    puts_dec(*counter);
+    guest_puts(" (expected ");
+    puts_dec(expected);
+    guest_puts(")\n");
+
+    if (*counter == expected) {
+        guest_puts("smp: PASSED (spinlock + shared counter correct)\n");
+    } else {
+        guest_puts("smp: FAILED (counter mismatch, diff = ");
+        puts_dec(*counter > expected ? *counter - expected : expected - *counter);
+        guest_puts(")\n");
+    }
+
+    guest_puts("\nPhase 11: ALL tests done\n");
+}
+
 static void vits_test(void)
 {
     guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
@@ -1649,9 +1771,38 @@ static void mmu_init(void)
     asm volatile("isb" ::: "memory");
 }
 
+/* SMP 主核标志：第一个进入 guest_main 的 vCPU 成为主核
+ * 因为两个 vCPU 在同一物理核上分时运行，不需要真正的原子操作 */
+static volatile int smp_master_locked = 0;
+static volatile int smp_is_master = 0;
+
+static int try_become_master(void)
+{
+    /* 简单的 test-and-set（单核分时运行，不需要 ldrex/strex） */
+    if (smp_master_locked == 0) {
+        smp_master_locked = 1;
+        smp_is_master = 1;
+        return 1;
+    }
+    return 0;
+}
+
 void guest_main(void)
 {
     u64 vmid = guest_vmid();
+    u64 mpidr = SYSREG_READ(mpidr_el1);
+    int cpu_id = (int)(mpidr & 0xFF);
+
+    /* 竞选主核：第一个到 guest_main 的当主核，另一个当次核
+     * 注意：不依赖 MPIDR 做判断，因为 start.S 和 C 代码读到的
+     * MPIDR 可能不一致（虚拟化 trap 时序问题）。 */
+    if (!try_become_master()) {
+        /* 次核：跳到次核入口 */
+        guest_secondary_main();
+        return;
+    }
+
+    /* 以下是主核路径 */
 
     /* 先初始化 MMU（开启 cache，解决与 hypervisor 的 cache 一致性问题） */
     mmu_init();
@@ -1710,11 +1861,72 @@ void guest_main(void)
      * 两个 VM 都跑，共享内存测试需要双方配合 */
     phase10_tests();
 
+    /* 测试 6: Phase 11 虚拟 SMP 测试（需要次 vCPU 配合）
+     * 两个 vCPU 都会进入，内部用标志位区分主/次角色 */
+    phase11_smp_test();
+
     guest_puts("\nguest: all tests done, entering main loop\n");
 
     while (1) {
         asm volatile("wfi" ::: "memory");
     }
+}
+
+/*
+ * Phase 11: SMP 共享计数器测试（次核侧）
+ *
+ * 次核在初始化完成后调用此函数，参与共享计数器累加测试。
+ * 主核负责初始化和结果验证。
+ *
+ * 同步协议：
+ *   ready_flag = 1: 主核初始化完成，次核先做一次 bring-up 测试
+ *   ready_flag = 2: 主核启动并发测试，双方同时累加
+ *   done_flag = 1:  次核完成 bring-up 测试
+ *   done_flag = 2:  次核完成并发测试
+ */
+static void smp_secondary_counter_test(void)
+{
+    volatile u64 *ready_flag = (volatile u64 *)(SMP_TEST_ADDR + SMP_READY_FLAG_OFF);
+    volatile u64 *done_flag = (volatile u64 *)(SMP_TEST_ADDR + SMP_DONE_FLAG_OFF);
+    volatile u64 *counter = (volatile u64 *)(SMP_TEST_ADDR + SMP_COUNTER_OFF);
+    spinlock_t *lock = (spinlock_t *)(SMP_TEST_ADDR + SMP_LOCK_OFF);
+
+    /* 等待主核初始化完成
+     * 用 sched_yield 主动让出 CPU，比忙等高效很多。
+     * 每次 yield 把自己的时间片清零，让其他 vCPU 先跑。 */
+    while (*ready_flag == 0) {
+        hvc_call(HVC_SCHED_YIELD, 0);
+    }
+    asm volatile("dmb ish" ::: "memory");
+
+    /* 第一轮：累加测试（次核先单独做一次，验证基本功能） */
+    for (int i = 0; i < SMP_ITERATIONS; i++) {
+        spin_lock(lock);
+        (*counter)++;
+        spin_unlock(lock);
+    }
+
+    /* 通知主核：第一轮完成 */
+    asm volatile("dmb ish" ::: "memory");
+    *done_flag = 1;
+
+    /* 等主核发第二轮信号（ready_flag == 2）
+     * 用 sched_yield 主动让出 CPU */
+    while (*ready_flag != 2) {
+        hvc_call(HVC_SCHED_YIELD, 0);
+    }
+    asm volatile("dmb ish" ::: "memory");
+
+    /* 第二轮：并发累加（和主核同时操作） */
+    for (int i = 0; i < SMP_ITERATIONS; i++) {
+        spin_lock(lock);
+        (*counter)++;
+        spin_unlock(lock);
+    }
+
+    /* 通知主核：第二轮完成 */
+    asm volatile("dmb ish" ::: "memory");
+    *done_flag = 2;
 }
 
 /*
@@ -1725,7 +1937,7 @@ void guest_main(void)
  *   - MMU（开启 cache，同一个页表）
  *   - GIC CPU interface（per-CPU）
  *   - 虚拟定时器（per-CPU）
- * 然后进入主循环。
+ * 然后参与 SMP 测试，最后进入 WFI 循环。
  *
  * 注意：BSS 清零由主核负责，次核不重复清零，
  * 否则会把主核已经初始化的数据又清零。
@@ -1762,6 +1974,15 @@ void guest_secondary_main(void)
     guest_puts("[vcpu");
     puts_dec(cpu_id);
     guest_puts("] guest: interrupts enabled\n");
+
+    /* Phase 11: 参与 SMP 共享计数器测试 */
+    guest_puts("[vcpu");
+    puts_dec(cpu_id);
+    guest_puts("] guest: entering SMP counter test\n");
+    smp_secondary_counter_test();
+    guest_puts("[vcpu");
+    puts_dec(cpu_id);
+    guest_puts("] guest: SMP test done\n");
 
     guest_puts("[vcpu");
     puts_dec(cpu_id);

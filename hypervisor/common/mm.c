@@ -290,14 +290,34 @@ int handle_mem_abort(vaddr_t addr, uint64_t esr)
 	if (is_mmio) {
 		unsigned int srt = (esr >> 16) & 0x1f;
 		unsigned int wnr = (esr >> 6) & 0x1;
+		unsigned int sf  = (esr >> 30) & 0x1;  /* 0 = 32-bit, 1 = 64-bit */
 
 		if (wnr == 0) {
-			if (HAVE_FUNC(ops, mmio_read))
-				regs->regs[srt] = ops->mmio_read(current, ipa);
+			if (HAVE_FUNC(ops, mmio_read)) {
+				uint64_t val = ops->mmio_read(current, ipa);
+				/* 目标寄存器是 WZR/XZR (srt=31) 时，不写回
+				 * （WZR 永远是 0，写了也没用）。
+				 * 编译器通常不会生成读 WZR 的代码，但防一手。 */
+				if (srt < 31)
+					regs->regs[srt] = val;
+			}
 		} else {
-			if (HAVE_FUNC(ops, mmio_write))
-				ops->mmio_write(current, ipa,
-						regs->regs[srt]);
+			if (HAVE_FUNC(ops, mmio_write)) {
+				uint64_t val;
+				/* 源寄存器是 WZR/XZR (srt=31) 时，值为 0
+				 * （编译器优化参数为 0 时常会用 WZR 写入）。
+				 * pt_regs 只有 X0-X30 共 31 个寄存器，
+				 * regs[31] 是越界访问，读到的是垃圾值。 */
+				if (srt == 31) {
+					val = 0;
+				} else {
+					val = regs->regs[srt];
+					/* 32-bit 写操作：只取低 32 位 */
+					if (sf == 0)
+						val = val & 0xFFFFFFFFULL;
+				}
+				ops->mmio_write(current, ipa, val);
+			}
 		}
 
 		increment_current_pc(4);

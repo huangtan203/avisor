@@ -63,6 +63,34 @@ void ivshmem_init(struct ivshmem_dev *dev,
 }
 
 /*
+ * 重新设置 peer_id（用于 vmid 修正后更新 ivshmem 身份）
+ *
+ * 背景：create_task_on_cpu 里调用 initialize 时，vmid 还是自动分配的
+ * 临时值（next_vmid 递增），调用方随后会覆盖为正确的 vmid。
+ * 但 ivshmem 的 peer_id 是初始化时根据 vmid 计算的，所以需要
+ * 在 vmid 修正后同步更新 peer_id。
+ */
+void ivshmem_set_peer_id(struct ivshmem_dev *dev, int new_peer_id)
+{
+    int old_peer_id = dev->peer_id;
+
+    /* 从旧位置移除 */
+    if (old_peer_id >= 0 && old_peer_id < IVSHMEM_MAX_PEERS &&
+        ivshmem_peers[old_peer_id] == dev) {
+        ivshmem_peers[old_peer_id] = NULL;
+    }
+
+    /* 设置新的 peer_id 并注册到新位置 */
+    dev->peer_id = new_peer_id;
+    if (new_peer_id >= 0 && new_peer_id < IVSHMEM_MAX_PEERS) {
+        ivshmem_peers[new_peer_id] = dev;
+    }
+
+    INFO("ivshmem: peer reparented %d -> %d (vm=%p)",
+         old_peer_id, new_peer_id, (void *)dev->vm);
+}
+
+/*
  * MMIO 读操作
  */
 uint32_t ivshmem_mmio_read(struct ivshmem_dev *dev, uint32_t offset)
@@ -116,8 +144,8 @@ void ivshmem_mmio_write(struct ivshmem_dev *dev, uint32_t offset, uint32_t val)
         struct vm_virt_state *virt = &target->vm->virt;
         int injected = 0;
 
-        /* 找一个空闲 LR（LR1；LR0=vtimer，LR2=PCI INTx） */
-        for (int i = 1; i < NR_VGIC_LRS - 1; i++) {
+        /* 找一个空闲 LR（LR0=vtimer 专用，从 LR1 开始找） */
+        for (int i = 1; i < NR_VGIC_LRS; i++) {
             if ((virt->gic_lr[i] & ICH_LR_STATE_MASK) == 0) {
                 virt->gic_lr[i] =
                     ((uint64_t)VIRQ_IVSHMEM & 0xffffffffULL)

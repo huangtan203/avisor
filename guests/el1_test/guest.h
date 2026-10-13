@@ -141,3 +141,73 @@ u64 guest_vmid(void);
 extern char vectors;
 
 void guest_main(void);
+
+/* ---- Phase 11: SMP 支持 ---- */
+
+/*
+ * Ticket 自旋锁（FIFO 公平锁）
+ *
+ * 两个 16 位字段：
+ *   - owner: 当前服务的 ticket（谁持有锁）
+ *   - next:  下一个可用的 ticket
+ *
+ * 取锁：原子地取走 next ticket，然后自旋等待 owner == 自己的 ticket
+ * 放锁：owner++（下一个 ticket 持有者获得锁）
+ */
+typedef struct spinlock {
+    volatile u32 owner;   /* 当前持锁 ticket */
+    volatile u32 next;    /* 下一个 ticket */
+} spinlock_t;
+
+#define SPINLOCK_INIT { 0, 0 }
+
+static inline void spin_lock_init(spinlock_t *lock)
+{
+    lock->owner = 0;
+    lock->next = 0;
+}
+
+static inline void spin_lock(spinlock_t *lock)
+{
+    /* 原子地获取 next ticket（ldaxr + stlxr = acquire-release 语义） */
+    u32 ticket;
+    u32 new_next;
+    u32 status;
+    asm volatile(
+        "1: ldaxr %w0, [%3]\n"      /* 原子读 next (acquire) -> ticket */
+        "   add %w1, %w0, #1\n"     /* new_next = ticket + 1 */
+        "   stlxr %w2, %w1, [%3]\n" /* 原子写回 next (release)，status = 0/1 */
+        "   cbnz %w2, 1b\n"         /* 失败重试 */
+        : "=&r"(ticket), "=&r"(new_next), "=&r"(status)
+        : "r"(&lock->next)
+        : "memory"
+    );
+    (void)new_next;
+
+    /* 自旋等待 owner == ticket */
+    while (lock->owner != ticket) {
+        asm volatile("yield" ::: "memory");
+    }
+    asm volatile("dmb ish" ::: "memory");  /* 确保锁内操作在获取锁之后 */
+}
+
+static inline void spin_unlock(spinlock_t *lock)
+{
+    asm volatile("dmb ish" ::: "memory");  /* 确保锁内操作在释放锁之前 */
+    lock->owner++;
+}
+
+/* SMP 测试用的共享变量（通过固定地址共享）
+ *
+ * 内存布局（在 0x40300000 处的一页内）：
+ *   offset 0x00: ready_flag (u64)   主核初始化后置 1
+ *   offset 0x08: done_flag  (u64)   次核完成后置 1
+ *   offset 0x10: counter    (u64)   共享计数器
+ *   offset 0x18: lock       (spinlock_t)  自旋锁
+ */
+#define SMP_TEST_ADDR        0x40300000UL
+#define SMP_READY_FLAG_OFF   0x00
+#define SMP_DONE_FLAG_OFF    0x08
+#define SMP_COUNTER_OFF      0x10
+#define SMP_LOCK_OFF         0x18
+#define SMP_ITERATIONS       10000     /* 每核累加次数 */

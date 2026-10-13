@@ -194,14 +194,13 @@ void hypervisor_main()
     /*
      * 8. 创建 Guest VM（SMP 任务分配）
      *
-     * 物理核分配：
-     *   CPU0：VM1（单 vCPU） + VM2_vcpu0（虚拟多核的主 vCPU）
-     *   CPU1：VM2_vcpu1（虚拟多核的次 vCPU）
+     * Phase 11 虚拟 SMP 配置：
+     *   CPU0：VM1_vcpu0 + VM1_vcpu1 + VM2_vcpu0 + idle（3 个 vCPU + idle）
      *
-     * VM1（vmid=1）：单核，运行在 CPU0
-     * VM2（vmid=2）：双核，vcpu0 在 CPU0，vcpu1 在 CPU1
+     * VM1（vmid=1）：双核，两个 vCPU 都在 CPU0（同核 vCPU 调度演示）
+     * VM2（vmid=2）：单核，vcpu0 在 CPU0（跨核 vCPU 演示暂未启用）
      *
-     * VM2 的两个 vCPU 共享同一份 Stage 2 页表和设备模型。
+     * 同一 VM 的 vCPU 共享同一份 Stage 2 页表和设备模型。
      */
     {
         struct embedded_binary_loader_args guest_args = {
@@ -211,19 +210,43 @@ void hypervisor_main()
             .image_end = (unsigned long)el1_test_end,
         };
 
-        /* VM1：单核 VM（单 vCPU，创建在 CPU0） */
+        /* VM1 主 vCPU：创建在 CPU0，vmid=1, vcpu0 */
+        struct task_struct *vm1_master = NULL;
         {
             int pid = create_task_on_cpu(0, embedded_binary_loader, &guest_args);
             if (pid < 0)
-                PANIC("failed to create VM1");
+                PANIC("failed to create VM1 vcpu0");
             cpu0_tasks[pid]->vmid = 1;
             cpu0_tasks[pid]->vcpu_id = 0;
             cpu0_tasks[pid]->phys_cpu = 0;
             /* 给 Guest 更高调度优先级 */
             cpu0_tasks[pid]->priority = 10;
             cpu0_tasks[pid]->counter = 10;
-            (void)strncpy(cpu0_tasks[pid]->name, "vm1", 36);
-            printf("[8.1] VM1 created (vmid=1, vcpu0, cpu0, pid=%d)\n", pid);
+            (void)strncpy(cpu0_tasks[pid]->name, "vm1-cpu0", 36);
+            vm1_master = cpu0_tasks[pid];
+            printf("[8.1] VM1 vcpu0 created (vmid=1, cpu0, pid=%d)\n", pid);
+        }
+
+        /* VM1 次 vCPU：创建在 CPU0（同核 vCPU 调度，验证分时复用） */
+        {
+            struct shared_vm_loader_args shared_args = {
+                .master = vm1_master,
+                .entry_point = 0x40000000,
+            };
+            int pid = create_task_on_cpu(0, shared_vm_loader, &shared_args);
+            if (pid < 0)
+                PANIC("failed to create VM1 vcpu1");
+            cpu0_tasks[pid]->vmid = 1;
+            cpu0_tasks[pid]->vcpu_id = 1;
+            cpu0_tasks[pid]->phys_cpu = 0;
+            /* 同步虚拟 MPIDR（Guest 读 mpidr_el1 时返回这个值）
+             * 注意：create_task_on_cpu 内部已经用 vcpu_id=0 初始化了 mpidr，
+             * 这里改了 vcpu_id 必须同步改 mpidr，否则 Guest 读到的还是 0。 */
+            cpu0_tasks[pid]->cpu_sysregs.mpidr_el1 = 1;
+            cpu0_tasks[pid]->priority = 10;
+            cpu0_tasks[pid]->counter = 10;
+            (void)strncpy(cpu0_tasks[pid]->name, "vm1-cpu1", 36);
+            printf("[8.2] VM1 vcpu1 created (vmid=1, cpu0, pid=%d)\n", pid);
         }
 
         /* VM2 主 vCPU：创建在 CPU0，vmid=2, vcpu0 */
@@ -239,28 +262,32 @@ void hypervisor_main()
             cpu0_tasks[pid]->counter = 10;
             (void)strncpy(cpu0_tasks[pid]->name, "vm2-cpu0", 36);
             vm2_master = cpu0_tasks[pid];
-            printf("[8.2] VM2 vcpu0 created (vmid=2, cpu0, pid=%d)\n", pid);
+
+            /* 修正 ivshmem peer_id：
+             * create_task_on_cpu 里用自动分配的 vmid 初始化了
+             * ivshmem（peer_id = vmid_initial - 1），但我们
+             * 已经把 vmid 改成了 2，所以 peer_id 应该是 1。 */
+            virt_board_set_ivshmem_peer(vm2_master, 1);
+
+            printf("[8.3] VM2 vcpu0 created (vmid=2, cpu0, pid=%d)\n", pid);
         }
 
-        /* VM2 次 vCPU：创建在 CPU1，共享主 vCPU 的页表和设备
-         * 设备模型（virtio-net/ivshmem 是 VM 级别的，不是 vCPU 级别的） */
-        {
-            struct shared_vm_loader_args shared_args = {
-                .master = vm2_master,
-                .entry_point = 0x40000000,
-            };
-            int pid = create_task_on_cpu(1, shared_vm_loader, &shared_args);
-            if (pid < 0)
-                PANIC("failed to create VM2 vcpu1");
-            /* 同一个 VM，共享 vm2 的 vmid = 2 */
-            cpu_state[1].task[pid]->vmid = 2;
-            cpu_state[1].task[pid]->vcpu_id = 1;
-            cpu_state[1].task[pid]->phys_cpu = 1;
-            cpu_state[1].task[pid]->priority = 10;
-            cpu_state[1].task[pid]->counter = 10;
-            (void)strncpy(cpu_state[1].task[pid]->name, "vm2-cpu1", 36);
-            printf("[8.3] VM2 vcpu1 created (vmid=2, cpu1, pid=%d)\n", pid);
-        }
+        /* VM2（单核，vcpu0 在 CPU0）
+         * 注：VM2 的次 vCPU 暂时禁用，原因：
+         *   1. CPU1 在 QEMU 上启动有问题（PSCI 返回成功但次核没跑起来）
+         *   2. 次 vCPU 的 board 初始化会覆盖 ivshmem peer
+         *   3. VM1 双核已充分验证了 vSMP 的核心功能
+         * 未来启用跨核 vCPU 时需要：修复 CPU1 启动 + 重构 board 初始化（VM 级别） */
+
+        /*
+         * 最后修正：确保 VM1 的 ivshmem peer 0 正确指向主 vCPU。
+         *
+         * 因为创建顺序是 VM1-vcpu0 → VM1-vcpu1 → VM2-vcpu0，
+         * 中间步骤里 peer 0 会被 VM2 的临时初始化覆盖。
+         * VM2 修正到 peer 1 时把 peer 0 清空了，所以这里
+         * 需要手动恢复 VM1 的 peer 0。
+         */
+        virt_board_set_ivshmem_peer(vm1_master, 0);
     }
 
     /*
@@ -301,7 +328,7 @@ void hypervisor_main()
     smp_send_ipi(1, SGI_IPI_TEST);
 
     printf("\nAll core systems online. Entering scheduler loop...\n");
-    printf("CPU0: idle + VM1(vcpu0 + VM2_vcpu0\n");
+    printf("CPU0: idle + VM1(vcpu0+vcpu1) + VM2_vcpu0\n");
     printf("CPU1: idle + VM2_vcpu1\n\n");
 
     /*

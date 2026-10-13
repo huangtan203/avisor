@@ -63,6 +63,11 @@ void ivshmem_init(struct ivshmem_dev *dev,
                   uint64_t shmem_ipa);
 
 /*
+ * 重新设置 peer_id（vmid 修正后调用）
+ */
+void ivshmem_set_peer_id(struct ivshmem_dev *dev, int new_peer_id);
+
+/*
  * MMIO 读操作
  */
 uint32_t ivshmem_mmio_read(struct ivshmem_dev *dev, uint32_t offset);

@@ -28,3 +28,6 @@ extern const struct board_ops virt_board_ops;
 
 /* 次级 vCPU 挂接主 vCPU 的设备数据（虚拟 SMP） */
 void virt_attach_secondary(struct task_struct *tsk, struct task_struct *master);
+
+/* 更新 VM 的 ivshmem peer_id（vmid 修正后调用） */
+void virt_board_set_ivshmem_peer(struct task_struct *tsk, int peer_id);

@@ -458,8 +458,20 @@ static void virt_initialize(struct task_struct *tsk)
  */
 void virt_attach_secondary(struct task_struct *tsk, struct task_struct *master)
 {
+    struct virt_vm_devices *master_devs =
+        (struct virt_vm_devices *)master->board_data;
+
     /* 共享主 vCPU 的设备模型（virtio-net、ivshmem 等 VM 级别状态） */
-    tsk->board_data = master->board_data;
+    tsk->board_data = master_devs;
+
+    /* 修复 ivshmem 全局 peer 指针：
+     * create_task_on_cpu 里调用了 board_ops->initialize，
+     * 把 ivshmem_peers[peer_id] 覆盖成了次 vCPU 临时的 dev。
+     * 现在恢复成主 vCPU 的设备，否则 doorbell 会发到错误的 vCPU。 */
+    if (master_devs && master_devs->ivshmem.peer_id >= 0 &&
+        master_devs->ivshmem.peer_id < IVSHMEM_MAX_PEERS) {
+        ivshmem_peers[master_devs->ivshmem.peer_id] = &master_devs->ivshmem;
+    }
 
     /* 同一个虚拟时间基准 */
     tsk->mm.cntvoff = master->mm.cntvoff;
@@ -469,6 +481,22 @@ void virt_attach_secondary(struct task_struct *tsk, struct task_struct *master)
     tsk->virt.vtimer_pending = 0;
     tsk->virt.cntv_cval = 0;
     tsk->virt.cntv_ctl = 0;
+}
+
+/*
+ * 更新 VM 的 ivshmem peer_id（vmid 修正后调用）
+ *
+ * 背景：create_task_on_cpu 里用自动分配的 vmid 初始化了 ivshmem，
+ * 但调用方随后会覆盖 vmid 为正确的值（比如多 vCPU 共享一个 vmid）。
+ * 这个函数用来在 vmid 修正后同步更新 ivshmem 的 peer_id 和
+ * 全局 peer 数组。
+ */
+void virt_board_set_ivshmem_peer(struct task_struct *tsk, int peer_id)
+{
+    struct virt_vm_devices *devs =
+        (struct virt_vm_devices *)tsk->board_data;
+    if (devs)
+        ivshmem_set_peer_id(&devs->ivshmem, peer_id);
 }
 
 /* ---------- 世界切换 ---------- */
