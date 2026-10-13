@@ -52,9 +52,16 @@ int vgic_is_virq_pending(uint32_t vintid);
  * Phase 10: 向指定 VM 注入虚拟中断（不要求目标 VM 正在运行）
  *   - 如果目标 VM 是 current：直接写 LR
  *   - 否则：写入目标 VM 的 saved gic_lr[]，下次调度时自动生效
+ *   - Phase 13：若目标 vCPU 在别的物理核上运行，额外发 IPI 立即生效
  * 返回 0 成功，-1 没有空闲 LR
  */
 int vgic_inject_virq_to_vm(struct task_struct *vm, uint32_t vintid);
+
+/*
+ * Phase 13: 处理跨核 vGIC 维护 IPI（SGI_VGIC_UPDATE）
+ * 由 smp_ipi_handle() 在目标核的中断上下文中调用。
+ */
+void vgic_ipi_update_handle(void);
 
 /*
  * vGIC 世界切换：保存/恢复所有 LR + VMCR

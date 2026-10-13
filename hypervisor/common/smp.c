@@ -13,6 +13,7 @@
  */
 
 #include "boards/virt/gicv3.h"
+#include "boards/virt/vgic.h"
 #include "common/debug.h"
 #include "common/smp.h"
 
@@ -57,6 +58,14 @@ void smp_ipi_handle(int sgi_id)
          */
         if (cpu == 1)
             gic_send_sgi(0, SGI_IPI_TEST);
+        break;
+
+    case SGI_VGIC_UPDATE:
+        /*
+         * 跨核 vGIC 维护：有虚拟中断要注入到当前核上运行的 vCPU。
+         * 由 vgic_inject_virq_to_vm 在跨核注入时触发。
+         */
+        vgic_ipi_update_handle();
         break;
 
     default:

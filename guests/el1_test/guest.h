@@ -225,6 +225,7 @@ static inline void spin_unlock(spinlock_t *lock)
 #define SMP_DONE_FLAG_OFF    0x08
 #define SMP_COUNTER_OFF      0x10
 #define SMP_LOCK_OFF         0x18
+#define SMP_BOOT_DONE_OFF    0x38    /* 主核完成 BSS 清零 + 页表建立后置 1 */
 #define SMP_ITERATIONS       10000     /* 每核累加次数 */
 
 /* ---- Phase 12: vSGI 测试共享内存布局 ----

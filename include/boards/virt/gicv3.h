@@ -154,6 +154,7 @@
  */
 #define SGI_IPI_NOTIFY      0   /* 通用核间通知 IPI */
 #define SGI_IPI_TEST        1   /* 核间通信 ping-pong 测试 */
+#define SGI_VGIC_UPDATE     2   /* 跨核 vGIC 维护：通知目标核刷新虚拟中断 */
 
 /* 函数声明 */
 void gic_init(void);

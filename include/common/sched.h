@@ -163,6 +163,8 @@ struct vm_virt_state {
 	unsigned long cntv_ctl;         /* CNTV_CTL_EL0 */
 	unsigned long cntv_cval;        /* CNTV_CVAL_EL0 */
 	int vtimer_pending;             /* vtimer 延迟注入标志 */
+	int vgic_ipi_pending;           /* 跨核 vGIC 注入：有待注入的虚拟中断 */
+	unsigned int vgic_ipi_vintid;   /* 跨核 vGIC 注入：待注入的虚拟中断号 */
 };
 
 struct task_struct {

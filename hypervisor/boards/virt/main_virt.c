@@ -61,6 +61,7 @@
  * CPU1 上的任务用 cpu_state[1].task[...] 直接访问。
  */
 #define cpu0_tasks (cpu_state[0].task)
+#define cpu1_tasks (cpu_state[1].task)
 
 /* 内嵌 Guest 镜像边界（guest_image.S） */
 extern char el1_test_begin[];
@@ -71,14 +72,15 @@ extern char el1_test_end[];
 volatile int smp_boot_flag = 0;
 
 /*
- * PSCI CPU_ON 函数（通过 HVC #0 调用，由 QEMU 模拟的 PSCI 处理）
+ * PSCI CPU_ON 函数（通过 SMC #0 调用，由 QEMU 模拟的 PSCI 固件处理）
  *
  * 返回 0 = 成功，其他 = 错误码
  *
  * 注意：
- *   QEMU virt 平台默认（不加 secure=on）时最高 EL 是 EL2，
- *   PSCI 是通过 HVC 调用的（不是 SMC）。
- *   只有在 secure=on 时，EL3 固件才会通过 SMC 处理 PSCI。
+ *   - ARM PSCI 标准使用 SMC 作为调用约定（SMC32/SMC64）
+ *   - QEMU 的 TCG 模拟会捕获 SMC 指令并处理 PSCI 调用
+ *   - 不能用 HVC #0，因为 hypervisor 本身运行在 EL2，
+ *     EL2 执行 HVC 会触发未处理的同步异常（SYNC_INVALID_EL2）
  */
 #define PSCI_CPU_ON_64        0xC4000003
 
@@ -91,7 +93,7 @@ static int psci_cpu_on(unsigned long mpidr, unsigned long entry_point,
     register unsigned long x3 asm("x3") = context_id;
 
     asm volatile(
-        "hvc #0\n"
+        "smc #0\n"
         : "+r"(x0)
         : "r"(x1), "r"(x2), "r"(x3)
         : "memory");
@@ -233,28 +235,28 @@ void hypervisor_main()
             virt_register_vcpu(cpu0_tasks[pid], 1, 0);
         }
 
-        /* VM1 次 vCPU：创建在 CPU0（同核 vCPU 调度，验证分时复用） */
+        /* VM1 次 vCPU：创建在 CPU1（跨物理核 vCPU 调度，验证跨核 IPI + vSGI） */
         {
             struct shared_vm_loader_args shared_args = {
                 .master = vm1_master,
                 .entry_point = 0x40000000,
             };
-            int pid = create_task_on_cpu(0, shared_vm_loader, &shared_args);
+            int pid = create_task_on_cpu(1, shared_vm_loader, &shared_args);
             if (pid < 0)
                 PANIC("failed to create VM1 vcpu1");
-            cpu0_tasks[pid]->vmid = 1;
-            cpu0_tasks[pid]->vcpu_id = 1;
-            cpu0_tasks[pid]->phys_cpu = 0;
+            cpu1_tasks[pid]->vmid = 1;
+            cpu1_tasks[pid]->vcpu_id = 1;
+            cpu1_tasks[pid]->phys_cpu = 1;
             /* 同步虚拟 MPIDR（Guest 读 mpidr_el1 时返回这个值）
              * 注意：create_task_on_cpu 内部已经用 vcpu_id=0 初始化了 mpidr，
              * 这里改了 vcpu_id 必须同步改 mpidr，否则 Guest 读到的还是 0。 */
-            cpu0_tasks[pid]->cpu_sysregs.mpidr_el1 = 1;
-            cpu0_tasks[pid]->priority = 10;
-            cpu0_tasks[pid]->counter = 10;
-            (void)strncpy(cpu0_tasks[pid]->name, "vm1-cpu1", 36);
-            printf("[8.2] VM1 vcpu1 created (vmid=1, cpu0, pid=%d)\n", pid);
+            cpu1_tasks[pid]->cpu_sysregs.mpidr_el1 = 1;
+            cpu1_tasks[pid]->priority = 10;
+            cpu1_tasks[pid]->counter = 10;
+            (void)strncpy(cpu1_tasks[pid]->name, "vm1-cpu1", 36);
+            printf("[8.2] VM1 vcpu1 created (vmid=1, cpu1, pid=%d)\n", pid);
             /* Phase 12: 注册 vCPU 到板级查找表 */
-            virt_register_vcpu(cpu0_tasks[pid], 1, 1);
+            virt_register_vcpu(cpu1_tasks[pid], 1, 1);
         }
 
         /* VM2 主 vCPU：创建在 CPU0，vmid=2, vcpu0 */
@@ -339,8 +341,8 @@ void hypervisor_main()
     smp_send_ipi(1, SGI_IPI_TEST);
 
     printf("\nAll core systems online. Entering scheduler loop...\n");
-    printf("CPU0: idle + VM1(vcpu0+vcpu1) + VM2_vcpu0\n");
-    printf("CPU1: idle + VM2_vcpu1\n\n");
+    printf("CPU0: idle + VM1 vcpu0 + VM2 vcpu0\n");
+    printf("CPU1: idle + VM1 vcpu1\n\n");
 
     /*
      * 10. 调度主循环（Hypervisor 的"_idle"身份）

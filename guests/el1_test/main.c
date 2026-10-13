@@ -1608,14 +1608,18 @@ static void phase12_vsgi_test(void)
             return;
         }
 
-        /* Test 2: 多次发送 */
-        guest_puts("\n--- Test 2: Multiple vSGI sends ---\n");
+        /* Test 2: 多次发送（逐次握手，避免 SGI 边沿触发被合并） */
+        guest_puts("\n--- Test 2: Multiple vSGI sends (handshake) ---\n");
         *vsgi_count = 0;
         *vsgi_received = 0;
-        *done_flag = 0;
         asm volatile("dmb ish" ::: "memory");
 
-        /* 发 5 次 SGI */
+        /*
+         * SGI 是边沿触发的：若连续快发多次，硬件/vGIC 会把同一 INTID 的
+         * 多次边沿合并成一次 pending，导致"发 5 收 5"不可靠。
+         * 这里改成逐次握手：每发一个 SGI，等次核收到（count 递增）后再发
+         * 下一个，从而稳定地验证跨核 vSGI 注入可重复工作。
+         */
         for (int i = 0; i < 5; i++) {
             ret = vsgi_send(1, VSGI_TEST_SGI_ID);
             if (ret != 0) {
@@ -1624,28 +1628,26 @@ static void phase12_vsgi_test(void)
                 guest_puts(" failed)\n");
                 return;
             }
-            /* 短暂让出，让次核有机会处理 */
-            hvc_call(HVC_SCHED_YIELD, 0);
-        }
-
-        /* 等次核处理完所有 5 次 */
-        guest_puts("vsgi: sent 5 SGIs, waiting for secondary...\n");
-        timeout = 50000;
-        while (*done_flag != 4) {   /* done_flag == 4 表示次核收到 5 次 */
-            hvc_call(HVC_SCHED_YIELD, 0);
-            if (--timeout <= 0) break;
+            /* 等次核收到本次 SGI（count 递增）再发下一个 */
+            int t = 50000;
+            while (*vsgi_count < (u64)(i + 1)) {
+                hvc_call(HVC_SCHED_YIELD, 0);
+                if (--t <= 0) break;
+            }
+            if (*vsgi_count < (u64)(i + 1)) {
+                guest_puts("vsgi: FAILED (round ");
+                puts_dec(i);
+                guest_puts(" timeout, count=");
+                puts_dec(*vsgi_count);
+                guest_puts(")\n");
+                return;
+            }
         }
 
         guest_puts("vsgi: secondary received count = ");
         puts_dec(*vsgi_count);
-        guest_puts(" (expected >= 5)\n");
-
-        if (*vsgi_count >= 5) {
-            guest_puts("vsgi: PASSED (multiple vSGI correct)\n");
-        } else {
-            guest_puts("vsgi: FAILED (insufficient count)\n");
-            return;
-        }
+        guest_puts(" (5 round-trips)\n");
+        guest_puts("vsgi: PASSED (multiple vSGI correct)\n");
 
         guest_puts("\nPhase 12: ALL tests done\n");
     } else {
@@ -1845,6 +1847,7 @@ void guest_irq_handler(void)
         volatile u64 *vsgi_count = (volatile u64 *)(SMP_TEST_ADDR + VSGI_COUNT_OFF);
         *vsgi_received |= (1ULL << intid);
         (*vsgi_count)++;
+        asm volatile("dmb ish" ::: "memory");
     }
 
     icc_eoir1_write(iar);
@@ -1955,6 +1958,18 @@ void guest_main(void)
 
     /* 先初始化 MMU（开启 cache，解决与 hypervisor 的 cache 一致性问题） */
     mmu_init();
+
+    /*
+     * 跨核并发启动同步：主核完成 BSS 清零 + 页表建立后置 boot_done=1。
+     * 次核在开启自己的 MMU 前必须等这个标志，否则次核 mmu_init() 写的
+     * guest_pg_dir 会和主核的 BSS 清零/页表建立发生竞态。
+     */
+    {
+        volatile u64 *boot_done =
+            (volatile u64 *)(SMP_TEST_ADDR + SMP_BOOT_DONE_OFF);
+        *boot_done = 1;
+        asm volatile("dmb ish" ::: "memory");
+    }
 
     guest_puts("\nguest: hello from EL1!\n");
     guest_puts("guest: I am VM ");
@@ -2102,6 +2117,19 @@ void guest_secondary_main(void)
     u64 vmid = guest_vmid();
     u64 mpidr = SYSREG_READ(mpidr_el1);
     int cpu_id = (int)(mpidr & 0xFF);
+
+    /*
+     * 跨核并发启动同步：等待主核完成 BSS 清零 + 页表建立。
+     * 次核 mmu_init() 会写 guest_pg_dir（BSS），若在主核还没建好页表
+     * 前就写，会被主核随后的 BSS 清零/页表写覆盖，导致 MMU 用错页表。
+     */
+    {
+        volatile u64 *boot_done =
+            (volatile u64 *)(SMP_TEST_ADDR + SMP_BOOT_DONE_OFF);
+        while (*boot_done != 1)
+            hvc_call(HVC_SCHED_YIELD, 0);
+        asm volatile("dmb ish" ::: "memory");
+    }
 
     /* 次核也需要开启 MMU（同一个页表，等值映射） */
     mmu_init();

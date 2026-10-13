@@ -13,6 +13,7 @@
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
 #include "common/sched.h"
+#include "common/smp.h"
 #include "common/utils.h"
 
 static inline uint64_t read_lr(int idx)
@@ -169,6 +170,14 @@ int vgic_inject_virq(uint32_t vintid)
             asm volatile("isb");
             return 0;
         }
+        /*
+         * 同一 vINTID 已 pending：边沿触发中断可合并，无需重复注入。
+         * （跨核注入时硬件 LR 可能已被 Guest ACK/EOI 过，这里以硬件 LR
+         *  为准做去重，避免重复写入。）
+         */
+        if ((uint32_t)(lr & 0xffffffffULL) == vintid &&
+            (lr & ICH_LR_STATE_MASK) == ICH_LR_PENDING)
+            return 0;
     }
     return -1;  /* 没有空闲 LR */
 }
@@ -209,12 +218,47 @@ void vgic_restore_state(struct vm_virt_state *state)
 }
 
 /*
+ * 把纯软件 vIRQ 写入 saved state 的 LR1 槽位。
+ *
+ * 与 vgic_inject_virq 一致：纯软件虚拟中断只使用 LR1
+ * （LR0=vtimer HW 映射，LR2=PCI INTx HW+EOI 映射）。
+ * 返回 0 成功，-1 LR1 被其他 vIRQ 占用且不可合并。
+ */
+static int vgic_inject_saved(struct vm_virt_state *virt, uint32_t vintid)
+{
+    int i = 1;  /* 纯软件注入固定 LR1 */
+    uint64_t lr = virt->gic_lr[i];
+
+    if ((lr & ICH_LR_STATE_MASK) == 0) {
+        virt->gic_lr[i] = ((uint64_t)vintid & 0xffffffffULL)
+                          | ICH_LR_GROUP1
+                          | ICH_LR_PENDING;
+        return 0;
+    }
+    /* 同一 vINTID 已 pending：边沿触发中断可合并 */
+    if (((uint32_t)(lr & 0xffffffffULL)) == vintid &&
+        (lr & ICH_LR_STATE_MASK) == ICH_LR_PENDING)
+        return 0;
+
+    return -1;
+}
+
+/*
  * Phase 10: 向指定 VM 注入虚拟中断（不要求目标 VM 正在运行）
  *
- * 两种情况：
+ * 三种情况：
  *   1. 目标 VM == current：直接写硬件 LR（和 vgic_inject_virq 一样）
- *   2. 目标 VM != current：写入 saved state 的 gic_lr[]，
- *      下次调度到该 VM 时 vgic_restore_state 会自动加载到硬件 LR
+ *   2. 目标 VM 在本核但未运行（被调度出去）：写 saved state
+ *   3. 目标 VM 在另一个物理核：置 mailbox 标志 + 发物理 SGI，
+ *      由目标核的 vgic_ipi_update_handle() 完成实际注入
+ *
+ * 跨核为何不能在这里直接写 saved state / 硬件 LR：
+ *   - 硬件 LR 是目标核的 per-CPU 资源，本核无法访问
+ *   - saved state 会与目标核的世界切换（vgic_save/restore_state）竞态，
+ *     且读 cpu_state[target].curr 判断"是否在运行"本身也是竞态
+ *
+ * 因此跨核统一走 mailbox + IPI，把注入动作交给目标核在中断上下文
+ * （IRQ 屏蔽，与世界切换互斥）里原子地完成。
  *
  * 返回 0 成功，-1 没有空闲 LR
  */
@@ -223,32 +267,62 @@ int vgic_inject_virq_to_vm(struct task_struct *vm, uint32_t vintid)
     if (!vm || vm->state == TASK_ZOMBIE)
         return -1;
 
-    /* 如果目标 VM 就是当前运行的 VM，直接写硬件 LR */
-    if (vm == current && vm->pid != 0) {
+    /* 情况 1：目标就是当前运行的 vCPU，直接写本核硬件 LR */
+    if (vm == current && vm->pid != 0)
         return vgic_inject_virq(vintid);
+
+    /* 情况 3：跨核——mailbox + 物理 SGI 交给目标核处理 */
+    if (vm->phys_cpu != smp_processor_id()) {
+        vm->virt.vgic_ipi_vintid = vintid;
+        vm->virt.vgic_ipi_pending = 1;
+        /* 确保 mailbox 写全局可见后再触发 SGI */
+        asm volatile("dmb ish" ::: "memory");
+        smp_send_ipi(vm->phys_cpu, SGI_VGIC_UPDATE);
+        return 0;
     }
 
-    /* 否则写入 saved state（下次调度恢复时生效） */
-    struct vm_virt_state *virt = &vm->virt;
+    /* 情况 2：同核但目标未运行——写 saved state，下次调度恢复时生效 */
+    return vgic_inject_saved(&vm->virt, vintid);
+}
 
-    for (int i = 1; i < NR_VGIC_LRS; i++) {
-        uint64_t lr = virt->gic_lr[i];
-        if ((lr & ICH_LR_STATE_MASK) == 0) {
-            /* 空闲：写入 pending 状态 */
-            virt->gic_lr[i] =
-                ((uint64_t)vintid & 0xffffffffULL)
-                | ICH_LR_GROUP1
-                | ICH_LR_PENDING;
-            return 0;
-        }
-        /* 已存在相同 pending 中断，不用重复注入 */
-        if (((uint32_t)(lr & 0xffffffffULL)) == vintid &&
-            (lr & ICH_LR_STATE_MASK) == ICH_LR_PENDING) {
-            return 0;
+/*
+ * Phase 13: 处理跨核 vGIC 维护 IPI
+ *
+ * 目标核收到 SGI_VGIC_UPDATE 后，在本核任务表中找到带 pending
+ * 标志的目标 vCPU，完成实际注入：
+ *   - 目标 vCPU 正在运行（== current）：写硬件 LR，立即送达
+ *   - 目标 vCPU 未运行（被调度出去）：写 saved state，下次恢复时生效
+ *
+ * 由 smp_ipi_handle() 在目标核的 IRQ 上下文调用（IRQ 屏蔽），
+ * 因此与本核的世界切换互斥，`current` 是稳定的，注入动作原子。
+ */
+void vgic_ipi_update_handle(void)
+{
+    int cpu = smp_processor_id();
+
+    /*
+     * 不能只用 `current` 找目标：收到 IPI 时目标 vCPU 可能已被
+     * 调度出去（此时 current 是 idle 或另一个 vCPU），而 pending
+     * 标志挂在目标 vCPU 自己的 virt 结构上。所以遍历本核任务表。
+     */
+    for (int i = 0; i < cpu_state[cpu].nr_tasks; i++) {
+        struct task_struct *vm = cpu_state[cpu].task[i];
+        if (!vm || vm->pid == 0)
+            continue;
+        if (!vm->virt.vgic_ipi_pending)
+            continue;
+
+        uint32_t vintid = vm->virt.vgic_ipi_vintid;
+        vm->virt.vgic_ipi_pending = 0;
+
+        if (cpu_state[cpu].curr == vm) {
+            /* 目标正在运行：写硬件 LR，立即送达 */
+            vgic_inject_virq(vintid);
+        } else {
+            /* 目标未运行：写 saved state，下次调度恢复时生效 */
+            vgic_inject_saved(&vm->virt, vintid);
         }
     }
-
-    return -1;  /* 没有空闲 LR */
 }
 
 /*

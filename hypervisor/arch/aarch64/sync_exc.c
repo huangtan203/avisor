@@ -20,6 +20,7 @@
 #include "boards/virt/arch_timer.h"
 #include "boards/virt/pci.h"
 #include "boards/virt/virt_mm.h"
+#include "boards/virt/virt_board.h"
 #include "boards/virt/shmem.h"
 #endif
 

@@ -126,8 +126,8 @@ secondary_el2:
 
 secondary_wait:
     ldr x0, =smp_boot_flag
-    ldr x0, [x0]
-    cmp x0, x19
+    ldr w0, [x0]            /* smp_boot_flag 是 int (32-bit)，用 w 寄存器读 */
+    cmp w0, w19
     b.ne secondary_wait
 
     /* 收到启动信号，开启 MMU，跳到次核 C 入口 */
