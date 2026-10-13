@@ -276,42 +276,17 @@ int shm_notify(int shmid)
                 continue;
 
             /*
-             * 如果目标 VM 正在运行（当前 CPU 上就是它），
-             * 直接注入 vIRQ。
+             * Phase 19: 统一注入路径——调用 vgic_inject_virq_to_vm()
              *
-             * 如果不是正在运行，注入到它的 vGIC 状态中
-             * （下次调度时恢复 LR 就会带进去）。
+             * 替代原有的直写 saved state 的老式注入方式，统一走
+             * vgic_inject_virq_to_vm 的三路分派（同核运行 / 同核
+             * 未运行 / 跨核 IPI），消除分散的 LR 操作逻辑。
              *
-             * 简化实现：只有当目标 VM 是当前运行的 VM 时才注入。
-             * 这在单 CPU 场景下限制较多，但我们有 SMP。
-             *
-             * 更好的方式：直接修改目标 VM 的 virt.gic_lr[]，
-             * 在 leaving_vm 保存/恢复的就是这个数组。
-             * 这样不管 VM 是否在运行，都能"延迟注入"。
+             * 唤醒逻辑保留在外层：注入成功后，若目标 VM 在等待，
+             * 则唤醒它。
              */
-
-            /* 检查目标 VM 是否有空闲 LR 槽 */
-            int found = 0;
-            for (int lr = 1; lr < NR_VGIC_LRS; lr++) {
-                uint64_t lr_val = vm->virt.gic_lr[lr];
-                if ((lr_val & ICH_LR_STATE_MASK) == 0) {
-                    /* 空闲：写入 pending 状态的虚拟中断 */
-                    vm->virt.gic_lr[lr] =
-                        ((uint64_t)SHM_NOTIFY_VIRQ & 0xffffffffULL)
-                        | ICH_LR_GROUP1
-                        | ICH_LR_PENDING;
-                    found = 1;
-                    break;
-                }
-                /* 如果已经 pending 同一个中断号，不用重复注入 */
-                if (((uint32_t)(lr_val & 0xffffffffULL)) == SHM_NOTIFY_VIRQ &&
-                    (lr_val & ICH_LR_STATE_MASK) == ICH_LR_PENDING) {
-                    found = 1;
-                    break;
-                }
-            }
-
-            if (found) {
+            int ret = vgic_inject_virq_to_vm(vm, SHM_NOTIFY_VIRQ);
+            if (ret == 0) {
                 notified++;
                 /* 如果目标 VM 在 waiting 状态，唤醒它 */
                 if (vm->state == TASK_WAITING) {

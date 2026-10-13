@@ -131,38 +131,19 @@ void ivshmem_mmio_write(struct ivshmem_dev *dev, uint32_t offset, uint32_t val)
         return;
 
     /*
-     * 向目标 VM 注入虚拟中断
+     * Phase 19: 统一注入路径——调用 vgic_inject_virq_to_vm()
      *
-     * - 如果目标 VM 当前正在运行 → 直接写硬件 LR
-     * - 否则 → 修改目标 VM 保存的 virt 状态中的 LR
-     *   下次进入该 VM 时（vgic_restore_state）会自动加载到硬件
+     * 该函数内部已处理三种情况：
+     *   1. 目标就是 current → 直接写硬件 LR（raw 路径，无门控）
+     *   2. 目标在本核但未运行 → 写 saved state
+     *   3. 目标在另一物理核 → mailbox + 物理 SGI 跨核注入
+     *
+     * ivshmem doorbell 是 SPI，需要 GICD enable 门控。
+     * 注意：vgic_inject_virq_to_vm 本身不带门控（用于 vSGI/LPI 等），
+     * 所以这里在外层先做门控判断。
      */
-    if (target->vm == current) {
-        /* 目标就是当前 VM，直接注入硬件 LR */
-        vgic_inject_virq(VIRQ_IVSHMEM);
-    } else {
-        /* Phase 15: GICD 门控——目标 SPI 被禁用则丢弃 */
-        if (!virt_vgicd_spi_enabled(target->vm, VIRQ_IVSHMEM))
-            return;
+    if (!virt_vgicd_spi_enabled(target->vm, VIRQ_IVSHMEM))
+        return;
 
-        /* 目标不是当前 VM，修改其保存的状态 */
-        struct vm_virt_state *virt = &target->vm->virt;
-        int injected = 0;
-
-        /* 找一个空闲 LR（LR0=vtimer 专用，从 LR1 开始找） */
-        for (int i = 1; i < NR_VGIC_LRS; i++) {
-            if ((virt->gic_lr[i] & ICH_LR_STATE_MASK) == 0) {
-                virt->gic_lr[i] =
-                    ((uint64_t)VIRQ_IVSHMEM & 0xffffffffULL)
-                    | ICH_LR_GROUP1
-                    | ICH_LR_PENDING;
-                injected = 1;
-                break;
-            }
-        }
-
-        if (!injected) {
-            WARN("ivshmem: no free LR for peer %d", target_peer);
-        }
-    }
+    vgic_inject_virq_to_vm(target->vm, VIRQ_IVSHMEM);
 }

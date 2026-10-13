@@ -2252,6 +2252,173 @@ gicr_pend_end:
         guest_puts("\nPhase 18: SOME tests FAILED\n");
 }
 
+/* ---------- Phase 19: vGIC 注入路径统一 ---------- */
+
+/*
+ * Phase 19 测试：vGIC 注入路径统一验证
+ *
+ * 重构内容：把 ivshmem doorbell 和 shm_notify 的"直写 saved state"
+ * 老式注入统一为 vgic_inject_virq_to_vm()，消除分散的 LR 操作逻辑。
+ *
+ * 本测试验证（VM 间协作，用 ivshmem 共享内存做同步）：
+ *   [1] ivshmem doorbell 门控验证：禁用目标 SPI 后 doorbell 被丢弃
+ *
+ * 注：ivshmem doorbell 本身的送达性已在 Test 2 (ivshmem ping-pong) 中验证；
+ *     shm_notify 与 ivshmem 走同一条 vgic_inject_virq_to_vm 统一路径，
+ *     不再重复验证送达性。
+ */
+static void phase19_injection_unify_test(void)
+{
+    guest_puts("\nPhase 19: vGIC injection path unification\n");
+
+    int passed = 1;
+    u64 vmid = guest_vmid();
+    volatile unsigned char *shm = (volatile unsigned char *)IVSHMEM_MEM_BASE;
+
+    /* 同步字节：byte[60:66]，远离前面测试的写区域 */
+    volatile unsigned char *s_entry1 = &shm[60];  /* 入口同步：VM1 就绪 */
+    volatile unsigned char *s_entry2 = &shm[61];  /* 入口同步：VM2 就绪 */
+    volatile unsigned char *s_ready  = &shm[63];  /* VM2 已禁用 SPI */
+    volatile unsigned char *s_sent   = &shm[64];  /* VM1 已发 doorbell */
+    volatile unsigned char *s_result = &shm[65];  /* VM2 验证结果 */
+    volatile unsigned char *s_ack    = &shm[66];  /* VM1 确认收到结果 */
+
+    /* ---- 入口同步：确保两边都进入 Phase 19 再开始 ----
+     * 用 byte[60]=VM1 ready, byte[61]=VM2 ready。
+     * 这些字节在 ivshmem 测试中不会被访问（只访问 byte 0-11），
+     * QEMU 初始化为 0，无需显式清零。 */
+    if (vmid == 1) {
+        *s_entry1 = 1;
+        asm volatile("dsb sy" ::: "memory");
+        int t = 500000;
+        while (*s_entry2 != 1 && t-- > 0)
+            hvc_call(HVC_SCHED_YIELD, 0);
+        if (*s_entry2 != 1) {
+            guest_puts("  FAILED (entry sync: VM1 timeout waiting for VM2)\n");
+            passed = 0;
+            goto p19_end;
+        }
+    } else {
+        *s_entry2 = 1;
+        asm volatile("dsb sy" ::: "memory");
+        int t = 500000;
+        while (*s_entry1 != 1 && t-- > 0)
+            hvc_call(HVC_SCHED_YIELD, 0);
+        if (*s_entry1 != 1) {
+            guest_puts("  FAILED (entry sync: VM2 timeout waiting for VM1)\n");
+            passed = 0;
+            goto p19_end;
+        }
+    }
+
+    /* ---- [1] 门控验证：禁用 SPI 后 doorbell 被丢弃 ---- */
+    guest_puts("  [1] SPI disabled -> doorbell dropped (gating) ... ");
+
+    ivshmem_irq_received = 0;
+    asm volatile("dmb ish" ::: "memory");
+
+    if (vmid == 1) {
+        /* VM1: 等 VM2 禁用 SPI 并就绪 */
+        int t = 200000;
+        while (*s_ready != 1 && t-- > 0)
+            hvc_call(HVC_SCHED_YIELD, 0);
+        if (*s_ready != 1) {
+            guest_puts("FAILED (VM1 timeout waiting for VM2 ready)\n");
+            passed = 0;
+            goto p19_end;
+        }
+
+        /* VM2 已禁用 SPI，发 doorbell 给 VM2（应该被丢弃） */
+        ivshmem_doorbell(1);
+
+        /* 给 VM2 一点时间确认没收到 */
+        for (int i = 0; i < 5000; i++)
+            hvc_call(HVC_SCHED_YIELD, 0);
+
+        /* 通知 VM2 "我发完了" */
+        *s_sent = 1;
+        asm volatile("dsb sy" ::: "memory");
+
+        /* 等 VM2 验证结果 */
+        t = 200000;
+        while (*s_result == 0 && t-- > 0)
+            hvc_call(HVC_SCHED_YIELD, 0);
+        if (*s_result != 1) {
+            guest_puts("FAILED (VM2 received doorbell with SPI disabled)\n");
+            passed = 0;
+            *s_ack = 1;
+            asm volatile("dsb sy" ::: "memory");
+            goto p19_end;
+        }
+
+        /* 通知 VM2 "我收到结果了，你可以恢复了" */
+        *s_ack = 1;
+        asm volatile("dsb sy" ::: "memory");
+    } else {
+        /* VM2: 禁用 ivshmem SPI (#49 = bit 17 of ICENABLER[1]) */
+        mmio_write32((void *)GICD_ICENABLER(1), 1u << 17);
+        asm volatile("dsb sy" ::: "memory");
+
+        /* 通知 VM1 "我禁用了，可以发了" */
+        *s_ready = 1;
+        asm volatile("dsb sy" ::: "memory");
+
+        /* 等 VM1 发完 doorbell */
+        int t = 200000;
+        while (*s_sent != 1 && t-- > 0)
+            hvc_call(HVC_SCHED_YIELD, 0);
+        if (*s_sent != 1) {
+            guest_puts("FAILED (VM2 timeout waiting for VM1 send)\n");
+            passed = 0;
+            /* 恢复 SPI */
+            mmio_write32((void *)GICD_ISENABLER(1), 1u << 17);
+            asm volatile("dsb sy" ::: "memory");
+            goto p19_end;
+        }
+
+        /* 检查是否收到了中断（应该没收到） */
+        if (ivshmem_irq_received) {
+            guest_puts("FAILED (received doorbell with SPI disabled)\n");
+            passed = 0;
+            *s_result = 2;   /* 2 = 失败 */
+            asm volatile("dsb sy" ::: "memory");
+            /* 恢复 SPI */
+            mmio_write32((void *)GICD_ISENABLER(1), 1u << 17);
+            asm volatile("dsb sy" ::: "memory");
+            goto p19_end;
+        }
+
+        /* 验证通过，通知 VM1 */
+        *s_result = 1;   /* 1 = 通过 */
+        asm volatile("dsb sy" ::: "memory");
+
+        /* 等 VM1 确认 */
+        t = 200000;
+        while (*s_ack != 1 && t-- > 0)
+            hvc_call(HVC_SCHED_YIELD, 0);
+
+        /* 恢复 SPI */
+        mmio_write32((void *)GICD_ISENABLER(1), 1u << 17);
+        asm volatile("dsb sy" ::: "memory");
+    }
+    guest_puts("PASSED\n");
+
+p19_end:
+    /* 清理共享内存同步字节 */
+    *s_entry1 = 0;
+    *s_entry2 = 0;
+    *s_ready = 0;
+    *s_sent = 0;
+    *s_result = 0;
+    *s_ack = 0;
+    asm volatile("dsb sy" ::: "memory");
+
+    if (passed)
+        guest_puts("\nPhase 19: ALL tests done\n");
+    else
+        guest_puts("\nPhase 19: SOME tests FAILED\n");
+}
+
 static void vits_test(void)
 {
     guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
@@ -2622,6 +2789,9 @@ void guest_main(void)
 
     /* 测试 11: Phase 18 优先级与 pending 完整建模（主核单线程） */
     phase18_priority_pending_test();
+
+    /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
+    phase19_injection_unify_test();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 
