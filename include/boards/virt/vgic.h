@@ -33,6 +33,11 @@ struct vm_virt_state;
 struct vgic_dist {
     uint32_t ctlr;             /* GICD_CTLR：全局使能 + 亲和路由 */
     uint32_t spi_enable[32];   /* GICD_ISENABLERn：INTID 0..1023 使能位图 */
+    /* Phase 18: SPI 软件 pending 位图（INTID 0..1023，仅 32..1019 有意义）
+     * 承载 GICD_ISPENDR/ICPENDR 的软件可见结果，不追踪硬件 LR 实时 state。 */
+    uint32_t spi_pending[32];
+    /* Phase 18: SPI 优先级（INTID 32..1019，index = vintid - 32） */
+    uint8_t  spi_priority[1020];
 };
 
 /*
@@ -49,6 +54,10 @@ struct vgic_dist {
 struct vgic_rdist {
     uint32_t ctlr;             /* GICR_CTLR */
     uint32_t ppi_enable;       /* GICR_ISENABLER0：INTID 0..31 使能位图 */
+    /* Phase 18: SGI/PPI 软件 pending 位图（INTID 0..31） */
+    uint32_t pending;
+    /* Phase 18: SGI/PPI 优先级（INTID 0..31，index = vintid） */
+    uint8_t  priority[32];
 };
 
 void vgic_init(void);

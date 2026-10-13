@@ -698,6 +698,27 @@ int virt_vgicr_ppi_enabled(struct task_struct *vm, uint32_t vintid)
     return (devs->vgicr.ppi_enable >> (vintid & 31)) & 1;
 }
 
+/*
+ * Phase 18: 查询指定 VM 的虚拟中断优先级（8 位，数值越小优先级越高）
+ *
+ * SGI/PPI (0-31) 查 GICR 的 priority[]；SPI (32-1019) 查 GICD 的
+ * spi_priority[]；LPI (8192+) 本项目未建模优先级，返回默认 0xA0。
+ */
+uint8_t virt_vgic_vintid_priority(struct task_struct *vm, uint32_t vintid)
+{
+    struct virt_vm_devices *devs =
+        (struct virt_vm_devices *)vm->board_data;
+    if (!devs)
+        return 0xA0;  /* 无设备模型（如 idle）时默认优先级 */
+
+    if (vintid < 32)
+        return devs->vgicr.priority[vintid & 31];
+    if (vintid < 1020)
+        return devs->vgicd.spi_priority[vintid - 32];
+
+    return 0xA0;  /* LPI 默认优先级 */
+}
+
 /* ---------- board ops ---------- */
 
 const struct board_ops virt_board_ops = {

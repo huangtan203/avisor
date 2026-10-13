@@ -122,6 +122,9 @@ static void gic_vcpu_init(void)
 #define GICD_IIDR           (GICD_BASE + 0x0008)
 #define GICD_ISENABLER(n)   (GICD_BASE + 0x0100 + (n) * 4)
 #define GICD_ICENABLER(n)   (GICD_BASE + 0x0180 + (n) * 4)
+#define GICD_ISPENDR(n)     (GICD_BASE + 0x0200 + (n) * 4)
+#define GICD_ICPENDR(n)     (GICD_BASE + 0x0280 + (n) * 4)
+#define GICD_IPRIORITYR(n)  (GICD_BASE + 0x0400 + (n) * 4)
 
 #define GICD_CTLR_ENABLE_G1NS   (1 << 1)
 #define GICD_CTLR_ARE_NS        (1 << 4)
@@ -245,6 +248,9 @@ static void phase15_vgicd_test(void)
 /* SGI/PPI 帧偏移相对 GICR 基址，已含 0x10000 的 SGI_base 帧偏移 */
 #define GICR_ISENABLER0     (GICR_BASE + 0x10100)
 #define GICR_ICENABLER0     (GICR_BASE + 0x10180)
+#define GICR_ISPENDR0       (GICR_BASE + 0x10200)
+#define GICR_ICPENDR0       (GICR_BASE + 0x10280)
+#define GICR_IPRIORITYR(n)  (GICR_BASE + 0x10400 + (n) * 4)
 
 /* 虚拟 GICR 测试接收标志 */
 static volatile int vgicr_irq_received = 0;
@@ -2033,6 +2039,219 @@ static void phase17_vsgi_trap_test(void)
     }
 }
 
+/* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
+
+/*
+ * Phase 18 测试（主核单线程）：
+ *
+ * 验证 vGIC 的优先级与 pending 状态建模：
+ *   1. GICD IPRIORITYR 读写：写入自定义优先级，读回校验
+ *   2. GICD ISPENDR/ICPENDR 读写：置位/清除软件 pending 位图
+ *   3. GICR IPRIORITYR 读写：SGI/PPI 优先级读写
+ *   4. GICR ISPENDR0/ICPENDR0 读写：SGI/PPI 软件 pending
+ *
+ * 优先级规则：数值越小优先级越高（GICv3 标准）。
+ * 默认优先级 0xA0。
+ */
+static void phase18_priority_pending_test(void)
+{
+    guest_puts("\nPhase 18: Priority & pending modeling\n");
+
+    int passed = 1;
+
+    /* ---- 1. GICD IPRIORITYR 读写 ---- */
+    guest_puts("  [1] GICD IPRIORITYR read/write ... ");
+
+    /* 读初始值（默认 0xA0），取 SPI #52（IPRIORITYR[13] 的 byte 0） */
+    u32 prio_reg_before = mmio_read32((void *)GICD_IPRIORITYR(13));
+    u8 prio_52_before = (u8)(prio_reg_before & 0xFF);
+    if (prio_52_before != 0xA0) {
+        guest_puts("FAILED (default prio of SPI#52 = 0x");
+        puts_hex(prio_52_before, 2);
+        guest_puts(", expected 0xA0)\n");
+        passed = 0;
+        goto gicd_prio_end;
+    }
+
+    /* 写入自定义优先级：SPI #52 = 0x20，SPI #53 = 0x40，SPI #54 = 0x60，SPI #55 = 0x80 */
+    u32 custom_prio = 0x80604020u;  /* byte3=#55, byte2=#54, byte1=#53, byte0=#52 */
+    mmio_write32((void *)GICD_IPRIORITYR(13), custom_prio);
+
+    u32 prio_reg_after = mmio_read32((void *)GICD_IPRIORITYR(13));
+    if (prio_reg_after != custom_prio) {
+        guest_puts("FAILED (write 0x");
+        puts_hex(custom_prio, 8);
+        guest_puts(" read back 0x");
+        puts_hex(prio_reg_after, 8);
+        guest_puts(")\n");
+        passed = 0;
+        /* 恢复默认值 */
+        mmio_write32((void *)GICD_IPRIORITYR(13), 0xA0A0A0A0u);
+        goto gicd_prio_end;
+    }
+
+    /* 恢复默认值 */
+    mmio_write32((void *)GICD_IPRIORITYR(13), 0xA0A0A0A0u);
+    guest_puts("PASSED\n");
+
+gicd_prio_end:
+
+    /* ---- 2. GICD ISPENDR / ICPENDR ---- */
+    guest_puts("  [2] GICD ISPENDR/ICPENDR ... ");
+
+    /* 初始 pending 位图应为 0（SPI 范围 32-63 在第 1 组） */
+    u32 pend_before = mmio_read32((void *)GICD_ISPENDR(1));
+    if (pend_before != 0) {
+        guest_puts("FAILED (initial pending = 0x");
+        puts_hex(pend_before, 8);
+        guest_puts(")\n");
+        passed = 0;
+        goto gicd_pend_end;
+    }
+
+    /* 置位 SPI #52 的 pending（bit 20 of ISPENDR[1]） */
+    mmio_write32((void *)GICD_ISPENDR(1), 1u << 20);
+    u32 pend_set = mmio_read32((void *)GICD_ISPENDR(1));
+    if ((pend_set & (1u << 20)) == 0) {
+        guest_puts("FAILED (after ISPENDR write, bit20 not set, val=0x");
+        puts_hex(pend_set, 8);
+        guest_puts(")\n");
+        passed = 0;
+        goto gicd_pend_end;
+    }
+
+    /* 通过 ICPENDR 读（与 ISPENDR 一致） */
+    u32 pend_icread = mmio_read32((void *)GICD_ICPENDR(1));
+    if (pend_icread != pend_set) {
+        guest_puts("FAILED (ICPENDR read 0x");
+        puts_hex(pend_icread, 8);
+        guest_puts(" != ISPENDR 0x");
+        puts_hex(pend_set, 8);
+        guest_puts(")\n");
+        passed = 0;
+        goto gicd_pend_end;
+    }
+
+    /* 清除 SPI #52 pending */
+    mmio_write32((void *)GICD_ICPENDR(1), 1u << 20);
+    u32 pend_clr = mmio_read32((void *)GICD_ISPENDR(1));
+    if ((pend_clr & (1u << 20)) != 0) {
+        guest_puts("FAILED (after ICPENDR write, bit20 still set, val=0x");
+        puts_hex(pend_clr, 8);
+        guest_puts(")\n");
+        passed = 0;
+        goto gicd_pend_end;
+    }
+
+    guest_puts("PASSED\n");
+
+gicd_pend_end:
+
+    /* ---- 3. GICR IPRIORITYR 读写（SGI/PPI） ---- */
+    guest_puts("  [3] GICR IPRIORITYR read/write ... ");
+
+    /* 读 IPRIORITYR[0]（INTID 0-3），默认全 0xA0 */
+    u32 r_prio0 = mmio_read32((void *)GICR_IPRIORITYR(0));
+    if (r_prio0 != 0xA0A0A0A0u) {
+        guest_puts("FAILED (default prio = 0x");
+        puts_hex(r_prio0, 8);
+        guest_puts(")\n");
+        passed = 0;
+        goto gicr_prio_end;
+    }
+
+    /* 写自定义：SGI#0=0x10, SGI#1=0x20, PPI#16=0x30（在 IPRIORITYR[4]） */
+    mmio_write32((void *)GICR_IPRIORITYR(0), 0xA0A02010u);  /* SGI 0,1 */
+    u32 r_prio0_after = mmio_read32((void *)GICR_IPRIORITYR(0));
+    /* 只校验低两个字节（INTID 0 和 1），高位 INTID 2,3 仍为 0xA0 */
+    if ((r_prio0_after & 0xFFFF) != 0x2010u) {
+        guest_puts("FAILED (SGI prio write, got 0x");
+        puts_hex(r_prio0_after & 0xFFFF, 4);
+        guest_puts(" expected 0x2010)\n");
+        passed = 0;
+        mmio_write32((void *)GICR_IPRIORITYR(0), 0xA0A0A0A0u);
+        goto gicr_prio_end;
+    }
+
+    /* PPI 优先级（INTID 16 = IPRIORITYR[4] 的 byte 0） */
+    mmio_write32((void *)GICR_IPRIORITYR(4), 0xA0A0A030u);
+    u32 r_prio4 = mmio_read32((void *)GICR_IPRIORITYR(4));
+    if ((r_prio4 & 0xFF) != 0x30) {
+        guest_puts("FAILED (PPI#16 prio = 0x");
+        puts_hex(r_prio4 & 0xFF, 2);
+        guest_puts(")\n");
+        passed = 0;
+        mmio_write32((void *)GICR_IPRIORITYR(4), 0xA0A0A0A0u);
+        goto gicr_prio_end;
+    }
+
+    /* 恢复默认 */
+    mmio_write32((void *)GICR_IPRIORITYR(0), 0xA0A0A0A0u);
+    mmio_write32((void *)GICR_IPRIORITYR(4), 0xA0A0A0A0u);
+    guest_puts("PASSED\n");
+
+gicr_prio_end:
+
+    /* ---- 4. GICR ISPENDR0 / ICPENDR0 ---- */
+    guest_puts("  [4] GICR ISPENDR0/ICPENDR0 ... ");
+
+    u32 r_pend0 = mmio_read32((void *)GICR_ISPENDR0);
+    if (r_pend0 != 0) {
+        guest_puts("FAILED (initial pending = 0x");
+        puts_hex(r_pend0, 8);
+        guest_puts(")\n");
+        passed = 0;
+        goto gicr_pend_end;
+    }
+
+    /* 置位 SGI#3 和 PPI#24 */
+    mmio_write32((void *)GICR_ISPENDR0, (1u << 3) | (1u << 24));
+    u32 r_pend_set = mmio_read32((void *)GICR_ISPENDR0);
+    if ((r_pend_set & ((1u << 3) | (1u << 24))) != ((1u << 3) | (1u << 24))) {
+        guest_puts("FAILED (after ISPENDR0 write, val=0x");
+        puts_hex(r_pend_set, 8);
+        guest_puts(")\n");
+        passed = 0;
+        goto gicr_pend_end;
+    }
+
+    /* 清除 SGI#3 */
+    mmio_write32((void *)GICR_ICPENDR0, 1u << 3);
+    u32 r_pend_clr = mmio_read32((void *)GICR_ISPENDR0);
+    if ((r_pend_clr & (1u << 3)) != 0) {
+        guest_puts("FAILED (SGI#3 not cleared, val=0x");
+        puts_hex(r_pend_clr, 8);
+        guest_puts(")\n");
+        passed = 0;
+        goto gicr_pend_end;
+    }
+    if ((r_pend_clr & (1u << 24)) == 0) {
+        guest_puts("FAILED (PPI#24 wrongly cleared)\n");
+        passed = 0;
+        goto gicr_pend_end;
+    }
+
+    /* 清除 PPI#24，恢复干净 */
+    mmio_write32((void *)GICR_ICPENDR0, 1u << 24);
+    u32 r_pend_final = mmio_read32((void *)GICR_ISPENDR0);
+    if (r_pend_final != 0) {
+        guest_puts("FAILED (final pending not zero, val=0x");
+        puts_hex(r_pend_final, 8);
+        guest_puts(")\n");
+        passed = 0;
+        goto gicr_pend_end;
+    }
+
+    guest_puts("PASSED\n");
+
+gicr_pend_end:
+
+    if (passed)
+        guest_puts("\nPhase 18: ALL tests done\n");
+    else
+        guest_puts("\nPhase 18: SOME tests FAILED\n");
+}
+
 static void vits_test(void)
 {
     guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
@@ -2400,6 +2619,9 @@ void guest_main(void)
     /* 测试 10: Phase 17 虚拟 SGI trap-and-emulate（捕获 ICC_SGI1R_EL1 写）
      * 需要次 vCPU 配合。phase17_vsgi_trap_test 内部按 cpuid 区分主/次。 */
     phase17_vsgi_trap_test();
+
+    /* 测试 11: Phase 18 优先级与 pending 完整建模（主核单线程） */
+    phase18_priority_pending_test();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 

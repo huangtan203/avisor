@@ -54,3 +54,8 @@ int virt_vgicd_spi_enabled(struct task_struct *vm, uint32_t vintid);
  * （返回 1=使能/放行，0=禁用；仅 PPI 16-31 走此门控）
  * 供 vgic.c 注入路径做 enable 门控。 */
 int virt_vgicr_ppi_enabled(struct task_struct *vm, uint32_t vintid);
+
+/* Phase 18: 查询指定 VM 的虚拟中断优先级（8 位，数值越小优先级越高）。
+ * SGI/PPI 查 GICR、SPI 查 GICD、LPI 返回默认 0xA0。
+ * 供 vgic.c 注入路径把优先级写入 ICH_LR 的 Priority 字段。 */
+uint8_t virt_vgic_vintid_priority(struct task_struct *vm, uint32_t vintid);

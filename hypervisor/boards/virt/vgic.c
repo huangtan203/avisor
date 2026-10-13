@@ -36,6 +36,31 @@ static inline void write_lr(int idx, uint64_t val)
     }
 }
 
+/* Phase 18: 清除当前 vCPU 的硬件 LR 中指定 vINTID 的 pending 状态
+ *
+ * 扫描所有 LR，找到匹配 vINTID 且状态为 pending 的条目，将其清 0
+ *（释放 LR）。用于 Guest 写 ICPENDR 时取消 pending 中断。
+ *
+ * 注意：仅清除"纯软件 pending"状态；对于 HW 映射（LR0/LR2）和
+ * active 状态的 LR 不做处理，避免破坏硬件 EOI 流程。
+ */
+static void vgic_clear_pending_virq(uint32_t vintid)
+{
+    /* 只扫描软件使用的 LR1..NR-2（LR0 保留给 vtimer HW，LR2 给 PCI） */
+    for (int i = 1; i < NR_VGIC_LRS - 1; i++) {
+        uint64_t lr = read_lr(i);
+        if ((lr & ICH_LR_STATE_MASK) != ICH_LR_PENDING)
+            continue;
+        if ((lr & ICH_LR_HW) != 0)
+            continue;  /* 跳过 HW 映射条目 */
+        if ((uint32_t)(lr & 0xffffffffULL) == vintid) {
+            write_lr(i, 0);   /* 清零 LR，释放条目 */
+            asm volatile("isb");
+            return;
+        }
+    }
+}
+
 /*
  * vGIC 初始化
  *
@@ -116,6 +141,11 @@ void vgicd_init(struct vgic_dist *d)
     d->ctlr = GICD_CTLR_ENABLE_G1NS | GICD_CTLR_ARE_NS;
     for (int i = 0; i < 32; i++)
         d->spi_enable[i] = 0xFFFFFFFFu;
+    /* Phase 18: 无软件 pending，优先级默认 0xA0 */
+    for (int i = 0; i < 32; i++)
+        d->spi_pending[i] = 0;
+    for (int i = 0; i < 1020; i++)
+        d->spi_priority[i] = 0xA0;
 }
 
 /*
@@ -141,9 +171,27 @@ uint32_t vgicd_read(struct vgic_dist *d, uint32_t offset)
     if (offset >= 0x0100 && offset < 0x0180 && ((offset - 0x0100) & 3) == 0)
         return d->spi_enable[(offset - 0x0100) >> 2];
 
-    /* IPRIORITYR(n): 默认优先级 0xA0 */
-    if (offset >= 0x0400 && offset < 0x0800 && ((offset - 0x0400) & 3) == 0)
-        return 0xA0A0A0A0u;
+    /* Phase 18: ISPENDR(n): 0x0200 + n*4，软件 pending 位图 */
+    if (offset >= 0x0200 && offset < 0x0280 && ((offset - 0x0200) & 3) == 0)
+        return d->spi_pending[(offset - 0x0200) >> 2];
+
+    /* Phase 18: ICPENDR(n): 0x0280 + n*4，读同 ISPENDR（写才是清除） */
+    if (offset >= 0x0280 && offset < 0x0300 && ((offset - 0x0280) & 3) == 0)
+        return d->spi_pending[(offset - 0x0280) >> 2];
+
+    /* Phase 18: IPRIORITYR(n): 0x0400 + n*4，从 spi_priority 读回 */
+    if (offset >= 0x0400 && offset < 0x0800 && ((offset - 0x0400) & 3) == 0) {
+        uint32_t n = (offset - 0x0400) >> 2;
+        uint32_t val = 0;
+        for (int i = 0; i < 4; i++) {
+            int intid = n * 4 + i;
+            uint8_t p = 0xA0;
+            if (intid >= 32 && intid < 1020)
+                p = d->spi_priority[intid - 32];
+            val |= ((uint32_t)p << (i * 8));
+        }
+        return val;
+    }
 
     /* 其余（ICENABLER/ISPENDR/ICPENDR/ICFGR/IROUTER 等）读 0 */
     return 0;
@@ -177,7 +225,41 @@ void vgicd_write(struct vgic_dist *d, uint32_t offset, uint32_t val)
         return;
     }
 
-    /* 其余（IGROUPR/IPRIORITYR/ICFGR/ISPENDR/IROUTER 等）忽略写 */
+    /* Phase 18: ISPENDR(n): 0x0200 + n*4，置位软件 pending */
+    if (offset >= 0x0200 && offset < 0x0280 && ((offset - 0x0200) & 3) == 0) {
+        d->spi_pending[(offset - 0x0200) >> 2] |= val;
+        return;
+    }
+
+    /* Phase 18: ICPENDR(n): 0x0280 + n*4，清除软件 pending
+     * 同时对当前 vCPU 的对应 vINTID 做 LR pending 清除。 */
+    if (offset >= 0x0280 && offset < 0x0300 && ((offset - 0x0280) & 3) == 0) {
+        uint32_t n = (offset - 0x0280) >> 2;
+        d->spi_pending[n] &= ~val;
+        /* 清除 LR 中的对应 pending 位 */
+        for (int i = 0; i < 32; i++) {
+            if (val & (1u << i)) {
+                uint32_t intid = n * 32 + i;
+                if (intid >= 32 && intid < 1020)
+                    vgic_clear_pending_virq(intid);
+            }
+        }
+        return;
+    }
+
+    /* Phase 18: IPRIORITYR(n): 0x0400 + n*4，写入优先级
+     * 每个寄存器放 4 个 INTID 的优先级（低字节=低 INTID）。*/
+    if (offset >= 0x0400 && offset < 0x0800 && ((offset - 0x0400) & 3) == 0) {
+        uint32_t n = (offset - 0x0400) >> 2;
+        for (int i = 0; i < 4; i++) {
+            int intid = n * 4 + i;
+            if (intid >= 32 && intid < 1020)
+                d->spi_priority[intid - 32] = (uint8_t)(val >> (i * 8));
+        }
+        return;
+    }
+
+    /* 其余（IGROUPR/ICFGR/IROUTER 等）忽略写 */
 }
 
 /*
@@ -194,6 +276,10 @@ void vgicr_init(struct vgic_rdist *r)
 
     r->ctlr = 0;                /* GICR_CTLR 复位为 0（无 LPI 使能位） */
     r->ppi_enable = 0xFFFFFFFFu;
+    /* Phase 18: 无软件 pending，优先级默认 0xA0 */
+    r->pending = 0;
+    for (int i = 0; i < 32; i++)
+        r->priority[i] = 0xA0;
 }
 
 /*
@@ -225,9 +311,25 @@ uint32_t vgicr_read(struct vgic_rdist *r, uint32_t offset)
             return 0xFFFFFFFFu;
         if (sgi == GICR_ISENABLER0)     /* 0x0100 */
             return r->ppi_enable;
-        /* IPRIORITYR(n)：0x0400 + n*4，默认优先级 0xA0 */
-        if (sgi >= 0x0400 && sgi < 0x0420 && ((sgi - 0x0400) & 3) == 0)
-            return 0xA0A0A0A0u;
+        if (sgi == GICR_ICENABLER0)     /* 0x0180：读 PPI enable（取反语义） */
+            return ~r->ppi_enable;
+        /* Phase 18: ISPENDR0: 0x0200，软件 pending 位图 */
+        if (sgi == GICR_ISPENDR0)
+            return r->pending;
+        /* Phase 18: ICPENDR0: 0x0280，读同 ISPENDR0（写才是清除） */
+        if (sgi == GICR_ICPENDR0)
+            return r->pending;
+        /* Phase 18: IPRIORITYR(n): 0x0400 + n*4，从 priority[] 读回 */
+        if (sgi >= 0x0400 && sgi < 0x0420 && ((sgi - 0x0400) & 3) == 0) {
+            uint32_t n = (sgi - 0x0400) >> 2;
+            uint32_t val = 0;
+            for (int i = 0; i < 4; i++) {
+                int intid = n * 4 + i;
+                if (intid < 32)
+                    val |= ((uint32_t)r->priority[intid] << (i * 8));
+            }
+            return val;
+        }
     }
 
     /* 其余（ICENABLER0/ISPENDR0/ICPENDR0/ICFGR/PROPBASER 等）读 0 */
@@ -259,6 +361,36 @@ void vgicr_write(struct vgic_rdist *r, uint32_t offset, uint32_t val)
         }
         if (sgi == GICR_ICENABLER0) {   /* 0x0180：清除使能 */
             r->ppi_enable &= ~val;
+            return;
+        }
+        /* Phase 18: ISPENDR0: 0x0200，置位软件 pending
+         * 写入 1 的位对应 INTID 被置为 pending，写入 0 的位不变。
+         * 只对 SGI/PPI 0..31 有效，边沿触发中断的软件置 pending。 */
+        if (sgi == GICR_ISPENDR0) {
+            r->pending |= (val & 0xFFFFFFFFu);
+            return;
+        }
+        /* Phase 18: ICPENDR0: 0x0280，清除软件 pending
+         * 写入 1 的位对应 INTID 被清除 pending；同时尝试清除 LR 中
+         * 对应 vINTID 的 pending 条目（软件触发的）。 */
+        if (sgi == GICR_ICPENDR0) {
+            r->pending &= ~val;
+            /* 对每一位，调用通用的 LR pending 清除函数 */
+            for (int i = 0; i < 32; i++) {
+                if (val & (1u << i))
+                    vgic_clear_pending_virq(i);
+            }
+            return;
+        }
+        /* Phase 18: IPRIORITYR(n): 0x0400 + n*4，写入优先级
+         * 每个寄存器放 4 个 INTID 的优先级（字节序：低字节=低 INTID）。 */
+        if (sgi >= 0x0400 && sgi < 0x0420 && ((sgi - 0x0400) & 3) == 0) {
+            uint32_t n = (sgi - 0x0400) >> 2;
+            for (int i = 0; i < 4; i++) {
+                int intid = n * 4 + i;
+                if (intid < 32)
+                    r->priority[intid] = (uint8_t)(val >> (i * 8));
+            }
             return;
         }
     }
@@ -334,13 +466,16 @@ uint64_t vgic_get_lr0(void)
  */
 static int vgic_inject_virq_raw(uint32_t vintid)
 {
+    uint8_t prio = virt_vgic_vintid_priority(current, vintid);
+
     for (int i = 1; i < NR_VGIC_LRS - 1; i++) {
         uint64_t lr = read_lr(i);
         if ((lr & ICH_LR_STATE_MASK) == 0) {
             /* 空闲：写入 pending 状态的虚拟中断 */
             lr = ((uint64_t)vintid & 0xffffffffULL)  /* vINTID */
                  | ICH_LR_GROUP1                     /* Group 1 */
-                 | ICH_LR_PENDING;                   /* pending */
+                 | ICH_LR_PENDING                    /* pending */
+                 | ((uint64_t)prio << ICH_LR_PRIORITY_SHIFT);  /* 优先级 */
             write_lr(i, lr);
             asm volatile("isb");
             return 0;

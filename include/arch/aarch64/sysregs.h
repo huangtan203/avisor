@@ -141,6 +141,10 @@
 #define ICH_LR_ACTIVE  (1UL << 63) /* state: active */
 #define ICH_LR_STATE_MASK (3UL << 62) /* state 字段整体掩码 */
 
+/* Phase 18: 虚拟中断优先级字段 bits[55:48]（8 位，数值越小优先级越高） */
+#define ICH_LR_PRIORITY_SHIFT 48
+#define ICH_LR_PRIORITY_MASK  (0xFFUL << 48)
+
 /* 虚拟定时器相关 */
 #define CNTVOFF_EL2  S3_4_C14_C0_3 /* 虚拟计数器偏移 */
 #define CNTHCTL_EL2  S3_4_C14_C1_0 /* EL1 访问 CNTP/CNTV 的 trap 控制 */
