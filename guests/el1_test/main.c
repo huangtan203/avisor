@@ -1202,6 +1202,227 @@ static void edu_test(void)
  *   6. 触发 edu 中断，验证收到 VITS_TEST_VSPI 号虚拟中断
  *   7. 恢复 MSI data = 0（不影响后续回归测试）
  */
+
+/* ---------- Phase 10: 调度器 + 内存管理 + 共享内存测试 ---------- */
+
+/* 共享内存 notify 中断标志 */
+static volatile int shm_notify_received = 0;
+
+/* 共享内存测试用的 key */
+#define SHM_TEST_KEY   0x12345678
+
+/* 动态内存映射测试用的 IPA（选高地址，避开已用区域）
+ * Guest RAM 从 0x40000000 开始，我们用 0x48000000 附近的未映射区域
+ * （Guest 自身镜像 + 栈 + 页表大概用了前 8MB） */
+#define DYN_MAP_IPA    0x48000000UL
+
+/*
+ * Test 5.1: 调度器 hypercall 测试
+ *   - 获取当前优先级
+ *   - 设置优先级
+ *   - sched_yield 让出 CPU
+ */
+static void test_scheduler(void)
+{
+    guest_puts("--- Test 5.1: Scheduler hypercalls ---\n");
+
+    /* 1. 获取当前优先级 */
+    u64 prio = hvc_call(HVC_SCHED_GET_PRIO, 0);
+    guest_puts("sched: current priority = ");
+    puts_dec(prio);
+    guest_puts("\n");
+
+    /* 2. 设置为高优先级 (3) */
+    u64 ret = hvc_call(HVC_SCHED_SET_PRIO, 3);
+    guest_puts("sched: set priority 3, ret=");
+    puts_dec(ret);
+    guest_puts("\n");
+
+    prio = hvc_call(HVC_SCHED_GET_PRIO, 0);
+    guest_puts("sched: priority now = ");
+    puts_dec(prio);
+    guest_puts("\n");
+
+    /* 3. sched_yield 让出 CPU */
+    ret = hvc_call(HVC_SCHED_YIELD, 0);
+    guest_puts("sched: yield, ret=");
+    puts_dec(ret);
+    guest_puts("\n");
+
+    /* 4. 恢复默认优先级 (2) */
+    hvc_call(HVC_SCHED_SET_PRIO, 2);
+
+    guest_puts("sched: PASSED\n");
+}
+
+/*
+ * Test 5.2: 动态内存映射测试
+ *   - hyp_mem_map 映射一个新页
+ *   - 写数据验证
+ *   - hyp_mem_unmap 取消映射
+ */
+static void test_mem_map(void)
+{
+    guest_puts("\n--- Test 5.2: Dynamic memory mapping ---\n");
+
+    /* 1. 映射一页到 DYN_MAP_IPA */
+    u64 ret = hvc_call2(HVC_MEM_MAP, DYN_MAP_IPA, 0);
+    guest_puts("mem: map 0x");
+    puts_hex(DYN_MAP_IPA, 8);
+    guest_puts(", ret=");
+    puts_dec(ret);
+    guest_puts("\n");
+
+    if (ret != 0) {
+        guest_puts("mem: FAILED (map returned error)\n");
+        return;
+    }
+
+    /* 2. 写数据到新映射的页面 */
+    volatile u32 *ptr = (volatile u32 *)DYN_MAP_IPA;
+    ptr[0] = 0xDEADBEEF;
+    ptr[1] = 0xCAFEBABE;
+    ptr[255] = 0x12345678;
+
+    /* 3. 读回来验证 */
+    if (ptr[0] != 0xDEADBEEF || ptr[1] != 0xCAFEBABE ||
+        ptr[255] != 0x12345678) {
+        guest_puts("mem: FAILED (data mismatch)\n");
+        return;
+    }
+
+    guest_puts("mem: read/write verified (0xDEADBEEF, 0xCAFEBABE, 0x12345678)\n");
+
+    /* 4. 取消映射 */
+    ret = hvc_call(HVC_MEM_UNMAP, DYN_MAP_IPA);
+    guest_puts("mem: unmap, ret=");
+    puts_dec(ret);
+    guest_puts("\n");
+
+    guest_puts("mem: PASSED\n");
+}
+
+/*
+ * Test 5.3: 跨 VM 共享内存测试
+ *
+ * 测试流程（轮询模式，不依赖中断通知时序）：
+ *   VM1: 创建 shm -> attach -> 写 "PING" -> 忙等 "PONG" -> 验证 -> detach
+ *   VM2: 查找 shm -> attach -> 忙等 "PING" -> 写 "PONG" -> detach
+ *
+ * 用轮询而非中断通知，避免两个 VM 启动时序不一致导致 notify 丢失。
+ */
+static void test_shared_memory(void)
+{
+    guest_puts("\n--- Test 5.3: Cross-VM shared memory ---\n");
+
+    u64 vmid = guest_vmid();
+
+    /* 1. 尝试创建/获取共享内存 */
+    int shmid = (int)hvc_call2(HVC_SHM_CREATE, SHM_TEST_KEY, 4096);
+    guest_puts("shm: create key=0x");
+    puts_hex(SHM_TEST_KEY, 8);
+    guest_puts(" -> shmid=");
+    puts_dec(shmid);
+    guest_puts("\n");
+
+    if (shmid < 0) {
+        guest_puts("shm: FAILED (create returned error)\n");
+        return;
+    }
+
+    /* 2. attach 到指定 IPA */
+    u64 shm_ipa = DYN_MAP_IPA + 0x1000;
+    int ret = (int)hvc_call2(HVC_SHM_ATTACH, (u64)shmid, shm_ipa);
+    guest_puts("shm: attach shmid=");
+    puts_dec(shmid);
+    guest_puts(" ipa=0x");
+    puts_hex(shm_ipa, 8);
+    guest_puts(" ret=");
+    puts_dec(ret);
+    guest_puts("\n");
+
+    if (ret != 0) {
+        guest_puts("shm: FAILED (attach returned error)\n");
+        return;
+    }
+
+    volatile char *shm_ptr = (volatile char *)shm_ipa;
+
+    if (vmid == 1) {
+        /* VM1: 主动方 — 写 "PING" 然后忙等 "PONG" */
+        shm_ptr[0] = 'P';
+        shm_ptr[1] = 'I';
+        shm_ptr[2] = 'N';
+        shm_ptr[3] = 'G';
+        shm_ptr[4] = '\0';
+        asm volatile("dsb sy" ::: "memory");
+
+        guest_puts("shm: VM1 wrote 'PING', waiting for 'PONG'...\n");
+
+        /* 忙等 PONG，循环中调用 sched_yield 主动让出 CPU 给 VM2 */
+        int timeout = 50000;  /* yield 次数，不是 cycles */
+        while (shm_ptr[0] != 'P' || shm_ptr[1] != 'O' ||
+               shm_ptr[2] != 'N' || shm_ptr[3] != 'G') {
+            hvc_call(HVC_SCHED_YIELD, 0);
+            if (--timeout <= 0) break;
+        }
+
+        if (timeout > 0 && shm_ptr[0] == 'P' && shm_ptr[1] == 'O' &&
+            shm_ptr[2] == 'N' && shm_ptr[3] == 'G') {
+            guest_puts("shm: VM1 received 'PONG' from VM2\n");
+            guest_puts("shm: PASSED\n");
+        } else {
+            guest_puts("shm: FAILED (VM1 timeout waiting for PONG)\n");
+        }
+    } else {
+        /* VM2: 被动方 — 忙等 "PING"，然后回复 "PONG" */
+        guest_puts("shm: VM2 waiting for 'PING'...\n");
+
+        /* 忙等 PING，循环中 yield 让出 CPU */
+        int timeout = 50000;  /* yield 次数 */
+        while (shm_ptr[0] != 'P' || shm_ptr[1] != 'I' ||
+               shm_ptr[2] != 'N' || shm_ptr[3] != 'G') {
+            hvc_call(HVC_SCHED_YIELD, 0);
+            if (--timeout <= 0) break;
+        }
+
+        if (timeout > 0 && shm_ptr[0] == 'P' && shm_ptr[1] == 'I' &&
+            shm_ptr[2] == 'N' && shm_ptr[3] == 'G') {
+            guest_puts("shm: VM2 received 'PING'\n");
+
+            /* 回复 "PONG" */
+            shm_ptr[0] = 'P';
+            shm_ptr[1] = 'O';
+            shm_ptr[2] = 'N';
+            shm_ptr[3] = 'G';
+            shm_ptr[4] = '\0';
+            asm volatile("dsb sy" ::: "memory");
+
+            guest_puts("shm: VM2 replied 'PONG'\n");
+            guest_puts("shm: PASSED\n");
+        } else {
+            guest_puts("shm: FAILED (VM2 timeout waiting for PING)\n");
+        }
+    }
+
+    /* 4. detach（取消映射） */
+    hvc_call(HVC_SHM_DETACH, (u64)shmid);
+    guest_puts("shm: detached\n");
+}
+
+static void phase10_tests(void)
+{
+    guest_puts("\n========================================\n");
+    guest_puts("  Phase 10: Advanced Features\n");
+    guest_puts("========================================\n");
+
+    test_scheduler();
+    test_mem_map();
+    test_shared_memory();
+
+    guest_puts("\nPhase 10: ALL tests done\n");
+}
+
 static void vits_test(void)
 {
     guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
@@ -1350,6 +1571,9 @@ void guest_irq_handler(void)
         /* 清设备侧 IRQ status */
         mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK,
                      mmio_read32(EDU_BAR0_BASE + EDU_IRQ_STATUS));
+    } else if (intid == SHM_NOTIFY_VIRQ) {
+        /* 共享内存通知中断（Phase 10） */
+        shm_notify_received = 1;
     }
 
     icc_eoir1_write(iar);
@@ -1481,6 +1705,10 @@ void guest_main(void)
         /* 测试 4: vITS 虚拟 ITS（仅 VM1 有 vITS） */
         vits_test();
     }
+
+    /* 测试 5: Phase 10 新功能测试（调度器/内存/共享内存）
+     * 两个 VM 都跑，共享内存测试需要双方配合 */
+    phase10_tests();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 

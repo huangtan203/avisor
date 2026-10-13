@@ -19,6 +19,8 @@
 #ifdef PLATFORM_VIRT
 #include "boards/virt/arch_timer.h"
 #include "boards/virt/pci.h"
+#include "boards/virt/virt_mm.h"
+#include "boards/virt/shmem.h"
 #endif
 
 const char *sync_error_reasons[] = {
@@ -133,6 +135,57 @@ void handle_hvc64(unsigned long hvc_nr)
 		/* PCI 直通中断链路诊断 dump（Phase 7 调试用） */
 		pci_debug_dump();
 		break;
+
+	/* Phase 10: 调度器 hypercall */
+	case HVC_SCHED_YIELD:
+		sched_yield();
+		regs->regs[0] = 0;
+		break;
+	case HVC_SCHED_GET_PRIO:
+		regs->regs[0] = current->priority;
+		break;
+	case HVC_SCHED_SET_PRIO: {
+		int prio = (int)(regs->regs[0] & 0xff);
+		regs->regs[0] = sched_set_priority(current, prio);
+		break;
+	}
+
+	/* Phase 10: 内存管理 hypercall */
+	case HVC_MEM_MAP: {
+		paddr_t ipa = (paddr_t)regs->regs[0];
+		uint64_t flags = regs->regs[1];
+		regs->regs[0] = hyp_mem_map(ipa, flags);
+		break;
+	}
+	case HVC_MEM_UNMAP: {
+		paddr_t ipa = (paddr_t)regs->regs[0];
+		regs->regs[0] = hyp_mem_unmap(ipa);
+		break;
+	}
+
+	/* Phase 10: 共享内存 hypercall */
+	case HVC_SHM_CREATE: {
+		uint32_t key = (uint32_t)regs->regs[0];
+		uint32_t size = (uint32_t)regs->regs[1];
+		regs->regs[0] = shm_create(key, size);
+		break;
+	}
+	case HVC_SHM_ATTACH: {
+		int shmid = (int)regs->regs[0];
+		paddr_t ipa = (paddr_t)regs->regs[1];
+		regs->regs[0] = shm_attach(shmid, ipa);
+		break;
+	}
+	case HVC_SHM_DETACH: {
+		int shmid = (int)regs->regs[0];
+		regs->regs[0] = shm_detach(shmid);
+		break;
+	}
+	case HVC_SHM_NOTIFY: {
+		int shmid = (int)regs->regs[0];
+		regs->regs[0] = shm_notify(shmid);
+		break;
+	}
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);

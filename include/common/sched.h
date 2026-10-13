@@ -22,6 +22,7 @@
 
 #define TASK_RUNNING 0
 #define TASK_ZOMBIE  1
+#define TASK_WAITING 2   /* 等待状态（如等待 I/O、等待共享内存消息） */
 
 /* task_struct::flags：镜像加载完成（Stage 2 页表就绪）
  * 共享页表的次级 vCPU 依赖此标志判断主 vCPU 是否加载完毕 */
@@ -260,6 +261,53 @@ extern void switch_to(struct task_struct *);
 extern void cpu_switch_to(struct task_struct *, struct task_struct *);
 extern void exit_task(void);
 extern void show_task_list(void);
+
+/* Phase 10: 优先级调度 + 时间片轮转 + sched_yield */
+
+/* 优先级定义（数字越大优先级越高） */
+#define SCHED_PRIO_LOW      1
+#define SCHED_PRIO_NORMAL   2
+#define SCHED_PRIO_HIGH     3
+#define SCHED_PRIO_MAX      3
+
+/* 各优先级对应的时间片（tick 数，假设 1 tick = 10ms）
+ * 高优先级 = 更长的时间片 + 更多的调度机会
+ */
+#define SCHED_TIMESLICE_LOW     1   /* 10ms */
+#define SCHED_TIMESLICE_NORMAL  2   /* 20ms */
+#define SCHED_TIMESLICE_HIGH    4   /* 40ms */
+
+/* 优先级到时间片的转换 */
+static inline int sched_prio_to_timeslice(int prio)
+{
+    if (prio >= SCHED_PRIO_HIGH) return SCHED_TIMESLICE_HIGH;
+    if (prio >= SCHED_PRIO_NORMAL) return SCHED_TIMESLICE_NORMAL;
+    return SCHED_TIMESLICE_LOW;
+}
+
+/*
+ * sched_yield: 主动让出 CPU（但仍在就绪队列中）
+ * 调用后当前任务时间片清零，触发调度。
+ */
+extern void sched_yield(void);
+
+/*
+ * sched_set_priority: 设置任务优先级（1~SCHED_PRIO_MAX）
+ * 返回 0 成功，-1 参数非法
+ */
+extern int sched_set_priority(struct task_struct *tsk, int prio);
+
+/*
+ * sched_wakeup: 唤醒一个处于 TASK_WAITING 状态的任务
+ * 注意：只能在目标任务所在的 CPU 上下文中调用（或关中断）
+ */
+extern void sched_wakeup(struct task_struct *tsk);
+
+/*
+ * sched_wait: 将当前任务设为等待状态并调度
+ * （需要其他任务/中断调用 sched_wakeup 来唤醒）
+ */
+extern void sched_wait(void);
 
 #define INIT_TASK                                                              \
 	{                                                                      \

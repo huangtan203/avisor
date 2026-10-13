@@ -46,6 +46,20 @@ typedef int bool;
 #define HVC_GET_VMID       3
 #define HVC_PCI_DEBUG      4
 
+/* Phase 10: 新增 hypercall */
+#define HVC_SCHED_YIELD     10
+#define HVC_SCHED_GET_PRIO  11
+#define HVC_SCHED_SET_PRIO  12
+#define HVC_MEM_MAP         20
+#define HVC_MEM_UNMAP       21
+#define HVC_SHM_CREATE      30
+#define HVC_SHM_ATTACH      31
+#define HVC_SHM_DETACH      32
+#define HVC_SHM_NOTIFY      33
+
+/* 共享内存 notify 使用的虚拟中断号 */
+#define SHM_NOTIFY_VIRQ     60
+
 /* ---- 内联汇编访问系统寄存器 ---- */
 
 static inline void write_sysreg(u64 val, const char *name)
@@ -93,6 +107,21 @@ static inline u64 hvc_call(u64 nr, u64 arg)
 	asm volatile("hvc #0"
 		     : "+r"(x0)
 		     : "r"(x8)
+		     : "memory");
+
+	return x0;
+}
+
+/* 两参数版本的 hvc_call（x0, x1） */
+static inline u64 hvc_call2(u64 nr, u64 arg0, u64 arg1)
+{
+	register u64 x0 __asm__("x0") = arg0;
+	register u64 x1 __asm__("x1") = arg1;
+	register u64 x8 __asm__("x8") = nr;
+
+	asm volatile("hvc #0"
+		     : "+r"(x0)
+		     : "r"(x1), "r"(x8)
 		     : "memory");
 
 	return x0;

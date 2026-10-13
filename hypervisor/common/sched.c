@@ -72,6 +72,10 @@ void _schedule(void)
 			int idx = (*rr_start + i) % NR_TASKS;
 			p = cpu_state[cpu].task[idx];
 
+			/*
+			 * Phase 10: 只考虑 RUNNING 状态的任务
+			 * （WAITING/ZOMBIE 不参与调度）
+			 */
 			if (p && p->state == TASK_RUNNING && p->counter > c) {
 				c = p->counter;
 				next = idx;
@@ -81,10 +85,17 @@ void _schedule(void)
 		if (c)
 			break;
 
+		/*
+		 * 所有 RUNNING 任务时间片都用完了，重新分配。
+		 * counter = (counter >> 1) + priority 的含义：
+		 *   - priority 越高，分到的基础时间片越多
+		 *   - 剩余时间 >> 1（衰减一半）让高优先级任务积累优势
+		 *   - 等价于"加权公平调度"的简化版
+		 */
 		for (int i = 0; i < NR_TASKS; i++) {
 			p = cpu_state[cpu].task[i];
 
-			if (p)
+			if (p && p->state == TASK_RUNNING)
 				p->counter = (p->counter >> 1) + p->priority;
 		}
 	}
@@ -99,6 +110,40 @@ void schedule(void)
 {
 	current->counter = 0;
 	_schedule();
+}
+
+/* Phase 10: 主动让出 CPU（时间片清零，重新调度） */
+void sched_yield(void)
+{
+    current->counter = 0;
+    _schedule();
+}
+
+/* Phase 10: 设置任务优先级 */
+int sched_set_priority(struct task_struct *tsk, int prio)
+{
+    if (!tsk || prio < 1 || prio > SCHED_PRIO_MAX)
+        return -1;
+    tsk->priority = prio;
+    return 0;
+}
+
+/* Phase 10: 将任务设为等待状态（让出 CPU） */
+void sched_wait(void)
+{
+    current->state = TASK_WAITING;
+    current->counter = 0;
+    _schedule();
+}
+
+/* Phase 10: 唤醒等待中的任务 */
+void sched_wakeup(struct task_struct *tsk)
+{
+    if (!tsk || tsk->state != TASK_WAITING)
+        return;
+    tsk->state = TASK_RUNNING;
+    /* 给新唤醒的任务一个完整时间片，立即参与调度 */
+    tsk->counter = sched_prio_to_timeslice(tsk->priority);
 }
 
 void set_cpu_virtual_interrupt(struct task_struct *tsk)
@@ -234,6 +279,7 @@ void vm_leaving_work()
 const char *task_state_str[] = {
 	"RUNNING",
 	"ZOMBIE",
+    "WAITING",
 };
 
 void show_task_list(void)

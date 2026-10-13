@@ -403,3 +403,123 @@ int ipa_to_pa(struct task_struct *vm, paddr_t ipa, paddr_t *pa)
 	*pa = (entry & PAGE_MASK) | (ipa & (PAGE_SIZE - 1));
 	return 0;
 }
+
+/*
+ * Phase 10: 动态内存映射 hypercall
+ *
+ * hyp_mem_map: 为当前 VM 在指定 IPA 上映射一个新物理页
+ *   ipa: 目标 IPA（4KB 对齐）
+ *   flags: 保留，当前固定为 Normal Memory + RW
+ * 返回 0 成功，-1 失败
+ */
+int hyp_mem_map(paddr_t ipa, uint64_t flags)
+{
+	paddr_t page;
+
+	(void)flags;  /* 暂时忽略，固定 Normal + RW */
+
+	/* 检查 IPA 是否已经映射（避免覆盖）
+	 * 用 ipa_to_pa 而不是 check_task_page_mapped，
+	 * 因为后者会创建中间表（有副作用）且检查粒度不准确。 */
+	paddr_t dummy_pa;
+	if (ipa_to_pa(current, ipa & PAGE_MASK, &dummy_pa) == 0) {
+		WARN("hyp_mem_map: ipa 0x%lx already mapped",
+		     (unsigned long)ipa);
+		return -1;
+	}
+
+	/* 分配物理页 */
+	page = get_free_page(get_page_pool());
+	if (page == 0) {
+		WARN("hyp_mem_map: out of memory");
+		return -1;
+	}
+
+	/* 清零新页面 */
+	memset((void *)TO_VADDR(page), 0, PAGE_SIZE);
+
+	/* 映射到 Stage-2 页表 */
+	map_stage2_page(current, ipa & PAGE_MASK, page,
+			MMU_STAGE2_PAGE_FLAGS);
+
+	INFO("hyp_mem_map: vm=%lu ipa=0x%lx pa=0x%lx",
+	     current->vmid, (unsigned long)(ipa & PAGE_MASK),
+	     (unsigned long)page);
+	return 0;
+}
+
+/*
+ * hyp_mem_unmap: 取消指定 IPA 的映射，释放物理页
+ *   ipa: 目标 IPA（4KB 对齐）
+ * 返回 0 成功，-1 失败
+ */
+int hyp_mem_unmap(paddr_t ipa)
+{
+	paddr_t pa;
+
+	/* 先找到物理页地址 */
+	if (ipa_to_pa(current, ipa & PAGE_MASK, &pa) < 0) {
+		WARN("hyp_mem_unmap: ipa 0x%lx not mapped",
+		     (unsigned long)ipa);
+		return -1;
+	}
+
+	pa &= PAGE_MASK;
+
+	/*
+	 * 清空 Stage-2 页表中的对应 entry。
+	 *
+	 * 简化实现：直接找到 Level 3 table，把对应 entry 清零。
+	 * 这里复用 ipa_to_pa 的查找逻辑拿到 Level 3 entry 指针。
+	 */
+	{
+		paddr_t lv1_table, lv2_table, lv3_table;
+		uint64_t entry;
+		uint64_t *l3_entry_p;
+
+		lv1_table = current->mm.first_table;
+		if (!lv1_table)
+			return -1;
+
+		/* Level 1 */
+		{
+			uint64_t idx = (ipa >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
+			entry = ((uint64_t *)TO_VADDR(lv1_table))[idx];
+		}
+		if ((entry & 0x3) != 3)
+			return -1;
+		lv2_table = entry & PAGE_MASK;
+
+		/* Level 2 */
+		{
+			uint64_t idx = (ipa >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
+			entry = ((uint64_t *)TO_VADDR(lv2_table))[idx];
+		}
+		if ((entry & 0x3) != 3)
+			return -1;
+		lv3_table = entry & PAGE_MASK;
+
+		/* Level 3 */
+		{
+			uint64_t idx = (ipa >> PAGE_SHIFT) & (PTRS_PER_TABLE - 1);
+			l3_entry_p = &((uint64_t *)TO_VADDR(lv3_table))[idx];
+		}
+
+		/* 清零 entry */
+		*l3_entry_p = 0;
+	}
+
+	/* 释放物理页 */
+	free_page(get_page_pool(), pa);
+
+	/* 失效 TLB（当前 VMID） */
+	asm volatile("tlbi vmalle1" ::: "memory");
+	asm volatile("dsb ish" ::: "memory");
+
+	current->mm.user_pages_count--;
+
+	INFO("hyp_mem_unmap: vm=%lu ipa=0x%lx pa=0x%lx",
+	     current->vmid, (unsigned long)(ipa & PAGE_MASK),
+	     (unsigned long)pa);
+	return 0;
+}

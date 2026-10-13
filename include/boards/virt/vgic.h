@@ -13,6 +13,7 @@
 
 #include "common/types.h"
 
+struct task_struct;
 struct vm_virt_state;
 
 /* 虚拟中断号 */
@@ -48,8 +49,22 @@ int vgic_inject_virq(uint32_t vintid);
 int vgic_is_virq_pending(uint32_t vintid);
 
 /*
+ * Phase 10: 向指定 VM 注入虚拟中断（不要求目标 VM 正在运行）
+ *   - 如果目标 VM 是 current：直接写 LR
+ *   - 否则：写入目标 VM 的 saved gic_lr[]，下次调度时自动生效
+ * 返回 0 成功，-1 没有空闲 LR
+ */
+int vgic_inject_virq_to_vm(struct task_struct *vm, uint32_t vintid);
+
+/*
  * vGIC 世界切换：保存/恢复所有 LR + VMCR
  * （在 switch_to 的 leaving_vm / entering_vm 中调用）
  */
 void vgic_save_state(struct vm_virt_state *state);
 void vgic_restore_state(struct vm_virt_state *state);
+
+/*
+ * Phase 10: 中断性能统计
+ */
+void irq_stats_record_lpi(uint64_t cycles);
+void irq_stats_dump(void);

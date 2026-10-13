@@ -207,3 +207,87 @@ void vgic_restore_state(struct vm_virt_state *state)
         write_lr(i, state->gic_lr[i]);
     asm volatile("isb");
 }
+
+/*
+ * Phase 10: 向指定 VM 注入虚拟中断（不要求目标 VM 正在运行）
+ *
+ * 两种情况：
+ *   1. 目标 VM == current：直接写硬件 LR（和 vgic_inject_virq 一样）
+ *   2. 目标 VM != current：写入 saved state 的 gic_lr[]，
+ *      下次调度到该 VM 时 vgic_restore_state 会自动加载到硬件 LR
+ *
+ * 返回 0 成功，-1 没有空闲 LR
+ */
+int vgic_inject_virq_to_vm(struct task_struct *vm, uint32_t vintid)
+{
+    if (!vm || vm->state == TASK_ZOMBIE)
+        return -1;
+
+    /* 如果目标 VM 就是当前运行的 VM，直接写硬件 LR */
+    if (vm == current && vm->pid != 0) {
+        return vgic_inject_virq(vintid);
+    }
+
+    /* 否则写入 saved state（下次调度恢复时生效） */
+    struct vm_virt_state *virt = &vm->virt;
+
+    for (int i = 1; i < NR_VGIC_LRS; i++) {
+        uint64_t lr = virt->gic_lr[i];
+        if ((lr & ICH_LR_STATE_MASK) == 0) {
+            /* 空闲：写入 pending 状态 */
+            virt->gic_lr[i] =
+                ((uint64_t)vintid & 0xffffffffULL)
+                | ICH_LR_GROUP1
+                | ICH_LR_PENDING;
+            return 0;
+        }
+        /* 已存在相同 pending 中断，不用重复注入 */
+        if (((uint32_t)(lr & 0xffffffffULL)) == vintid &&
+            (lr & ICH_LR_STATE_MASK) == ICH_LR_PENDING) {
+            return 0;
+        }
+    }
+
+    return -1;  /* 没有空闲 LR */
+}
+
+/*
+ * Phase 10: 中断性能统计
+ *
+ * 测量从中断触发（进入 EL2）到注入完成的 cycles 数，
+ * 用于评估中断虚拟化开销。
+ */
+struct irq_stats {
+    uint64_t lpi_count;       /* LPI 中断总数 */
+    uint64_t lpi_total_cycles; /* LPI 总处理 cycles */
+    uint64_t lpi_max_cycles;   /* LPI 最大单次 cycles */
+    uint64_t lpi_min_cycles;   /* LPI 最小单次 cycles */
+};
+
+static struct irq_stats irq_stat = {
+    .lpi_min_cycles = (uint64_t)-1,
+};
+
+void irq_stats_record_lpi(uint64_t cycles)
+{
+    irq_stat.lpi_count++;
+    irq_stat.lpi_total_cycles += cycles;
+    if (cycles > irq_stat.lpi_max_cycles)
+        irq_stat.lpi_max_cycles = cycles;
+    if (cycles < irq_stat.lpi_min_cycles)
+        irq_stat.lpi_min_cycles = cycles;
+}
+
+void irq_stats_dump(void)
+{
+    if (irq_stat.lpi_count == 0) {
+        printf("[irq-stats] no LPI interrupts yet\n");
+        return;
+    }
+    uint64_t avg = irq_stat.lpi_total_cycles / irq_stat.lpi_count;
+    printf("[irq-stats] LPI: count=%lu avg=%lu min=%lu max=%lu cycles\n",
+           (unsigned long)irq_stat.lpi_count,
+           (unsigned long)avg,
+           (unsigned long)irq_stat.lpi_min_cycles,
+           (unsigned long)irq_stat.lpi_max_cycles);
+}

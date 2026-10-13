@@ -73,6 +73,15 @@ int handle_mem_abort(vaddr_t addr, uint64_t esr);
  */
 int ipa_to_pa(struct task_struct *vm, paddr_t ipa, paddr_t *pa);
 
+/*
+ * Phase 10: 动态内存映射 hypercall
+ *   hyp_mem_map: 为当前 VM 在指定 IPA 上映射一个新物理页
+ *   hyp_mem_unmap: 取消指定 IPA 的映射，释放物理页
+ * 返回 0 成功，-1 失败
+ */
+int hyp_mem_map(paddr_t ipa, uint64_t flags);
+int hyp_mem_unmap(paddr_t ipa);
+
 extern paddr_t pg_dir;
 
 #endif /* __ASSEMBLER__ */

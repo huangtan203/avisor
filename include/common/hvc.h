@@ -23,3 +23,14 @@
 #define HVC_GET_TIMER_FREQ 2 /* 返回值 x0 = 定时器频率（Hz） */
 #define HVC_GET_VMID 3 /* 返回值 x0 = 当前 VM 的 ID（pid，Phase 3） */
 #define HVC_PCI_DEBUG 4 /* PCI 直通中断链路诊断 dump（Phase 7 调试用） */
+
+/* Phase 10: 新增 hypercall */
+#define HVC_SCHED_YIELD     10  /* 主动让出 CPU，返回 0 */
+#define HVC_SCHED_GET_PRIO  11  /* 获取当前任务优先级，返回 prio */
+#define HVC_SCHED_SET_PRIO  12  /* x0 = prio，设置优先级，返回 0/-1 */
+#define HVC_MEM_MAP         20  /* 映射内存页：x0=ipa x1=flags，返回 0/-1 */
+#define HVC_MEM_UNMAP       21  /* 取消映射：x0=ipa，返回 0/-1 */
+#define HVC_SHM_CREATE      30  /* 创建共享内存区：x0=key x1=size，返回 shmid/-1 */
+#define HVC_SHM_ATTACH      31  /* 附加共享内存：x0=shmid x1=ipa，返回 0/-1 */
+#define HVC_SHM_DETACH      32  /* 分离共享内存：x0=shmid，返回 0/-1 */
+#define HVC_SHM_NOTIFY      33  /* 通知对端：x0=shmid，返回 0/-1 */

@@ -54,6 +54,7 @@
 #include "boards/virt/pci.h"
 #include "boards/virt/its.h"
 #include "boards/virt/vits.h"
+#include "boards/virt/shmem.h"
 
 /*
  * main_virt.c 中创建的任务都在 CPU0 上，用 cpu0_task 快速访问。
@@ -150,6 +151,10 @@ void hypervisor_main()
     /* 4.3 初始化 vITS 全局状态（物理 ITS 就绪后、PCI 初始化前） */
     vits_global_init();
     printf("[4.3] vITS global initialized (virtual MSI controller)\n");
+
+    /* 4.4 初始化跨 VM 共享内存子系统 */
+    shmem_init();
+    printf("[4.4] shared memory initialized (cross-VM shm)\n");
 
     /* 4.5 初始化 PCI 直通（必须在创建 VM 之前，使 virt_initialize
      * 调用 pci_passthrough_map 时 edu 已枚举完成） */
