@@ -1545,6 +1545,147 @@ static void phase11_smp_test(void)
     guest_puts("\nPhase 11: ALL tests done\n");
 }
 
+/* ---------- Phase 12: vSGI（虚拟 SGI）测试 ---------- */
+
+static void phase12_vsgi_test(void)
+{
+    guest_puts("\n========================================\n");
+    guest_puts("  Phase 12: Virtual SGI (vSGI)\n");
+    guest_puts("========================================\n");
+
+    volatile u64 *vsgi_received = (volatile u64 *)(SMP_TEST_ADDR + VSGI_RECEIVED_OFF);
+    volatile u64 *vsgi_count = (volatile u64 *)(SMP_TEST_ADDR + VSGI_COUNT_OFF);
+    volatile u64 *done_flag = (volatile u64 *)(SMP_TEST_ADDR + SMP_DONE_FLAG_OFF);
+
+    int my_cpuid = vsgi_get_cpuid();
+
+    /* 主核（vcpu0）负责发起测试 */
+    if (my_cpuid == 0) {
+        /* 初始化 vSGI 测试变量 */
+        *vsgi_received = 0;
+        *vsgi_count = 0;
+        *done_flag = 0;
+        asm volatile("dmb ish" ::: "memory");
+
+        guest_puts("\n--- Test 1: Master -> Secondary vSGI ---\n");
+        guest_puts("vsgi: master (vcpu0) sending SGI#5 to vcpu1...\n");
+
+        /* 发 SGI 给次核 */
+        int ret = vsgi_send(1, VSGI_TEST_SGI_ID);
+        if (ret != 0) {
+            guest_puts("vsgi: FAILED (send returned ");
+            puts_dec(ret);
+            guest_puts(")\n");
+            return;
+        }
+
+        /* 等待次核收到中断并置 done_flag */
+        guest_puts("vsgi: master waiting for secondary to receive SGI...\n");
+        int timeout = 50000;
+        while (*done_flag != 3) {   /* done_flag == 3 表示次核收到 vSGI */
+            hvc_call(HVC_SCHED_YIELD, 0);
+            if (--timeout <= 0) break;
+        }
+
+        if (*done_flag != 3) {
+            guest_puts("vsgi: FAILED (secondary vSGI timeout, count=");
+            puts_dec(*vsgi_count);
+            guest_puts(")\n");
+            return;
+        }
+
+        /* 验证 */
+        guest_puts("vsgi: secondary received SGI count = ");
+        puts_dec(*vsgi_count);
+        guest_puts("\n");
+
+        if (*vsgi_count == 1 && (*vsgi_received & (1ULL << VSGI_TEST_SGI_ID))) {
+            guest_puts("vsgi: PASSED (master->secondary vSGI correct)\n");
+        } else {
+            guest_puts("vsgi: FAILED (wrong count or sgi id, received_bitmap=0x");
+            puts_hex((u32)*vsgi_received, 4);
+            guest_puts(")\n");
+            return;
+        }
+
+        /* Test 2: 多次发送 */
+        guest_puts("\n--- Test 2: Multiple vSGI sends ---\n");
+        *vsgi_count = 0;
+        *vsgi_received = 0;
+        *done_flag = 0;
+        asm volatile("dmb ish" ::: "memory");
+
+        /* 发 5 次 SGI */
+        for (int i = 0; i < 5; i++) {
+            ret = vsgi_send(1, VSGI_TEST_SGI_ID);
+            if (ret != 0) {
+                guest_puts("vsgi: FAILED (send #");
+                puts_dec(i);
+                guest_puts(" failed)\n");
+                return;
+            }
+            /* 短暂让出，让次核有机会处理 */
+            hvc_call(HVC_SCHED_YIELD, 0);
+        }
+
+        /* 等次核处理完所有 5 次 */
+        guest_puts("vsgi: sent 5 SGIs, waiting for secondary...\n");
+        timeout = 50000;
+        while (*done_flag != 4) {   /* done_flag == 4 表示次核收到 5 次 */
+            hvc_call(HVC_SCHED_YIELD, 0);
+            if (--timeout <= 0) break;
+        }
+
+        guest_puts("vsgi: secondary received count = ");
+        puts_dec(*vsgi_count);
+        guest_puts(" (expected >= 5)\n");
+
+        if (*vsgi_count >= 5) {
+            guest_puts("vsgi: PASSED (multiple vSGI correct)\n");
+        } else {
+            guest_puts("vsgi: FAILED (insufficient count)\n");
+            return;
+        }
+
+        guest_puts("\nPhase 12: ALL tests done\n");
+    } else {
+        /* 次核：等待主核发 SGI，收到后置 done_flag */
+        guest_puts("vsgi: secondary (vcpu");
+        puts_dec(my_cpuid);
+        guest_puts(") waiting for SGI from master...\n");
+
+        /* 第一次：等 1 个 SGI */
+        int timeout = 100000;
+        while (*vsgi_count < 1) {
+            hvc_call(HVC_SCHED_YIELD, 0);
+            if (--timeout <= 0) break;
+        }
+
+        if (*vsgi_count >= 1) {
+            guest_puts("vsgi: secondary received SGI! count=");
+            puts_dec(*vsgi_count);
+            guest_puts("\n");
+            *done_flag = 3;   /* 告诉主核：第一次收到了 */
+            asm volatile("dmb ish" ::: "memory");
+        }
+
+        /* 第二次：等累计 5 个 SGI */
+        timeout = 100000;
+        while (*vsgi_count < 5) {
+            hvc_call(HVC_SCHED_YIELD, 0);
+            if (--timeout <= 0) break;
+        }
+
+        if (*vsgi_count >= 5) {
+            guest_puts("vsgi: secondary received all 5 SGIs! total=");
+            puts_dec(*vsgi_count);
+            guest_puts("\n");
+            *done_flag = 4;   /* 告诉主核：5 次都收到了 */
+            asm volatile("dmb ish" ::: "memory");
+        }
+    }
+}
+
 static void vits_test(void)
 {
     guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
@@ -1696,6 +1837,14 @@ void guest_irq_handler(void)
     } else if (intid == SHM_NOTIFY_VIRQ) {
         /* 共享内存通知中断（Phase 10） */
         shm_notify_received = 1;
+    } else if (intid < 16) {
+        /* Phase 12: SGI（软件生成中断，vSGI 测试用）
+         * SGI INTID 范围 0-15。
+         * 用共享内存记录收到的 SGI 号和次数。 */
+        volatile u64 *vsgi_received = (volatile u64 *)(SMP_TEST_ADDR + VSGI_RECEIVED_OFF);
+        volatile u64 *vsgi_count = (volatile u64 *)(SMP_TEST_ADDR + VSGI_COUNT_OFF);
+        *vsgi_received |= (1ULL << intid);
+        (*vsgi_count)++;
     }
 
     icc_eoir1_write(iar);
@@ -1865,6 +2014,12 @@ void guest_main(void)
      * 两个 vCPU 都会进入，内部用标志位区分主/次角色 */
     phase11_smp_test();
 
+    /* 测试 7: Phase 12 vSGI（虚拟 SGI）测试
+     * 需要次 vCPU 配合。仅 VM1（vmid=1）有双 vCPU。
+     * 两个 vCPU 都会进入，内部用 cpuid 区分主/次角色 */
+    if (vmid == 1)
+        phase12_vsgi_test();
+
     guest_puts("\nguest: all tests done, entering main loop\n");
 
     while (1) {
@@ -1983,6 +2138,13 @@ void guest_secondary_main(void)
     guest_puts("[vcpu");
     puts_dec(cpu_id);
     guest_puts("] guest: SMP test done\n");
+
+    /* Phase 12: vSGI 测试（次核侧）
+     * 仅 VM1（vmid == 1）有次 vCPU。
+     * phase12_vsgi_test 内部会根据 cpuid 自动判断主/次角色。 */
+    if (vmid == 1) {
+        phase12_vsgi_test();
+    }
 
     guest_puts("[vcpu");
     puts_dec(cpu_id);

@@ -34,3 +34,7 @@
 #define HVC_SHM_ATTACH      31  /* 附加共享内存：x0=shmid x1=ipa，返回 0/-1 */
 #define HVC_SHM_DETACH      32  /* 分离共享内存：x0=shmid，返回 0/-1 */
 #define HVC_SHM_NOTIFY      33  /* 通知对端：x0=shmid，返回 0/-1 */
+
+/* Phase 12: 虚拟 SGI（vSGI）hypercall */
+#define HVC_VSGI_SEND       40  /* 发送虚拟 SGI：x0=target_vcpu_id x1=sgi_id，返回 0/-1 */
+#define HVC_VSGI_GET_CPUID  41  /* 获取当前 vCPU ID，返回 vcpu_id */

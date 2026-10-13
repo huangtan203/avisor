@@ -31,3 +31,16 @@ void virt_attach_secondary(struct task_struct *tsk, struct task_struct *master);
 
 /* 更新 VM 的 ivshmem peer_id（vmid 修正后调用） */
 void virt_board_set_ivshmem_peer(struct task_struct *tsk, int peer_id);
+
+/* Phase 12: 虚拟 SGI（vSGI）支持 */
+#define MAX_VMS_PER_BOARD     4   /* 板级最多支持的 VM 数 */
+#define MAX_VCPUS_PER_VM      4   /* 每个 VM 最多支持的 vCPU 数 */
+
+/* 注册 vCPU 到板级查找表（创建 vCPU 时调用） */
+void virt_register_vcpu(struct task_struct *tsk, int vmid, int vcpu_id);
+
+/* 根据 vmid + vcpu_id 查找 vCPU（返回 NULL 表示不存在） */
+struct task_struct *virt_find_vcpu(int vmid, int vcpu_id);
+
+/* 向同 VM 的指定 vCPU 注入虚拟中断 */
+int virt_inject_virq_to_vcpu(int vmid, int vcpu_id, uint32_t vintid);

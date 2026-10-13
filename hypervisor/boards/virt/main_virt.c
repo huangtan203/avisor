@@ -71,10 +71,14 @@ extern char el1_test_end[];
 volatile int smp_boot_flag = 0;
 
 /*
- * PSCI CPU_ON 函数（通过 SMC #0 调用，由 EL3 固件/QEMU 处理）
+ * PSCI CPU_ON 函数（通过 HVC #0 调用，由 QEMU 模拟的 PSCI 处理）
  *
  * 返回 0 = 成功，其他 = 错误码
- * 注意：必须使用 -machine secure=on，否则没有 EL3 来处理 SMC。
+ *
+ * 注意：
+ *   QEMU virt 平台默认（不加 secure=on）时最高 EL 是 EL2，
+ *   PSCI 是通过 HVC 调用的（不是 SMC）。
+ *   只有在 secure=on 时，EL3 固件才会通过 SMC 处理 PSCI。
  */
 #define PSCI_CPU_ON_64        0xC4000003
 
@@ -87,7 +91,7 @@ static int psci_cpu_on(unsigned long mpidr, unsigned long entry_point,
     register unsigned long x3 asm("x3") = context_id;
 
     asm volatile(
-        "smc #0\n"
+        "hvc #0\n"
         : "+r"(x0)
         : "r"(x1), "r"(x2), "r"(x3)
         : "memory");
@@ -225,6 +229,8 @@ void hypervisor_main()
             (void)strncpy(cpu0_tasks[pid]->name, "vm1-cpu0", 36);
             vm1_master = cpu0_tasks[pid];
             printf("[8.1] VM1 vcpu0 created (vmid=1, cpu0, pid=%d)\n", pid);
+            /* Phase 12: 注册 vCPU 到板级查找表（用于 vSGI 等跨 vCPU 操作） */
+            virt_register_vcpu(cpu0_tasks[pid], 1, 0);
         }
 
         /* VM1 次 vCPU：创建在 CPU0（同核 vCPU 调度，验证分时复用） */
@@ -247,6 +253,8 @@ void hypervisor_main()
             cpu0_tasks[pid]->counter = 10;
             (void)strncpy(cpu0_tasks[pid]->name, "vm1-cpu1", 36);
             printf("[8.2] VM1 vcpu1 created (vmid=1, cpu0, pid=%d)\n", pid);
+            /* Phase 12: 注册 vCPU 到板级查找表 */
+            virt_register_vcpu(cpu0_tasks[pid], 1, 1);
         }
 
         /* VM2 主 vCPU：创建在 CPU0，vmid=2, vcpu0 */
@@ -268,6 +276,9 @@ void hypervisor_main()
              * ivshmem（peer_id = vmid_initial - 1），但我们
              * 已经把 vmid 改成了 2，所以 peer_id 应该是 1。 */
             virt_board_set_ivshmem_peer(vm2_master, 1);
+
+            /* Phase 12: 注册 vCPU 到板级查找表 */
+            virt_register_vcpu(vm2_master, 2, 0);
 
             printf("[8.3] VM2 vcpu0 created (vmid=2, cpu0, pid=%d)\n", pid);
         }

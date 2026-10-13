@@ -572,6 +572,48 @@ static void virt_entering_vm(struct task_struct *tsk)
 	}
 }
 
+/*
+ * Phase 12: vCPU 查找表
+ *
+ * 支持根据 (vmid, vcpu_id) 快速定位到目标 vCPU 的 task_struct。
+ * 用于 vSGI（虚拟 SGI）等跨 vCPU 操作。
+ *
+ * 注意：vmid 从 1 开始（0 是 hypervisor idle），所以数组下标 = vmid - 1。
+ */
+static struct task_struct *vm_vcpus[MAX_VMS_PER_BOARD][MAX_VCPUS_PER_VM];
+
+void virt_register_vcpu(struct task_struct *tsk, int vmid, int vcpu_id)
+{
+    if (vmid < 1 || vmid > MAX_VMS_PER_BOARD ||
+        vcpu_id < 0 || vcpu_id >= MAX_VCPUS_PER_VM)
+        return;
+
+    vm_vcpus[vmid - 1][vcpu_id] = tsk;
+}
+
+struct task_struct *virt_find_vcpu(int vmid, int vcpu_id)
+{
+    if (vmid < 1 || vmid > MAX_VMS_PER_BOARD ||
+        vcpu_id < 0 || vcpu_id >= MAX_VCPUS_PER_VM)
+        return NULL;
+
+    return vm_vcpus[vmid - 1][vcpu_id];
+}
+
+/*
+ * 向指定 VM 的指定 vCPU 注入虚拟中断
+ *
+ * 返回 0 成功，-1 失败（找不到 vCPU 或 LR 已满）
+ */
+int virt_inject_virq_to_vcpu(int vmid, int vcpu_id, uint32_t vintid)
+{
+    struct task_struct *target = virt_find_vcpu(vmid, vcpu_id);
+    if (!target)
+        return -1;
+
+    return vgic_inject_virq_to_vm(target, vintid);
+}
+
 /* ---------- board ops ---------- */
 
 const struct board_ops virt_board_ops = {

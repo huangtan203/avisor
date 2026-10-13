@@ -57,6 +57,10 @@ typedef int bool;
 #define HVC_SHM_DETACH      32
 #define HVC_SHM_NOTIFY      33
 
+/* Phase 12: 虚拟 SGI（vSGI）hypercall */
+#define HVC_VSGI_SEND       40  /* x0=target_vcpu_id x1=sgi_id，返回 0/-1 */
+#define HVC_VSGI_GET_CPUID  41  /* 返回当前 vCPU ID */
+
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60
 
@@ -130,6 +134,17 @@ static inline u64 hvc_call2(u64 nr, u64 arg0, u64 arg1)
 static inline void hvc_putc(char c)
 {
 	hvc_call(HVC_CONSOLE_PUTC, (u64)c);
+}
+
+/* Phase 12: vSGI 辅助函数（依赖 hvc_call，放在后面） */
+static inline int vsgi_send(int target_vcpu, int sgi_id)
+{
+    return (int)hvc_call2(HVC_VSGI_SEND, (u64)target_vcpu, (u64)sgi_id);
+}
+
+static inline int vsgi_get_cpuid(void)
+{
+    return (int)hvc_call(HVC_VSGI_GET_CPUID, 0);
 }
 
 void guest_puts(const char *s);
@@ -211,3 +226,15 @@ static inline void spin_unlock(spinlock_t *lock)
 #define SMP_COUNTER_OFF      0x10
 #define SMP_LOCK_OFF         0x18
 #define SMP_ITERATIONS       10000     /* 每核累加次数 */
+
+/* ---- Phase 12: vSGI 测试共享内存布局 ----
+ *
+ * 继续使用 0x40300000 页面（和 SMP 测试复用）：
+ *   offset 0x20: vsgi_received (u64)   vSGI 收到标志 bitmap
+ *   offset 0x28: vsgi_count    (u64)   vSGI 收到次数
+ *   offset 0x30: vsgi_sender   (u64)   上次发送者 vcpu_id（预留）
+ */
+#define VSGI_RECEIVED_OFF   0x20
+#define VSGI_COUNT_OFF      0x28
+#define VSGI_SENDER_OFF     0x30
+#define VSGI_TEST_SGI_ID    5     /* 用 SGI#5 做测试 */

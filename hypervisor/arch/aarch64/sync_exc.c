@@ -186,6 +186,23 @@ void handle_hvc64(unsigned long hvc_nr)
 		regs->regs[0] = shm_notify(shmid);
 		break;
 	}
+
+	/* Phase 12: 虚拟 SGI（vSGI）hypercall */
+	case HVC_VSGI_SEND: {
+		int target_vcpu = (int)(regs->regs[0] & 0xff);
+		uint32_t sgi_id = (uint32_t)(regs->regs[1] & 0xf);
+		/* SGI 的 INTID 范围是 0-15（SGI0-SGI15） */
+		if (sgi_id > 15) {
+			regs->regs[0] = -1;
+			break;
+		}
+		regs->regs[0] = virt_inject_virq_to_vcpu(
+			(int)current->vmid, target_vcpu, sgi_id);
+		break;
+	}
+	case HVC_VSGI_GET_CPUID:
+		regs->regs[0] = current->vcpu_id;
+		break;
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);
