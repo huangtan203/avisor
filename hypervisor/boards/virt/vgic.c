@@ -54,8 +54,11 @@ void vgic_init(void)
 
     /*
      * 2. 使能虚拟 CPU 接口（ICH_HCR_EL2.En）
+     *    Phase 17 额外置 TC：使 Guest 写 ICC_SGI1R_EL1 时 trap 到 EL2，
+     *    由 handle_trap_system() 翻译成 vSGI 注入（trap-and-emulate）。
+     *    TC 只影响 EL1 的 SGI 寄存器访问，EL2 自身发物理 SGI 不受影响。
      */
-    WRITE_SYSREG64(ICH_HCR_EL2_EN, ICH_HCR_EL2);
+    WRITE_SYSREG64(ICH_HCR_EL2_EN | ICH_HCR_EL2_TC, ICH_HCR_EL2);
     asm volatile("isb");
 
     /*
@@ -520,6 +523,60 @@ void vgic_ipi_update_handle(void)
             /* 目标未运行：写 saved state，下次调度恢复时生效 */
             vgic_inject_saved(&vm->virt, vintid);
         }
+    }
+}
+
+/*
+ * Phase 17: 处理 Guest 写 ICC_SGI1R_EL1 的 trap（虚拟 SGI trap-and-emulate）
+ *
+ * 背景：GICv3 里 Guest 用 ICC_SGI1R_EL1 发 SGI。若 ICH_HCR_EL2.TC=1，
+ * 该写会 trap 到 EL2（EC=0x18），由 handle_trap_system() 解析 ESR 后
+ * 调用本函数。本函数把标准的 ICC_SGI1R_EL1 写翻译成 vSGI 注入，
+ * 从而让 Guest 的 GICv3 SGI 发送代码无需 HVC 半虚拟化即可工作。
+ *
+ * ICC_SGI1R_EL1 编码（GICv3 亲和路由 ARE_NS=1，与 gic_send_sgi 一致）：
+ *   [55:48]  Aff3
+ *   [40]     IRM   1=广播给除自身外的所有 PE
+ *   [39:32]  Aff2
+ *   [27:24]  INTID SGI 号 (0-15)
+ *   [23:16]  Aff1
+ *   [15:0]   TargetList  bit n 对应 aff0=n 的 PE
+ *
+ * 本项目单 cluster（所有 vCPU 的 Aff1/Aff2/Aff3 均为 0），仅 Aff0 区分
+ * vCPU，因此：
+ *   - 若 Aff1/Aff2/Aff3 非 0，目标不在本 VM，直接忽略；
+ *   - 否则把 TargetList 位图翻译成 vcpu_id（=Aff0），逐位注入。
+ */
+void handle_vgic_sgi1r(uint64_t val)
+{
+    uint32_t sgi_id = (uint32_t)((val >> 24) & 0xF);   /* INTID [27:24] */
+    int irm        = (int)((val >> 40) & 1);           /* IRM [40] */
+    uint32_t aff1  = (uint32_t)((val >> 16) & 0xFF);   /* Aff1 [23:16] */
+    uint32_t aff2  = (uint32_t)((val >> 32) & 0xFF);   /* Aff2 [39:32] */
+    uint32_t aff3  = (uint32_t)((val >> 48) & 0xFF);   /* Aff3 [55:48] */
+    uint32_t target_list = (uint32_t)(val & 0xFFFF);   /* TargetList [15:0] */
+
+    int vmid = (int)current->vmid;
+    int self_vcpu = (int)current->vcpu_id;
+
+    /* 单 cluster 简化：目标亲和必须是 0 才算本 VM 的 vCPU */
+    if (aff1 || aff2 || aff3)
+        return;
+
+    if (irm) {
+        /* 广播：给本 VM 所有 vCPU，排除自身 */
+        for (int v = 0; v < MAX_VCPUS_PER_VM; v++) {
+            if (v == self_vcpu)
+                continue;
+            virt_inject_virq_to_vcpu(vmid, v, sgi_id);
+        }
+        return;
+    }
+
+    /* 定向：遍历 TargetList 位图，bit n -> vcpu_id = n (Aff0) */
+    for (int v = 0; v < 16; v++) {
+        if (target_list & (1u << v))
+            virt_inject_virq_to_vcpu(vmid, v, sgi_id);
     }
 }
 

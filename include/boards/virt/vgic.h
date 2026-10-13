@@ -73,6 +73,16 @@ uint32_t vgicr_read(struct vgic_rdist *r, uint32_t offset);
 void vgicr_write(struct vgic_rdist *r, uint32_t offset, uint32_t val);
 
 /*
+ * Phase 17: 处理 Guest 写 ICC_SGI1R_EL1 的 trap（虚拟 SGI trap-and-emulate）
+ *
+ * 当 ICH_HCR_EL2.TC=1 时，Guest 写 ICC_SGI1R_EL1 会 trap 到 EL2，
+ * 由 handle_trap_system() 解析 ESR 后调用本函数。val 是 Guest 写入
+ * ICC_SGI1R_EL1 的原始值（标准 GICv3 编码），本函数解析出 SGI 号与
+ * 目标 vCPU 亲和，翻译成 vSGI 注入（替代 HVC_VSGI_SEND 半虚拟化）。
+ */
+void handle_vgic_sgi1r(uint64_t val);
+
+/*
  * 向当前 Guest 注入一个 HW 映射的虚拟中断（PCI INTx 直通用，固定 LR2）
  *
  * 与 vgic_inject_virq_hw 语义一致：ICH_LR_HW=1，pINTID 放 bits[41:32]。

@@ -262,6 +262,17 @@ void handle_trap_system(unsigned long esr)
 	//	op0, op2, op1, crn, rt, crm, dir);
 
 	if ((op0 & 2) && dir == 0) {
+#ifdef PLATFORM_VIRT
+		/*
+		 * Phase 17: 虚拟 SGI trap-and-emulate。
+		 * ICH_HCR_EL2.TC=1 使 Guest 写 ICC_SGI1R_EL1（S3_0_C12_C11_5）
+		 * trap 到这里，解析写入值并翻译成 vSGI 注入。
+		 */
+		if (op0 == 3 && op1 == 0 && crn == 12 && crm == 11 && op2 == 5) {
+			handle_vgic_sgi1r(regs->regs[rt]);
+			goto sys_fin;
+		}
+#endif
 		DEFINE_SYSREG_MSR(actlr_el1, 0, 1, 0, 1);
 		DEFINE_SYSREG_MSR(csselr_el1, 1, 0, 0, 0);
 	} else if ((op0 & 2) && dir == 1) {

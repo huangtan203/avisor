@@ -102,6 +102,8 @@ static inline void write_sysreg(u64 val, const char *name)
 #define icc_igrpen1_write(v) SYSREG_WRITE(S3_0_C12_C12_7, v)
 #define icc_iar1_read()     SYSREG_READ(S3_0_C12_C12_0)
 #define icc_eoir1_write(v)  SYSREG_WRITE(S3_0_C12_C12_1, v)
+/* Phase 17: 标准 SGI 发送（写 ICC_SGI1R_EL1，触发 Hypervisor trap-and-emulate） */
+#define icc_sgi1r_write(v)  SYSREG_WRITE(S3_0_C12_C11_5, v)
 
 /* 虚拟定时器寄存器（直通，不 trap） */
 #define cntvct_read()       SYSREG_READ(CNTVCT_EL0)
@@ -251,3 +253,6 @@ static inline void spin_unlock(spinlock_t *lock)
 #define VSGI_COUNT_OFF      0x28
 #define VSGI_SENDER_OFF     0x30
 #define VSGI_TEST_SGI_ID    5     /* 用 SGI#5 做测试 */
+
+/* Phase 17: 虚拟 SGI trap-and-emulate 测试用 SGI 号（区别于 Phase 12 的 #5） */
+#define VSGI_TRAP_TEST_SGI_ID 6

@@ -121,6 +121,7 @@
 
 /* ICH_HCR_EL2 位 */
 #define ICH_HCR_EL2_EN (1 << 0) /* 使能虚拟 CPU 接口 */
+#define ICH_HCR_EL2_TC (1UL << 10) /* Trap Control：使 EL1 访问 ICC_SGI*R_EL1 trap 到 EL2 */
 
 /* ICH_VMCR_EL2 位（Guest 视角 ICC_* 的后端，与 QEMU 编码一致） */
 #define ICH_VMCR_VENG1 (1UL << 1)  /* ICC_IGRPEN1_EL1.EnableGrp1 */

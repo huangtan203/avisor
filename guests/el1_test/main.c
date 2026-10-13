@@ -1930,6 +1930,109 @@ static void phase12_vsgi_test(void)
     }
 }
 
+/* ---------- Phase 17: 虚拟 SGI trap-and-emulate 测试 ---------- */
+
+/*
+ * 验证 Hypervisor 捕获 Guest 写 ICC_SGI1R_EL1 并翻译成 vSGI 注入。
+ * 与 Phase 12 的区别：这里用标准 GICv3 系统寄存器发送 SGI（触发 trap），
+ * 而非 HVC_VSGI_SEND 半虚拟化。
+ */
+static void phase17_vsgi_trap_test(void)
+{
+    guest_puts("\n========================================\n");
+    guest_puts("  Phase 17: Virtual SGI trap-and-emulate\n");
+    guest_puts("========================================\n");
+
+    volatile u64 *vsgi_received = (volatile u64 *)(SMP_TEST_ADDR + VSGI_RECEIVED_OFF);
+    volatile u64 *vsgi_count = (volatile u64 *)(SMP_TEST_ADDR + VSGI_COUNT_OFF);
+    volatile u64 *done_flag = (volatile u64 *)(SMP_TEST_ADDR + SMP_DONE_FLAG_OFF);
+
+    int my_cpuid = vsgi_get_cpuid();
+
+    if (my_cpuid == 0) {
+        *vsgi_received = 0;
+        *vsgi_count = 0;
+        *done_flag = 0;
+        asm volatile("dmb ish" ::: "memory");
+
+        guest_puts("vsgi-trap: master (vcpu0) writing ICC_SGI1R_EL1 -> SGI#");
+        puts_dec(VSGI_TRAP_TEST_SGI_ID);
+        guest_puts(" to vcpu1...\n");
+
+        /* 标准 GICv3 SGI 编码：INTID [27:24]，TargetList [15:0]（bit1=vcpu1） */
+        u64 sgi_val = ((u64)(VSGI_TRAP_TEST_SGI_ID & 0xF) << 24)
+                    | (1ULL << 1);
+        icc_sgi1r_write(sgi_val);
+
+        guest_puts("vsgi-trap: master waiting for secondary...\n");
+        int timeout = 50000;
+        while (*done_flag != 5) {   /* done_flag == 5 表示次核收到 trap SGI */
+            hvc_call(HVC_SCHED_YIELD, 0);
+            if (--timeout <= 0) break;
+        }
+
+        if (*done_flag != 5) {
+            guest_puts("vsgi-trap: FAILED (secondary timeout, count=");
+            puts_dec(*vsgi_count);
+            guest_puts(")\n");
+            return;
+        }
+
+        guest_puts("vsgi-trap: secondary received count = ");
+        puts_dec(*vsgi_count);
+        guest_puts("\n");
+
+        if (*vsgi_count == 1 &&
+            (*vsgi_received & (1ULL << VSGI_TRAP_TEST_SGI_ID))) {
+            guest_puts("vsgi-trap: PASSED (ICC_SGI1R_EL1 trap-and-emulate delivered SGI#");
+            puts_dec(VSGI_TRAP_TEST_SGI_ID);
+            guest_puts(")\n");
+        } else {
+            guest_puts("vsgi-trap: FAILED (count=");
+            puts_dec(*vsgi_count);
+            guest_puts(", bitmap=0x");
+            puts_hex((u32)*vsgi_received, 4);
+            guest_puts(")\n");
+            return;
+        }
+
+        guest_puts("\nPhase 17: ALL tests done\n");
+    } else {
+        guest_puts("vsgi-trap: secondary (vcpu");
+        puts_dec(my_cpuid);
+        guest_puts(") waiting for SGI#");
+        puts_dec(VSGI_TRAP_TEST_SGI_ID);
+        guest_puts("...\n");
+
+        /*
+         * 两阶段握手，避免 Phase 12 遗留的 vsgi_count 值干扰：
+         *   1) 先等主核进入 Phase 17 并清零共享变量（done_flag==0）；
+         *   2) 再等 SGI 到达（vsgi_count 递增）。
+         * 主核清零 done_flag 前已先清零 vsgi_count，故看到 done_flag==0
+         * 时 vsgi_count 一定是干净值。
+         */
+        int timeout = 100000;
+        while (*done_flag != 0) {
+            hvc_call(HVC_SCHED_YIELD, 0);
+            if (--timeout <= 0) break;
+        }
+
+        timeout = 100000;
+        while (*vsgi_count < 1) {
+            hvc_call(HVC_SCHED_YIELD, 0);
+            if (--timeout <= 0) break;
+        }
+
+        if (*vsgi_count >= 1) {
+            guest_puts("vsgi-trap: secondary received SGI! count=");
+            puts_dec(*vsgi_count);
+            guest_puts("\n");
+            *done_flag = 5;   /* 告诉主核：收到了 */
+            asm volatile("dmb ish" ::: "memory");
+        }
+    }
+}
+
 static void vits_test(void)
 {
     guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
@@ -2294,6 +2397,10 @@ void guest_main(void)
     /* 测试 9: Phase 16 虚拟 GICR 模拟（trap-and-emulate） */
     phase16_gicr_test();
 
+    /* 测试 10: Phase 17 虚拟 SGI trap-and-emulate（捕获 ICC_SGI1R_EL1 写）
+     * 需要次 vCPU 配合。phase17_vsgi_trap_test 内部按 cpuid 区分主/次。 */
+    phase17_vsgi_trap_test();
+
     guest_puts("\nguest: all tests done, entering main loop\n");
 
     while (1) {
@@ -2430,6 +2537,11 @@ void guest_secondary_main(void)
      * Phase 14 起两个 VM 都有次 vCPU。
      * phase12_vsgi_test 内部会根据 cpuid 自动判断主/次角色。 */
     phase12_vsgi_test();
+
+    /* Phase 17: 虚拟 SGI trap-and-emulate 测试（次核侧）
+     * 内部根据 cpuid 区分主/次；次核在此等待主核通过 ICC_SGI1R_EL1
+     * 发送的 SGI。 */
+    phase17_vsgi_trap_test();
 
     guest_puts("[vcpu");
     puts_dec(cpu_id);
