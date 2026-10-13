@@ -35,6 +35,22 @@ struct vgic_dist {
     uint32_t spi_enable[32];   /* GICD_ISENABLERn：INTID 0..1023 使能位图 */
 };
 
+/*
+ * Phase 16: 虚拟 GIC Redistributor (GICR) 状态
+ *
+ * GICv3 每个 PE 有一个 Redistributor，管理 SGI/PPI 私有中断，与 GICD
+ * （SPI 全局中断）对称。这里保存 SGI+PPI 使能位图，用于在注入虚拟 PPI
+ * 时做 enable 门控。
+ *
+ * 简化：per-VM 一份（真实硬件是 per-PE 一份）。本项目只有 vtimer 一个
+ * 真实 PPI，它走 HW 直通（vgic_inject_virq_hw），不经过此软件位图；
+ * 软件 PPI 门控主要用于 Guest 通过 GICR_ICENABLER0 显式禁用后的注入丢弃。
+ */
+struct vgic_rdist {
+    uint32_t ctlr;             /* GICR_CTLR */
+    uint32_t ppi_enable;       /* GICR_ISENABLER0：INTID 0..31 使能位图 */
+};
+
 void vgic_init(void);
 void vgic_inject_virq_hw(uint32_t vintid, uint32_t pintid);
 
@@ -46,6 +62,15 @@ void vgic_inject_virq_hw(uint32_t vintid, uint32_t pintid);
 void vgicd_init(struct vgic_dist *d);
 uint32_t vgicd_read(struct vgic_dist *d, uint32_t offset);
 void vgicd_write(struct vgic_dist *d, uint32_t offset, uint32_t val);
+
+/*
+ * Phase 16: 虚拟 GICR 寄存器读写模拟（trap-and-emulate）
+ *   offset 为相对 GICR 基址 (0x080A0000) 的偏移。
+ *   由 virt_board 的 MMIO 分派调用。
+ */
+void vgicr_init(struct vgic_rdist *r);
+uint32_t vgicr_read(struct vgic_rdist *r, uint32_t offset);
+void vgicr_write(struct vgic_rdist *r, uint32_t offset, uint32_t val);
 
 /*
  * 向当前 Guest 注入一个 HW 映射的虚拟中断（PCI INTx 直通用，固定 LR2）

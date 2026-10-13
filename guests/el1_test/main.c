@@ -235,6 +235,127 @@ static void phase15_vgicd_test(void)
     guest_puts("\nPhase 15: ALL tests done\n");
 }
 
+/* ---------- Phase 16: 虚拟 GICR (trap-and-emulate) ---------- */
+
+#define GICR_BASE           0x080A0000UL
+#define GICR_CTLR           (GICR_BASE + 0x0000)
+#define GICR_IIDR           (GICR_BASE + 0x0004)
+#define GICR_TYPER          (GICR_BASE + 0x0008)
+#define GICR_WAKER          (GICR_BASE + 0x0014)
+/* SGI/PPI 帧偏移相对 GICR 基址，已含 0x10000 的 SGI_base 帧偏移 */
+#define GICR_ISENABLER0     (GICR_BASE + 0x10100)
+#define GICR_ICENABLER0     (GICR_BASE + 0x10180)
+
+/* 虚拟 GICR 测试接收标志 */
+static volatile int vgicr_irq_received = 0;
+
+static inline int vgicr_inject(u32 vintid)
+{
+    return (int)hvc_call(HVC_GICR_INJECT, (u64)vintid);
+}
+
+/*
+ * 初始化虚拟 GICR（演示 trap-and-emulate 读）：
+ *   读 GICR_TYPER / GICR_WAKER，确认 Hypervisor 模拟的 Redistributor
+ *   未睡眠；若处于睡眠态则写 0 唤醒。
+ */
+static void gicr_init(void)
+{
+    u32 typer = mmio_read32(GICR_TYPER);
+    u32 waker = mmio_read32(GICR_WAKER);
+    guest_puts("gicr: GICR_TYPER = 0x");
+    puts_hex(typer, 8);
+    guest_puts(", GICR_WAKER = 0x");
+    puts_hex(waker, 8);
+    guest_puts("\n");
+
+    if (waker & (1 << 1)) {
+        mmio_write32(GICR_WAKER, 0);
+        guest_puts("gicr: GICR_WAKER woke up (ProcessorSleep cleared)\n");
+    }
+}
+
+/*
+ * Phase 16: 虚拟 GICR (trap-and-emulate) 测试
+ *
+ * 验证 Hypervisor 对 GIC Redistributor MMIO 的软件模拟：
+ *   1. 读 TYPER / IIDR，确认模拟值
+ *   2. 读 ISENABLER0，确认默认所有 PPI 使能
+ *   3. ICENABLER0 禁用测试 PPI -> HVC_GICR_INJECT 被门控返回 -1 且收不到中断
+ *   4. ISENABLER0 重新使能 -> HVC_GICR_INJECT 返回 0 且收到中断
+ */
+static void phase16_gicr_test(void)
+{
+    guest_puts("\n========================================\n");
+    guest_puts("  Phase 16: Virtual GICR emulation\n");
+    guest_puts("========================================\n");
+
+    /* 1. 读标识寄存器，验证 trap-and-emulate 读 */
+    u32 typer = mmio_read32(GICR_TYPER);
+    u32 iidr = mmio_read32(GICR_IIDR);
+    guest_puts("gicr: GICR_TYPER = 0x");
+    puts_hex(typer, 8);
+    guest_puts(", GICR_IIDR = 0x");
+    puts_hex(iidr, 8);
+    guest_puts("\n");
+
+    u32 ppi_bit = 1u << (VGICR_TEST_PPI & 31);  /* bit 24 */
+
+    /* 2. 默认所有 PPI 使能，确认测试 PPI 使能位为 1 */
+    u32 en = mmio_read32(GICR_ISENABLER0);
+    guest_puts("gicr: ISENABLER0 = 0x");
+    puts_hex(en, 8);
+    guest_puts(" (PPI 24 enabled = ");
+    puts_dec((en & ppi_bit) ? 1 : 0);
+    guest_puts(")\n");
+
+    /* 3. 禁用测试 PPI，验证注入被门控丢弃 */
+    guest_puts("gicr: disabling PPI 24 via ICENABLER0...\n");
+    mmio_write32(GICR_ICENABLER0, ppi_bit);
+
+    vgicr_irq_received = 0;
+    int ret = vgicr_inject(VGICR_TEST_PPI);
+
+    int timeout = 100000;
+    while (timeout-- > 0)
+        asm volatile("nop");
+
+    guest_puts("gicr: inject while disabled -> ret=");
+    puts_dec(ret);
+    guest_puts(", irq_received=");
+    puts_dec(vgicr_irq_received);
+    guest_puts("\n");
+
+    if (ret == -1 && vgicr_irq_received == 0)
+        guest_puts("gicr: gating PASSED (disabled PPI dropped)\n");
+    else
+        guest_puts("gicr: gating FAILED\n");
+
+    /* 4. 重新使能测试 PPI，验证注入正常送达 */
+    guest_puts("gicr: re-enabling PPI 24 via ISENABLER0...\n");
+    mmio_write32(GICR_ISENABLER0, ppi_bit);
+
+    vgicr_irq_received = 0;
+    ret = vgicr_inject(VGICR_TEST_PPI);
+
+    timeout = 10000000;
+    while (!vgicr_irq_received && timeout-- > 0)
+        asm volatile("nop");
+
+    guest_puts("gicr: inject while enabled -> ret=");
+    puts_dec(ret);
+    guest_puts(", irq_received=");
+    puts_dec(vgicr_irq_received);
+    guest_puts("\n");
+
+    if (ret == 0 && vgicr_irq_received)
+        guest_puts("gicr: inject PASSED (enabled PPI delivered)\n");
+    else
+        guest_puts("gicr: inject FAILED\n");
+
+    guest_puts("\nPhase 16: ALL tests done\n");
+}
+
 /* ---------- 虚拟定时器 ---------- */
 
 static u64 timer_freq;
@@ -1963,6 +2084,9 @@ void guest_irq_handler(void)
     } else if (intid == VGICD_TEST_VIRQ) {
         /* Phase 15: 虚拟 GICD 测试中断 */
         vgicd_irq_received = 1;
+    } else if (intid == VGICR_TEST_PPI) {
+        /* Phase 16: 虚拟 GICR 测试中断 */
+        vgicr_irq_received = 1;
     } else if (intid < 16) {
         /* Phase 12: SGI（软件生成中断，vSGI 测试用）
          * SGI INTID 范围 0-15。
@@ -2120,6 +2244,9 @@ void guest_main(void)
     /* 初始化虚拟 GIC Distributor（Phase 15 trap-and-emulate） */
     gic_dist_init();
 
+    /* 初始化虚拟 GIC Redistributor（Phase 16 trap-and-emulate） */
+    gicr_init();
+
     /* 初始化虚拟定时器 */
     vtimer_start();
     guest_puts("guest: virtual timer started\n");
@@ -2163,6 +2290,9 @@ void guest_main(void)
 
     /* 测试 8: Phase 15 虚拟 GICD 模拟（trap-and-emulate） */
     phase15_vgicd_test();
+
+    /* 测试 9: Phase 16 虚拟 GICR 模拟（trap-and-emulate） */
+    phase16_gicr_test();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 

@@ -49,3 +49,8 @@ int virt_inject_virq_to_vcpu(int vmid, int vcpu_id, uint32_t vintid);
  * （返回 1=使能/放行，0=禁用；SGI/PPI/LPI 等非 GICD 门控范围恒返回 1）
  * 供 vgic.c 注入路径做 enable 门控。 */
 int virt_vgicd_spi_enabled(struct task_struct *vm, uint32_t vintid);
+
+/* Phase 16: 查询指定 VM 的虚拟 PPI 是否在 GICR 中被使能
+ * （返回 1=使能/放行，0=禁用；仅 PPI 16-31 走此门控）
+ * 供 vgic.c 注入路径做 enable 门控。 */
+int virt_vgicr_ppi_enabled(struct task_struct *vm, uint32_t vintid);

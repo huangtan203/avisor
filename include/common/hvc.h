@@ -41,3 +41,6 @@
 
 /* Phase 15: 虚拟 GICD 测试 hypercall */
 #define HVC_GICD_INJECT     42  /* x0=vintid，直接经 vgic_inject_virq 注入，返回 0/-1 */
+
+/* Phase 16: 虚拟 GICR 测试 hypercall */
+#define HVC_GICR_INJECT     43  /* x0=vPPI(16-31)，直接经 vgic_inject_virq 注入，返回 0/-1 */

@@ -178,6 +178,92 @@ void vgicd_write(struct vgic_dist *d, uint32_t offset, uint32_t val)
 }
 
 /*
+ * Phase 16: 虚拟 GICR 初始化
+ *
+ * 默认所有 PPI 使能（ppi_enable 全 1），保持向后兼容：软件 PPI
+ * 默认放行。真实 vtimer PPI 27 走 HW 直通（vgic_inject_virq_hw），
+ * 不受此软件位图影响。
+ */
+void vgicr_init(struct vgic_rdist *r)
+{
+    if (!r)
+        return;
+
+    r->ctlr = 0;                /* GICR_CTLR 复位为 0（无 LPI 使能位） */
+    r->ppi_enable = 0xFFFFFFFFu;
+}
+
+/*
+ * Phase 16: 虚拟 GICR 寄存器读（offset 相对 0x080A0000）
+ *
+ * GICR 由两个 64KB 帧组成：
+ *   - RD_base 帧（0x0000-0xFFFF）：GICR_CTLR/IIDR/TYPER/WAKER 等
+ *   - SGI_base 帧（0x10000-0x1FFFF）：SGI/PPI 的组/使能/优先级
+ */
+uint32_t vgicr_read(struct vgic_rdist *r, uint32_t offset)
+{
+    if (!r)
+        return 0;
+
+    if (offset == GICR_CTLR)            /* 0x0000 */
+        return r->ctlr;
+    if (offset == GICR_IIDR)            /* 0x0004 */
+        return 0x43B;
+    if (offset == GICR_TYPER)           /* 0x0008：Affinity_Value=0，简化 */
+        return 0;
+    if (offset == GICR_WAKER)           /* 0x0014：未睡眠 */
+        return 0;
+
+    /* SGI/PPI 帧（0x10000 起），sgi 为相对 SGI_base 的偏移 */
+    if (offset >= GICR_SGI_BASE) {
+        uint32_t sgi = offset - GICR_SGI_BASE;
+
+        if (sgi == GICR_IGROUPR0)       /* 0x0080：SGI+PPI 全 Group 1 */
+            return 0xFFFFFFFFu;
+        if (sgi == GICR_ISENABLER0)     /* 0x0100 */
+            return r->ppi_enable;
+        /* IPRIORITYR(n)：0x0400 + n*4，默认优先级 0xA0 */
+        if (sgi >= 0x0400 && sgi < 0x0420 && ((sgi - 0x0400) & 3) == 0)
+            return 0xA0A0A0A0u;
+    }
+
+    /* 其余（ICENABLER0/ISPENDR0/ICPENDR0/ICFGR/PROPBASER 等）读 0 */
+    return 0;
+}
+
+/*
+ * Phase 16: 虚拟 GICR 寄存器写（offset 相对 0x080A0000）
+ */
+void vgicr_write(struct vgic_rdist *r, uint32_t offset, uint32_t val)
+{
+    if (!r)
+        return;
+
+    if (offset == GICR_CTLR) {          /* 0x0000 */
+        r->ctlr = val;
+        return;
+    }
+
+    if (offset == GICR_WAKER)           /* 0x0014：Guest 唤醒，忽略 */
+        return;
+
+    if (offset >= GICR_SGI_BASE) {
+        uint32_t sgi = offset - GICR_SGI_BASE;
+
+        if (sgi == GICR_ISENABLER0) {   /* 0x0100：置位使能 */
+            r->ppi_enable |= val;
+            return;
+        }
+        if (sgi == GICR_ICENABLER0) {   /* 0x0180：清除使能 */
+            r->ppi_enable &= ~val;
+            return;
+        }
+    }
+
+    /* 其余（IGROUPR0/IPRIORITYR/ICFGR/PROPBASER 等）忽略写 */
+}
+
+/*
  * 向当前 Guest 注入一个虚拟中断（HW 直通映射模式）
  *
  * 用于 vtimer 等有对应物理中断的场景。固定使用 LR0。
@@ -279,7 +365,12 @@ static int vgic_inject_virq_raw(uint32_t vintid)
  */
 int vgic_inject_virq(uint32_t vintid)
 {
-    /* SPI (32-1019) 受 GICD enable 门控；SGI/PPI/LPI 不在此列 */
+    /* PPI (16-31) 受 GICR enable 门控（软件 PPI） */
+    if (vintid >= 16 && vintid < 32 &&
+        !virt_vgicr_ppi_enabled(current, vintid))
+        return -1;
+
+    /* SPI (32-1019) 受 GICD enable 门控；SGI/LPI 不在此列 */
     if (vintid >= 32 && vintid < 1020 &&
         !virt_vgicd_spi_enabled(current, vintid))
         return -1;

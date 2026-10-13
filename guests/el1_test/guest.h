@@ -64,11 +64,17 @@ typedef int bool;
 /* Phase 15: 虚拟 GICD 测试 hypercall */
 #define HVC_GICD_INJECT     42  /* x0=vintid，直接注入虚拟 SPI，返回 0/-1 */
 
+/* Phase 16: 虚拟 GICR 测试 hypercall */
+#define HVC_GICR_INJECT     43  /* x0=vPPI(16-31)，直接注入虚拟 PPI，返回 0/-1 */
+
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60
 
 /* Phase 15: 虚拟 GICD 测试用虚拟 SPI（避开 48/49/50/60 已有设备 SPI） */
 #define VGICD_TEST_VIRQ     52
+
+/* Phase 16: 虚拟 GICR 测试用虚拟 PPI（避开 vtimer=27） */
+#define VGICR_TEST_PPI      24
 
 /* ---- 内联汇编访问系统寄存器 ---- */
 

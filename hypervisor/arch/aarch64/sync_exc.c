@@ -212,6 +212,13 @@ void handle_hvc64(unsigned long hvc_nr)
 	case HVC_GICD_INJECT:
 		regs->regs[0] = vgic_inject_virq((uint32_t)regs->regs[0]);
 		break;
+
+	/* Phase 16: 虚拟 GICR 测试 hypercall——与 GICD_INJECT 相同，
+	 * 底层都走 vgic_inject_virq（对 PPI 做 GICR enable 门控），
+	 * 语义上区分 SPI/PPI，便于 guest 测试可读性。 */
+	case HVC_GICR_INJECT:
+		regs->regs[0] = vgic_inject_virq((uint32_t)regs->regs[0]);
+		break;
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);
