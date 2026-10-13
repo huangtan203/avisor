@@ -285,20 +285,34 @@ void hypervisor_main()
             printf("[8.3] VM2 vcpu0 created (vmid=2, cpu0, pid=%d)\n", pid);
         }
 
-        /* VM2（单核，vcpu0 在 CPU0）
-         * 注：VM2 的次 vCPU 暂时禁用，原因：
-         *   1. CPU1 在 QEMU 上启动有问题（PSCI 返回成功但次核没跑起来）
-         *   2. 次 vCPU 的 board 初始化会覆盖 ivshmem peer
-         *   3. VM1 双核已充分验证了 vSMP 的核心功能
-         * 未来启用跨核 vCPU 时需要：修复 CPU1 启动 + 重构 board 初始化（VM 级别） */
+        /* VM2 次 vCPU：创建在 CPU1（Phase 14 双 VM 全 SMP，跨核 vCPU） */
+        {
+            struct shared_vm_loader_args shared_args = {
+                .master = vm2_master,
+                .entry_point = 0x40000000,
+            };
+            int pid = create_task_on_cpu(1, shared_vm_loader, &shared_args);
+            if (pid < 0)
+                PANIC("failed to create VM2 vcpu1");
+            cpu1_tasks[pid]->vmid = 2;
+            cpu1_tasks[pid]->vcpu_id = 1;
+            cpu1_tasks[pid]->phys_cpu = 1;
+            /* 同步虚拟 MPIDR（次 vCPU 返回 aff0=1） */
+            cpu1_tasks[pid]->cpu_sysregs.mpidr_el1 = 1;
+            cpu1_tasks[pid]->priority = 10;
+            cpu1_tasks[pid]->counter = 10;
+            (void)strncpy(cpu1_tasks[pid]->name, "vm2-cpu1", 36);
+            printf("[8.4] VM2 vcpu1 created (vmid=2, cpu1, pid=%d)\n", pid);
+            /* 注册 vCPU 到板级查找表（用于 vSGI 等跨 vCPU 操作） */
+            virt_register_vcpu(cpu1_tasks[pid], 2, 1);
+        }
 
         /*
          * 最后修正：确保 VM1 的 ivshmem peer 0 正确指向主 vCPU。
          *
-         * 因为创建顺序是 VM1-vcpu0 → VM1-vcpu1 → VM2-vcpu0，
-         * 中间步骤里 peer 0 会被 VM2 的临时初始化覆盖。
-         * VM2 修正到 peer 1 时把 peer 0 清空了，所以这里
-         * 需要手动恢复 VM1 的 peer 0。
+         * 因为创建顺序是 VM1-vcpu0 → VM1-vcpu1 → VM2-vcpu0 → VM2-vcpu1，
+         * 中间步骤里 peer 0 会被后续临时初始化覆盖。
+         * 这里手动恢复 VM1 的 peer 0，保证 doorbell 路由正确。
          */
         virt_board_set_ivshmem_peer(vm1_master, 0);
     }
@@ -342,7 +356,7 @@ void hypervisor_main()
 
     printf("\nAll core systems online. Entering scheduler loop...\n");
     printf("CPU0: idle + VM1 vcpu0 + VM2 vcpu0\n");
-    printf("CPU1: idle + VM1 vcpu1\n\n");
+    printf("CPU1: idle + VM1 vcpu1 + VM2 vcpu1\n\n");
 
     /*
      * 10. 调度主循环（Hypervisor 的"_idle"身份）

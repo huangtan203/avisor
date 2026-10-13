@@ -2030,10 +2030,9 @@ void guest_main(void)
     phase11_smp_test();
 
     /* 测试 7: Phase 12 vSGI（虚拟 SGI）测试
-     * 需要次 vCPU 配合。仅 VM1（vmid=1）有双 vCPU。
+     * 需要次 vCPU 配合。Phase 14 起两个 VM 都是双核，
      * 两个 vCPU 都会进入，内部用 cpuid 区分主/次角色 */
-    if (vmid == 1)
-        phase12_vsgi_test();
+    phase12_vsgi_test();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 
@@ -2168,11 +2167,9 @@ void guest_secondary_main(void)
     guest_puts("] guest: SMP test done\n");
 
     /* Phase 12: vSGI 测试（次核侧）
-     * 仅 VM1（vmid == 1）有次 vCPU。
+     * Phase 14 起两个 VM 都有次 vCPU。
      * phase12_vsgi_test 内部会根据 cpuid 自动判断主/次角色。 */
-    if (vmid == 1) {
-        phase12_vsgi_test();
-    }
+    phase12_vsgi_test();
 
     guest_puts("[vcpu");
     puts_dec(cpu_id);
