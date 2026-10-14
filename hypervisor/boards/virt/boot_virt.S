@@ -110,6 +110,12 @@ secondary_el2:
     mrs x0, mpidr_el1
     and x0, x0, #0xFF
 
+    /* 设置 TPIDR_EL2 = 物理 CPU ID，供 smp_processor_id() 使用
+     * 注意：这里在开启 MMU 之前读 MPIDR_EL1，此时 HCR_EL2.VM 可能
+     * 还未设置（或 VM=1 但此时 VMPIDR_EL2 是复位值=0x80000000？），
+     * 但无论如何此处读到的是物理 MPIDR（EL2 启动早期）。 */
+    msr tpidr_el2, x0
+
     /* 设置次核栈（每个核 16KB 栈空间）
      * CPU0 栈: LOW_MEMORY
      * CPU1 栈: LOW_MEMORY - 0x4000
@@ -202,6 +208,11 @@ el3:
     eret
 
 el2_entry:
+    /* 设置 TPIDR_EL2 = 0（主核物理 CPU ID），供 smp_processor_id() 使用。
+     * 必须在任何调用 smp_processor_id() 的代码之前设置。 */
+    mov x0, #0
+    msr tpidr_el2, x0
+
     /* 清零 BSS 段 */
     adr x0, bss_begin
     adr x1, bss_end

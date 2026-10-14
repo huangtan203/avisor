@@ -80,6 +80,7 @@ typedef uint64_t vaddr_t;
 
 void map_stage2_page(struct task_struct *task, vaddr_t va, paddr_t page,
 		     uint64_t flags);
+int unmap_stage2_page(struct task_struct *task, vaddr_t va, int do_free);
 void *allocate_page(void);
 void deallocate_page(void *);
 void *allocate_task_page(struct task_struct *task, vaddr_t va);

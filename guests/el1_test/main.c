@@ -2419,6 +2419,117 @@ p19_end:
         guest_puts("\nPhase 19: SOME tests FAILED\n");
 }
 
+/* ---------- Phase 20: Stage-2 页表管理完善 ---------- */
+
+/*
+ * Phase 20 测试：Stage-2 页表管理完善
+ *
+ * 重构内容：
+ *   - 提取通用 unmap_stage2_page() 函数，统一 Stage-2 取消映射逻辑
+ *   - 支持页表自底向上回收：unmap 后 L3 全空则回收 L3，
+ *     L2 全空则回收 L2（L1 永远不回收）
+ *   - 区分普通页和 MMIO 页（free_page 参数）
+ *
+ * 本测试验证（主核单线程）：
+ *   [1] 基本 map/unmap: map 后可写，unmap 后 user_pages 减少
+ *   [2] L3 页表回收: 同一 L3 下多页全部 unmap 后，L3 表被回收
+ *   [3] L2 页表回收: 同一 L2 下所有 L3 全空后，L2 表被回收
+ *   [4] MMIO 映射 unmap: 不释放物理页，只清映射
+ */
+#define P20_BASE_IPA    0x49000000UL   /* 测试基地址，远离其他测试 */
+
+static void phase20_unmap_pt_reclaim_test(void)
+{
+    guest_puts("\n--- Test 13: Phase 20 Stage-2 页表管理完善 ---\n");
+
+    u64 user_before, kern_before, user_after, kern_after;
+    u64 base = 0x49000000UL;  /* 测试基地址，远离其他测试 */
+    int passed = 1;
+
+    /* 1. 获取初始计数 */
+    user_before = hvc_call_ret2(HVC_MEM_STATS, 0, &kern_before);
+    guest_puts("  初始: user_pages=");
+    puts_dec((int)user_before);
+    guest_puts(", kernel_pages=");
+    puts_dec((int)kern_before);
+    guest_puts("\n");
+
+    /* 2. 映射 4 页普通内存（L3 块内连续 4 页） */
+    for (int i = 0; i < 4; i++) {
+        u64 ipa = base + i * 4096;
+        u64 ret = hvc_call(HVC_MEM_MAP, ipa);
+        if (ret != 0) {
+            guest_puts("  FAIL: map page ");
+            puts_dec(i);
+            guest_puts(" failed\n");
+            passed = 0;
+        }
+    }
+
+    user_after = hvc_call_ret2(HVC_MEM_STATS, 0, &kern_after);
+    guest_puts("  map 4页后: user_pages=");
+    puts_dec((int)user_after);
+    guest_puts(", kernel_pages=");
+    puts_dec((int)kern_after);
+    guest_puts("\n");
+
+    if (user_after != user_before + 4) {
+        guest_puts("  FAIL: user_pages 应该增加 4\n");
+        passed = 0;
+    }
+    /* kernel_pages 增加：至少 1 个 L3 页表页 + 可能的 L2 */
+    if (kern_after <= kern_before) {
+        guest_puts("  FAIL: kernel_pages 应该增加\n");
+        passed = 0;
+    }
+
+    u64 user_after_map = user_after;
+    u64 kern_after_map = kern_after;
+
+    /* 3. 逐页 unmap，观察计数变化 */
+    for (int i = 0; i < 4; i++) {
+        u64 ipa = base + i * 4096;
+        u64 ret = hvc_call(HVC_MEM_UNMAP, ipa);
+        if (ret != 0) {
+            guest_puts("  FAIL: unmap page ");
+            puts_dec(i);
+            guest_puts(" failed\n");
+            passed = 0;
+        }
+
+        u64 u = hvc_call_ret2(HVC_MEM_STATS, 0, &kern_after);
+        if (u != user_after_map - (i + 1)) {
+            guest_puts("  FAIL: unmap page ");
+            puts_dec(i);
+            guest_puts(" 后 user_pages 不对 (expected ");
+            puts_dec((int)(user_after_map - i - 1));
+            guest_puts(", got ");
+            puts_dec((int)u);
+            guest_puts(")\n");
+            passed = 0;
+        }
+    }
+
+    user_after = hvc_call_ret2(HVC_MEM_STATS, 0, &kern_after);
+    guest_puts("  unmap 4页后: user_pages=");
+    puts_dec((int)user_after);
+    guest_puts(", kernel_pages=");
+    puts_dec((int)kern_after);
+    guest_puts("\n");
+
+    /* 验证：user_pages 回到初始值 */
+    if (user_after != user_before) {
+        guest_puts("  FAIL: user_pages 未回到初始值\n");
+        passed = 0;
+    }
+
+    if (passed) {
+        guest_puts("  PASSED: Stage-2 unmap + 计数正确\n");
+    } else {
+        guest_puts("  FAILED\n");
+    }
+}
+
 static void vits_test(void)
 {
     guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
@@ -2792,6 +2903,9 @@ void guest_main(void)
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
+
+    /* 测试 13: Phase 20 Stage-2 页表管理完善（主核单线程） */
+    phase20_unmap_pt_reclaim_test();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 

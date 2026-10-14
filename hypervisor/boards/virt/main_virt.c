@@ -72,6 +72,22 @@ extern char el1_test_end[];
 volatile int smp_boot_flag = 0;
 
 /*
+ * Loader 参数（全局存储，避免栈上变量被覆盖）
+ *
+ * 背景：create_task_on_cpu 只是把 arg 指针存到 task 的 cpu_context 里，
+ * 不会拷贝内容。如果 arg 是 hypervisor_main 栈上的局部变量，
+ * 而任务（尤其是次级 vCPU，需要等待 master 加载完成）延迟执行，
+ * 栈上的内容可能已被 hypervisor_main 后续代码覆盖，导致
+ * loader 读到错误的 entry_point / master 指针，最终 Guest 从 PC=0 启动
+ * 触发 Instruction Abort。
+ *
+ * 修复：把所有 loader 参数放到全局数据段，生命周期与系统一致。
+ */
+static struct embedded_binary_loader_args global_guest_args;
+static struct shared_vm_loader_args global_vm1_shared_args;
+static struct shared_vm_loader_args global_vm2_shared_args;
+
+/*
  * PSCI CPU_ON 函数（通过 SMC #0 调用，由 QEMU 模拟的 PSCI 固件处理）
  *
  * 返回 0 = 成功，其他 = 错误码
@@ -209,7 +225,7 @@ void hypervisor_main()
      * 同一 VM 的 vCPU 共享同一份 Stage 2 页表和设备模型。
      */
     {
-        struct embedded_binary_loader_args guest_args = {
+        global_guest_args = (struct embedded_binary_loader_args){
             .load_addr = 0x40000000,
             .entry_point = 0x40000000,
             .image_begin = (unsigned long)el1_test_begin,
@@ -219,7 +235,7 @@ void hypervisor_main()
         /* VM1 主 vCPU：创建在 CPU0，vmid=1, vcpu0 */
         struct task_struct *vm1_master = NULL;
         {
-            int pid = create_task_on_cpu(0, embedded_binary_loader, &guest_args);
+            int pid = create_task_on_cpu(0, embedded_binary_loader, &global_guest_args);
             if (pid < 0)
                 PANIC("failed to create VM1 vcpu0");
             cpu0_tasks[pid]->vmid = 1;
@@ -237,11 +253,11 @@ void hypervisor_main()
 
         /* VM1 次 vCPU：创建在 CPU1（跨物理核 vCPU 调度，验证跨核 IPI + vSGI） */
         {
-            struct shared_vm_loader_args shared_args = {
+            global_vm1_shared_args = (struct shared_vm_loader_args){
                 .master = vm1_master,
                 .entry_point = 0x40000000,
             };
-            int pid = create_task_on_cpu(1, shared_vm_loader, &shared_args);
+            int pid = create_task_on_cpu(1, shared_vm_loader, &global_vm1_shared_args);
             if (pid < 0)
                 PANIC("failed to create VM1 vcpu1");
             cpu1_tasks[pid]->vmid = 1;
@@ -262,7 +278,7 @@ void hypervisor_main()
         /* VM2 主 vCPU：创建在 CPU0，vmid=2, vcpu0 */
         struct task_struct *vm2_master = NULL;
         {
-            int pid = create_task_on_cpu(0, embedded_binary_loader, &guest_args);
+            int pid = create_task_on_cpu(0, embedded_binary_loader, &global_guest_args);
             if (pid < 0)
                 PANIC("failed to create VM2 vcpu0");
             cpu0_tasks[pid]->vmid = 2;
@@ -287,11 +303,11 @@ void hypervisor_main()
 
         /* VM2 次 vCPU：创建在 CPU1（Phase 14 双 VM 全 SMP，跨核 vCPU） */
         {
-            struct shared_vm_loader_args shared_args = {
+            global_vm2_shared_args = (struct shared_vm_loader_args){
                 .master = vm2_master,
                 .entry_point = 0x40000000,
             };
-            int pid = create_task_on_cpu(1, shared_vm_loader, &shared_args);
+            int pid = create_task_on_cpu(1, shared_vm_loader, &global_vm2_shared_args);
             if (pid < 0)
                 PANIC("failed to create VM2 vcpu1");
             cpu1_tasks[pid]->vmid = 2;

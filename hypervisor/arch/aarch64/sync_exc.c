@@ -164,6 +164,13 @@ void handle_hvc64(unsigned long hvc_nr)
 		regs->regs[0] = hyp_mem_unmap(ipa);
 		break;
 	}
+	/* Phase 20: 内存统计 hypercall
+	 * 返回 x0 = user_pages_count, x1 = kernel_pages_count */
+	case HVC_MEM_STATS: {
+		regs->regs[0] = current->mm.user_pages_count;
+		regs->regs[1] = current->mm.kernel_pages_count;
+		break;
+	}
 
 	/* Phase 10: 共享内存 hypercall */
 	case HVC_SHM_CREATE: {
@@ -362,7 +369,7 @@ void handle_sync_exception(unsigned long esr, unsigned long elr,
 			PANIC("handle_mem_abort() failed.");
 		break;
 	default:
-		PANIC("uncaught synchronous exception:\n%s\nesr: %x, address: %x",
+		PANIC("uncaught synchronous exception:\n%s\nesr: %x, elr(el2)=%lx",
 		      sync_error_reasons[eclass], esr, elr);
 		break;
 	}

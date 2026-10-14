@@ -204,15 +204,19 @@ struct cpu_sched_state {
 
 extern struct cpu_sched_state cpu_state[MAX_CPUS];
 
-/* 获取当前 CPU ID（读 MPIDR 的 aff0 字段）
+/* 获取当前物理 CPU ID（读 TPIDR_EL2）
  *
- * 注意：用宏而不是 inline 函数，避免某些编译器对 asm volatile
- * 的优化导致返回值不正确。MPIDR_EL1 的 aff0 字段即 CPU ID。
+ * 注意：不能用 MPIDR_EL1，因为 HCR_EL2.VM=1 时，EL2 读 MPIDR_EL1
+ * 可能返回 VMPIDR_EL2 中的虚拟值（而非物理 MPIDR），导致 per-CPU
+ * 的 current 指针、任务表等数据结构全部错乱。
+ *
+ * 使用 TPIDR_EL2：EL2 专属的软件线程 ID 寄存器，完全由软件控制，
+ * 在每个 CPU 启动时写入物理 CPU ID，之后只读，不受任何虚拟化影响。
  */
 #define smp_processor_id() ({                              \
-    unsigned long __mpidr;                                 \
-    asm volatile("mrs %0, mpidr_el1" : "=r"(__mpidr));    \
-    (int)(__mpidr & 0xFF);                                 \
+    unsigned long __cpu;                                   \
+    asm volatile("mrs %0, tpidr_el2" : "=r"(__cpu));       \
+    (int)__cpu;                                            \
 })
 
 /*

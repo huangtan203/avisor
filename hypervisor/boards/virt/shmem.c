@@ -200,37 +200,12 @@ int shm_detach(int shmid)
     paddr_t ipa = shm->attach[slot].ipa;
 
     /*
-     * 清 Stage-2 映射。
-     * 这里用和 hyp_mem_unmap 一样的逻辑：
-     * 找到 Level 3 entry 清零 + TLB flush。
+     * Phase 20: 用通用 unmap_stage2_page() 清 Stage-2 映射
+     *
+     * 共享内存不释放物理页（free_page=0），物理页由 shm 子系统管理。
+     * 自动获得页表自底向上回收能力。
      */
-    {
-        paddr_t lv1_table, lv2_table, lv3_table;
-        uint64_t entry;
-        uint64_t *l3_entry_p;
-
-        lv1_table = current->mm.first_table;
-        if (lv1_table) {
-            uint64_t idx = (ipa >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
-            entry = ((uint64_t *)TO_VADDR(lv1_table))[idx];
-            if ((entry & 0x3) == 3) {
-                lv2_table = entry & PAGE_MASK;
-                idx = (ipa >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
-                entry = ((uint64_t *)TO_VADDR(lv2_table))[idx];
-                if ((entry & 0x3) == 3) {
-                    lv3_table = entry & PAGE_MASK;
-                    idx = (ipa >> PAGE_SHIFT) & (PTRS_PER_TABLE - 1);
-                    l3_entry_p =
-                        &((uint64_t *)TO_VADDR(lv3_table))[idx];
-                    *l3_entry_p = 0;
-
-                    asm volatile("tlbi vmalle1" ::: "memory");
-                    asm volatile("dsb ish" ::: "memory");
-                    current->mm.user_pages_count--;
-                }
-            }
-        }
-    }
+    unmap_stage2_page(current, ipa, 0);
 
     /* 清除 attach 记录 */
     shm->attach[slot].vm = NULL;

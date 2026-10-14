@@ -142,7 +142,12 @@ paddr_t get_free_page(struct page_pool *pool)
 
 void free_page(struct page_pool *pool, paddr_t p)
 {
-	pool->memap[(p - pool->start_addr) / PAGE_SIZE] = 0;
+	unsigned long idx = (p - pool->start_addr) / PAGE_SIZE;
+	if (p < pool->start_addr || idx >= pool->page_nr) {
+		PANIC("free_page: invalid pa 0x%lx (start=0x%lx nr=%lu idx=%lu)",
+		      p, pool->start_addr, pool->page_nr, idx);
+	}
+	pool->memap[idx] = 0;
 }
 
 void map_stage2_table_entry(vaddr_t pte, vaddr_t va, paddr_t pa, uint64_t flags)
@@ -234,6 +239,113 @@ void map_stage2_page(struct task_struct *task, vaddr_t va, paddr_t page,
 
 	map_stage2_table_entry(TO_VADDR(lv3_table), va, page, flags);
 	task->mm.user_pages_count++;
+}
+
+/*
+ * Phase 20: 判断一个页表页是否全空（所有 entry 都是 0）
+ *
+ * 用于页表自底向上回收：unmap 一个 L3 entry 后，如果整个 L3 表全空，
+ * 则回收 L3 表页本身，并继续检查 L2 表是否也变空了。
+ */
+static int page_table_empty(paddr_t table_pa)
+{
+	uint64_t *table = (uint64_t *)TO_VADDR(table_pa);
+	for (int i = 0; i < PTRS_PER_TABLE; i++) {
+		if (table[i] != 0)
+			return 0;
+	}
+	return 1;
+}
+
+/*
+ * Phase 20: 通用 Stage-2 单页取消映射
+ *
+ *   task: 目标 VM task
+ *   va:   目标 IPA/VA（4KB 页对齐）
+ *   free_page: 1 = 释放映射的物理页（普通内存页），
+ *              0 = 不释放物理页（MMIO 映射 / 共享内存）
+ *
+ * 返回 0 成功，-1 未映射
+ *
+ * 特性：
+ *   - 支持页表自底向上回收：L3 全空则回收 L3 表页，
+ *     L2 全空则回收 L2 表页（L1 永远不回收，它是根）
+ *   - 自动 TLB flush（vmalle1）
+ *   - 递减 user_pages_count 和 kernel_pages_count
+ */
+int unmap_stage2_page(struct task_struct *task, vaddr_t va, int do_free)
+{
+	paddr_t lv1_table, lv2_table_pa = 0, lv3_table_pa = 0;
+	uint64_t entry;
+	uint64_t *l3_entry_p;
+	int idx1, idx2, idx3;
+
+	if (!task || !task->mm.first_table)
+		return -1;
+
+	lv1_table = task->mm.first_table;
+	va &= PAGE_MASK;
+
+	/* Level 1 */
+	idx1 = (va >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv1_table))[idx1];
+	if ((entry & 0x3) != 3)   /* 不是 table descriptor */
+		return -1;
+	lv2_table_pa = entry & PAGE_MASK;
+
+	/* Level 2 */
+	idx2 = (va >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv2_table_pa))[idx2];
+	if ((entry & 0x3) != 3)   /* 不是 table descriptor */
+		return -1;
+	lv3_table_pa = entry & PAGE_MASK;
+
+	/* Level 3: 找到目标 entry */
+	idx3 = (va >> PAGE_SHIFT) & (PTRS_PER_TABLE - 1);
+	l3_entry_p = &((uint64_t *)TO_VADDR(lv3_table_pa))[idx3];
+	entry = *l3_entry_p;
+	if ((entry & 0x3) != 3)   /* 未映射或非 page */
+		return -1;
+
+	/* 清零 L3 entry（先清映射再释放物理页） */
+	*l3_entry_p = 0;
+	task->mm.user_pages_count--;
+
+	/*
+	 * 自底向上回收空的页表页
+	 *
+	 * 顺序：先回收 L3 表（如果全空），再回收 L2 表（如果全空）。
+	 * L1 表（first_table）不回收——它是 VM 页表的根，
+	 * 生命周期与 task 一致。
+	 */
+
+	/* 回收 L3 表页 */
+	if (page_table_empty(lv3_table_pa)) {
+		page_pool_lock_acquire();
+		free_page(get_page_pool(), lv3_table_pa);
+		page_pool_lock_release();
+		task->mm.kernel_pages_count--;
+
+		/* 清 L2 中指向该 L3 的 entry */
+		((uint64_t *)TO_VADDR(lv2_table_pa))[idx2] = 0;
+
+		/* 回收 L2 表页 */
+		if (page_table_empty(lv2_table_pa)) {
+			page_pool_lock_acquire();
+			free_page(get_page_pool(), lv2_table_pa);
+			page_pool_lock_release();
+			task->mm.kernel_pages_count--;
+
+			/* 清 L1 中指向该 L2 的 entry */
+			((uint64_t *)TO_VADDR(lv1_table))[idx1] = 0;
+		}
+	}
+
+	/* 失效 TLB（当前 VMID） */
+	asm volatile("tlbi vmalle1" ::: "memory");
+	asm volatile("dsb ish" ::: "memory");
+
+	return 0;
 }
 
 paddr_t get_ipa(vaddr_t va)
@@ -472,74 +584,20 @@ int hyp_mem_map(paddr_t ipa, uint64_t flags)
  * hyp_mem_unmap: 取消指定 IPA 的映射，释放物理页
  *   ipa: 目标 IPA（4KB 对齐）
  * 返回 0 成功，-1 失败
+ *
+ * Phase 20: 改为调用通用的 unmap_stage2_page()，
+ *   自动获得页表自底向上回收能力，且修复了 free_page 未加锁的 bug。
  */
 int hyp_mem_unmap(paddr_t ipa)
 {
-	paddr_t pa;
-
-	/* 先找到物理页地址 */
-	if (ipa_to_pa(current, ipa & PAGE_MASK, &pa) < 0) {
+	int ret = unmap_stage2_page(current, ipa, 1);
+	if (ret < 0) {
 		WARN("hyp_mem_unmap: ipa 0x%lx not mapped",
 		     (unsigned long)ipa);
 		return -1;
 	}
 
-	pa &= PAGE_MASK;
-
-	/*
-	 * 清空 Stage-2 页表中的对应 entry。
-	 *
-	 * 简化实现：直接找到 Level 3 table，把对应 entry 清零。
-	 * 这里复用 ipa_to_pa 的查找逻辑拿到 Level 3 entry 指针。
-	 */
-	{
-		paddr_t lv1_table, lv2_table, lv3_table;
-		uint64_t entry;
-		uint64_t *l3_entry_p;
-
-		lv1_table = current->mm.first_table;
-		if (!lv1_table)
-			return -1;
-
-		/* Level 1 */
-		{
-			uint64_t idx = (ipa >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
-			entry = ((uint64_t *)TO_VADDR(lv1_table))[idx];
-		}
-		if ((entry & 0x3) != 3)
-			return -1;
-		lv2_table = entry & PAGE_MASK;
-
-		/* Level 2 */
-		{
-			uint64_t idx = (ipa >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
-			entry = ((uint64_t *)TO_VADDR(lv2_table))[idx];
-		}
-		if ((entry & 0x3) != 3)
-			return -1;
-		lv3_table = entry & PAGE_MASK;
-
-		/* Level 3 */
-		{
-			uint64_t idx = (ipa >> PAGE_SHIFT) & (PTRS_PER_TABLE - 1);
-			l3_entry_p = &((uint64_t *)TO_VADDR(lv3_table))[idx];
-		}
-
-		/* 清零 entry */
-		*l3_entry_p = 0;
-	}
-
-	/* 释放物理页 */
-	free_page(get_page_pool(), pa);
-
-	/* 失效 TLB（当前 VMID） */
-	asm volatile("tlbi vmalle1" ::: "memory");
-	asm volatile("dsb ish" ::: "memory");
-
-	current->mm.user_pages_count--;
-
-	INFO("hyp_mem_unmap: vm=%lu ipa=0x%lx pa=0x%lx",
-	     current->vmid, (unsigned long)(ipa & PAGE_MASK),
-	     (unsigned long)pa);
+	INFO("hyp_mem_unmap: vm=%lu ipa=0x%lx",
+	     current->vmid, (unsigned long)(ipa & PAGE_MASK));
 	return 0;
 }

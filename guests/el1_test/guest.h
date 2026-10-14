@@ -52,6 +52,7 @@ typedef int bool;
 #define HVC_SCHED_SET_PRIO  12
 #define HVC_MEM_MAP         20
 #define HVC_MEM_UNMAP       21
+#define HVC_MEM_STATS       22  /* 返回 x0=user_pages x1=kernel_pages */
 #define HVC_SHM_CREATE      30
 #define HVC_SHM_ATTACH      31
 #define HVC_SHM_DETACH      32
@@ -142,6 +143,24 @@ static inline u64 hvc_call2(u64 nr, u64 arg0, u64 arg1)
 		     : "r"(x1), "r"(x8)
 		     : "memory");
 
+	return x0;
+}
+
+/* Phase 20: 返回 x0 和 x1 两个返回值的 hvc_call
+ * 用于一次返回两个值的 hypercall（如 HVC_MEM_STATS） */
+static inline u64 hvc_call_ret2(u64 nr, u64 arg0, u64 *ret1)
+{
+	register u64 x0 __asm__("x0") = arg0;
+	register u64 x1 __asm__("x1");
+	register u64 x8 __asm__("x8") = nr;
+
+	asm volatile("hvc #0"
+		     : "+r"(x0), "=r"(x1)
+		     : "r"(x8)
+		     : "memory");
+
+	if (ret1)
+		*ret1 = x1;
 	return x0;
 }
 

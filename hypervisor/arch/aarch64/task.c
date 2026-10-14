@@ -45,8 +45,6 @@ struct pt_regs *task_pt_regs(struct task_struct *tsk)
 
 static void prepare_task(loader_func_t loader, void *arg)
 {
-	INFO("loading...");
-
 	struct pt_regs *regs = task_pt_regs(current);
 	regs->pstate = PSR_MODE_EL1h;
 	/* interrupt mask */
@@ -64,8 +62,6 @@ static void prepare_task(loader_func_t loader, void *arg)
 	asm volatile("dmb ish" ::: "memory");
 
 	set_cpu_sysregs(current);
-
-	INFO("loaded");
 }
 
 static struct cpu_sysregs initial_sysregs;
