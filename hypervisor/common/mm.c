@@ -348,6 +348,389 @@ int unmap_stage2_page(struct task_struct *task, vaddr_t va, int do_free)
 	return 0;
 }
 
+/*
+ * Phase 21: 修改 Stage-2 页表中某一页的访问权限
+ *
+ *   task:   目标 VM task
+ *   va:     目标 IPA/VA（4KB 页对齐）
+ *   new_ap: 新的权限值（S2_AP_RW / S2_AP_RO / S2_AP_NONE）
+ *
+ * 返回 0 成功，-1 未映射
+ *
+ * 说明：
+ *   - 只修改 AP 位（bit[7:6]），其他属性不变
+ *   - 修改后自动 TLB flush（vmalle1）
+ *   - 不改变页表层级结构，不涉及物理页分配/释放
+ */
+int mprotect_stage2_page(struct task_struct *task, vaddr_t va, uint64_t new_ap)
+{
+	paddr_t lv1_table, lv2_table_pa, lv3_table_pa;
+	uint64_t entry;
+	int idx1, idx2, idx3;
+	uint64_t *l3_entry_p;
+
+	if (!task || !task->mm.first_table)
+		return -1;
+
+	lv1_table = task->mm.first_table;
+	va &= PAGE_MASK;
+	new_ap &= S2_AP_MASK;
+
+	/* Level 1 */
+	idx1 = (va >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv1_table))[idx1];
+	if ((entry & 0x3) != 3)
+		return -1;
+	lv2_table_pa = entry & PAGE_MASK;
+
+	/* Level 2 */
+	idx2 = (va >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv2_table_pa))[idx2];
+	if ((entry & 0x3) != 3)
+		return -1;
+	lv3_table_pa = entry & PAGE_MASK;
+
+	/* Level 3 — 找到 L3 entry 并修改 AP 位 */
+	idx3 = (va >> PAGE_SHIFT) & (PTRS_PER_TABLE - 1);
+	l3_entry_p = &((uint64_t *)TO_VADDR(lv3_table_pa))[idx3];
+	entry = *l3_entry_p;
+
+	if ((entry & 0x3) != 0x3)  /* 不是 page descriptor */
+		return -1;
+
+	/* 清除旧的 AP 位，设置新的 AP 位 */
+	entry &= ~S2_AP_MASK;
+	entry |= new_ap;
+	*l3_entry_p = entry;
+
+	/* 失效 TLB（当前 VMID） */
+	asm volatile("tlbi vmalle1" ::: "memory");
+	asm volatile("dsb ish" ::: "memory");
+	asm volatile("isb" ::: "memory");
+
+	return 0;
+}
+
+/*
+ * Phase 22: Stage-2 2MB Block 映射
+ *
+ *   task:  目标 VM task
+ *   va:    目标 IPA/VA（必须 2MB 对齐）
+ *   pa:    物理地址（必须 2MB 对齐）
+ *   flags: 映射标志（用 MMU_STAGE2_BLOCK_FLAGS 或变体）
+ *
+ * 返回 0 成功，-1 失败（已存在映射或参数错误）
+ *
+ * 说明：
+ *   - 在 L2 level 直接建立 block descriptor（bit[1:0] = 01）
+ *   - 如果目标 L2 entry 已经是 table（指向 L3 表），则返回失败
+ *     （不自动拆分，避免复杂性；调用方先 unmap 再 block map）
+ *   - 不做 TLB flush（由调用方按需处理）
+ */
+int map_stage2_block(struct task_struct *task, vaddr_t va, paddr_t pa,
+		     uint64_t flags)
+{
+	paddr_t lv1_table;
+	uint64_t entry;
+	int idx1, idx2;
+
+	if (!task)
+		return -1;
+
+	/* 2MB 对齐检查 */
+	if ((va & (SECTION_SIZE - 1)) || (pa & (SECTION_SIZE - 1)))
+		return -1;
+
+	if (!task->mm.first_table) {
+		task->mm.first_table = get_free_page(get_page_pool());
+		task->mm.kernel_pages_count++;
+	}
+
+	lv1_table = task->mm.first_table;
+
+	/* Level 1 — 遍历到 L2 表 */
+	idx1 = (va >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv1_table))[idx1];
+
+	paddr_t lv2_table_pa;
+
+	if ((entry & 0x3) == 0) {
+		/* L1 entry 为空，分配一个新的 L2 表 */
+		lv2_table_pa = get_free_page(get_page_pool());
+		if (!lv2_table_pa)
+			return -1;
+		((uint64_t *)TO_VADDR(lv1_table))[idx1] =
+			lv2_table_pa | MM_TYPE_PAGE_TABLE;
+		task->mm.kernel_pages_count++;
+	} else if ((entry & 0x3) == 3) {
+		/* 已是 table descriptor */
+		lv2_table_pa = entry & PAGE_MASK;
+	} else {
+		/* L1 是 block（1GB），不能再放 L2 表 */
+		return -1;
+	}
+
+	/* Level 2 — 检查目标 entry 是否可用 */
+	idx2 = (va >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv2_table_pa))[idx2];
+
+	if ((entry & 0x3) != 0) {
+		/* 已有映射（可能是 table 或 block），不覆盖 */
+		return -1;
+	}
+
+	/* 写入 block descriptor */
+	((uint64_t *)TO_VADDR(lv2_table_pa))[idx2] = pa | flags;
+	task->mm.huge_pages_count++;
+
+	return 0;
+}
+
+/*
+ * Phase 22: Stage-2 2MB Block 取消映射
+ *
+ *   task:     目标 VM task
+ *   va:       目标 IPA/VA（2MB 对齐）
+ *   do_free:  1 = 释放 2MB 物理内存（512 页），0 = 不释放
+ *
+ * 返回 0 成功，-1 未映射或不是 block
+ *
+ * 说明：
+ *   - 仅当 L2 entry 是 block descriptor 时才处理
+ *   - do_free=1 时，释放连续 512 个 4KB 物理页
+ *   - 如果 L2 表变空，回收 L2 表页（自底向上回收）
+ *   - 自动 TLB flush
+ */
+int unmap_stage2_block(struct task_struct *task, vaddr_t va, int do_free)
+{
+	paddr_t lv1_table, lv2_table_pa;
+	uint64_t entry;
+	int idx1, idx2;
+
+	if (!task || !task->mm.first_table)
+		return -1;
+
+	if (va & (SECTION_SIZE - 1))
+		return -1;
+
+	lv1_table = task->mm.first_table;
+
+	/* Level 1 */
+	idx1 = (va >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv1_table))[idx1];
+	if ((entry & 0x3) != 3)   /* 不是 table descriptor */
+		return -1;
+	lv2_table_pa = entry & PAGE_MASK;
+
+	/* Level 2 — 检查是否是 block */
+	idx2 = (va >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv2_table_pa))[idx2];
+	if ((entry & 0x3) != MM_TYPE_BLOCK)
+		return -1;
+
+	/* 释放物理内存（2MB = 512 页） */
+	if (do_free) {
+		paddr_t block_pa = entry & PAGE_MASK;
+		page_pool_lock_acquire();
+		for (int i = 0; i < (1 << (LV2_SHIFT - PAGE_SHIFT)); i++) {
+			free_page(get_page_pool(),
+				  block_pa + i * PAGE_SIZE);
+		}
+		page_pool_lock_release();
+	}
+
+	/* 清零 L2 entry */
+	((uint64_t *)TO_VADDR(lv2_table_pa))[idx2] = 0;
+	task->mm.huge_pages_count--;
+
+	/* 如果 L2 表变空，回收 L2 表页 */
+	if (page_table_empty(lv2_table_pa)) {
+		page_pool_lock_acquire();
+		free_page(get_page_pool(), lv2_table_pa);
+		page_pool_lock_release();
+		task->mm.kernel_pages_count--;
+		/* 清 L1 entry */
+		((uint64_t *)TO_VADDR(lv1_table))[idx1] = 0;
+	}
+
+	/* 失效 TLB */
+	asm volatile("tlbi vmalle1" ::: "memory");
+	asm volatile("dsb ish" ::: "memory");
+	asm volatile("isb" ::: "memory");
+
+	return 0;
+}
+
+/*
+ * Phase 22: 修改 2MB Block 的访问权限
+ *
+ * 返回 0 成功，-1 未映射或不是 block
+ */
+int mprotect_stage2_block(struct task_struct *task, vaddr_t va, uint64_t new_ap)
+{
+	paddr_t lv1_table, lv2_table_pa;
+	uint64_t entry;
+	int idx1, idx2;
+	uint64_t *l2_entry_p;
+
+	if (!task || !task->mm.first_table)
+		return -1;
+
+	if (va & (SECTION_SIZE - 1))
+		return -1;
+
+	new_ap &= S2_AP_MASK;
+
+	lv1_table = task->mm.first_table;
+
+	/* Level 1 */
+	idx1 = (va >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv1_table))[idx1];
+	if ((entry & 0x3) != 3)
+		return -1;
+	lv2_table_pa = entry & PAGE_MASK;
+
+	/* Level 2 — 找到 block entry */
+	idx2 = (va >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
+	l2_entry_p = &((uint64_t *)TO_VADDR(lv2_table_pa))[idx2];
+	entry = *l2_entry_p;
+
+	if ((entry & 0x3) != MM_TYPE_BLOCK)
+		return -1;
+
+	/* 修改 AP 位 */
+	entry &= ~S2_AP_MASK;
+	entry |= new_ap;
+	*l2_entry_p = entry;
+
+	/* 失效 TLB */
+	asm volatile("tlbi vmalle1" ::: "memory");
+	asm volatile("dsb ish" ::: "memory");
+	asm volatile("isb" ::: "memory");
+
+	return 0;
+}
+
+/*
+ * Phase 22: 设置 VM 内存配额（字节）
+ *
+ *   max_bytes: 最大允许的用户内存（4KB 页 + 2MB 大页合计）
+ *              0 表示无限制
+ *
+ * 返回 0 成功，-1 失败
+ */
+int set_task_memory_quota(struct task_struct *task, unsigned long max_bytes)
+{
+	if (!task)
+		return -1;
+	task->mm.max_memory = max_bytes;
+	return 0;
+}
+
+/*
+ * Phase 22: 获取 VM 当前用户内存使用量（字节）
+ *
+ * 返回总字节数 = 4KB 页 * 4096 + 2MB 大页 * 2MB
+ */
+unsigned long get_task_memory_usage(struct task_struct *task)
+{
+	if (!task)
+		return 0;
+	return (unsigned long)task->mm.user_pages_count * PAGE_SIZE +
+	       (unsigned long)task->mm.huge_pages_count * SECTION_SIZE;
+}
+
+/*
+ * Phase 22: 内存配额检查
+ *
+ * 检查再分配 add_bytes 字节后是否超出配额。
+ * 返回 0 表示允许，-1 表示超出配额。
+ * 配额为 0 时表示无限制。
+ */
+int quota_check(struct task_struct *task, unsigned long add_bytes)
+{
+	if (!task || task->mm.max_memory == 0)
+		return 0;
+	unsigned long usage = get_task_memory_usage(task);
+	if (usage + add_bytes > task->mm.max_memory)
+		return -1;
+	return 0;
+}
+
+/*
+ * Phase 22: 分配连续物理页（用于大页映射）
+ *
+ *   npages: 连续页数（必须是 2 的幂，方便对齐）
+ *
+ * 返回连续块的起始物理地址，失败返回 0。
+ *
+ * 算法：扫描 memap，找 npages 个连续空闲页，
+ *       且起始索引是 npages 的倍数（保证自然对齐）。
+ */
+paddr_t allocate_block_pages(int npages)
+{
+	struct page_pool *pool = get_page_pool();
+	paddr_t result = 0;
+
+	if (npages <= 0 || (npages & (npages - 1)) != 0)
+		return 0;  /* 必须是 2 的幂 */
+
+	page_pool_lock_acquire();
+
+	for (unsigned long i = 0; i < pool->page_nr; i++) {
+		unsigned long start =
+			(pool->last_page_id + i) % pool->page_nr;
+
+		/* 自然对齐：起始索引必须是 npages 的倍数 */
+		if (start % (unsigned long)npages != 0)
+			continue;
+
+		/* 检查 npages 个连续页是否都空闲 */
+		int ok = 1;
+		for (int j = 0; j < npages; j++) {
+			unsigned long idx = start + j;
+			if (idx >= pool->page_nr ||
+			    pool->memap[idx] != 0) {
+				ok = 0;
+				break;
+			}
+		}
+
+		if (ok) {
+			for (int j = 0; j < npages; j++)
+				pool->memap[start + j] = 1;
+			result = pool->start_addr + start * PAGE_SIZE;
+			pool->last_page_id =
+				(start + npages) % pool->page_nr;
+			break;
+		}
+	}
+
+	page_pool_lock_release();
+	return result;
+}
+
+/*
+ * Phase 22: 释放连续物理页
+ */
+void free_block_pages(paddr_t block_pa, int npages)
+{
+	struct page_pool *pool = get_page_pool();
+	unsigned long start_idx =
+		(block_pa - pool->start_addr) / PAGE_SIZE;
+
+	if (block_pa < pool->start_addr ||
+	    start_idx + npages > pool->page_nr) {
+		PANIC("free_block_pages: invalid pa 0x%lx (npages=%d)",
+		      block_pa, npages);
+	}
+
+	page_pool_lock_acquire();
+	for (int j = 0; j < npages; j++)
+		pool->memap[start_idx + j] = 0;
+	page_pool_lock_release();
+}
+
 paddr_t get_ipa(vaddr_t va)
 {
 	/*
@@ -439,6 +822,13 @@ int handle_mem_abort(vaddr_t addr, uint64_t esr)
 
 	if ((dfsc >> 2) == 0x1) {
 		// translation fault -> demand paging
+		/* Phase 22: 配额检查：超出则拒绝分配 */
+		if (quota_check(current, PAGE_SIZE) < 0) {
+			WARN("demand page: quota exceeded (vm=%d, ipa=0x%lx)",
+			     current->pid, ipa & PAGE_MASK);
+			return -1;
+		}
+
 		paddr_t page = get_free_page(get_page_pool());
 
 		if (page == 0) {

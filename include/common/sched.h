@@ -127,8 +127,20 @@ struct cpu_sysregs {
 
 struct mm_struct {
 	unsigned long first_table;
-	int user_pages_count;
-	int kernel_pages_count;
+	int user_pages_count;       /* 4KB 用户页数量 */
+	int kernel_pages_count;     /* 页表页数量（L2/L3 表页） */
+	/*
+	 * Phase 22: 2MB 大页计数
+	 *   huge_pages_count: 已映射的 2MB block 数量
+	 *   总用户内存 = user_pages_count * 4KB + huge_pages_count * 2MB
+	 */
+	int huge_pages_count;
+	/*
+	 * Phase 22: 内存配额（字节）
+	 *   0 表示无限制；非 0 时分配前检查，超配额则失败
+	 *   仅统计用户内存（普通页 + 大页），不统计页表开销
+	 */
+	unsigned long max_memory;
 	/*
 	 * 虚拟计数器偏移（virt 平台）：
 	 * 创建 VM 时快照物理计数器，Guest 的 CNTVCT 从 0 开始。

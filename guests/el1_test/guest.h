@@ -53,6 +53,14 @@ typedef int bool;
 #define HVC_MEM_MAP         20
 #define HVC_MEM_UNMAP       21
 #define HVC_MEM_STATS       22  /* 返回 x0=user_pages x1=kernel_pages */
+#define HVC_MEM_PROTECT     23  /* 修改页权限：x0=ipa x1=prot(0=RW 1=RO 2=NONE)，返回 0/-1 */
+
+/* Phase 22: 内存超售与大页 hypercall */
+#define HVC_MEM_QUERY        24  /* 查询内存：返回 x0=使用(字节) x1=配额(字节) x2=大页数 */
+#define HVC_MEM_SET_QUOTA    25  /* 设置配额：x0=max_bytes，返回 0/-1 */
+#define HVC_MEM_HUGE_MAP     26  /* 映射 2MB 大页：x0=ipa x1=prot，返回 0/-1 */
+#define HVC_MEM_HUGE_UNMAP   27  /* 取消 2MB 大页：x0=ipa，返回 0/-1 */
+#define HVC_MEM_HUGE_PROTECT 28  /* 修改 2MB 大页权限：x0=ipa x1=prot，返回 0/-1 */
 #define HVC_SHM_CREATE      30
 #define HVC_SHM_ATTACH      31
 #define HVC_SHM_DETACH      32
@@ -161,6 +169,26 @@ static inline u64 hvc_call_ret2(u64 nr, u64 arg0, u64 *ret1)
 
 	if (ret1)
 		*ret1 = x1;
+	return x0;
+}
+
+/* Phase 22: 返回 x0, x1, x2 三个返回值的 hvc_call */
+static inline u64 hvc_call_ret3(u64 nr, u64 arg0, u64 *ret1, u64 *ret2)
+{
+	register u64 x0 __asm__("x0") = arg0;
+	register u64 x1 __asm__("x1");
+	register u64 x2 __asm__("x2");
+	register u64 x8 __asm__("x8") = nr;
+
+	asm volatile("hvc #0"
+		     : "+r"(x0), "=r"(x1), "=r"(x2)
+		     : "r"(x8)
+		     : "memory");
+
+	if (ret1)
+		*ret1 = x1;
+	if (ret2)
+		*ret2 = x2;
 	return x0;
 }
 

@@ -13,6 +13,7 @@
 #include "common/hvc.h"
 #include "common/irq.h"
 #include "common/mm.h"
+#include "arch/aarch64/mmu.h"
 #include "common/sched.h"
 #include "common/task.h"
 
@@ -169,6 +170,121 @@ void handle_hvc64(unsigned long hvc_nr)
 	case HVC_MEM_STATS: {
 		regs->regs[0] = current->mm.user_pages_count;
 		regs->regs[1] = current->mm.kernel_pages_count;
+		break;
+	}
+	/* Phase 21: 修改内存页权限
+	 * x0 = ipa (页对齐), x1 = prot (0=RW, 1=RO, 2=NONE)
+	 * 返回 x0 = 0 成功，-1 失败 */
+	case HVC_MEM_PROTECT: {
+		paddr_t ipa = (paddr_t)regs->regs[0];
+		uint64_t prot = regs->regs[1];
+		uint64_t ap;
+
+		switch (prot) {
+		case 0: ap = S2_AP_RW;   break;
+		case 1: ap = S2_AP_RO;   break;
+		case 2: ap = S2_AP_NONE; break;
+		default:
+			regs->regs[0] = -1;  /* 无效 prot 值 */
+			break;
+		}
+		if (prot > 2)
+			break;
+
+		regs->regs[0] = mprotect_stage2_page(current, ipa, ap);
+		break;
+	}
+
+	/* Phase 22: 查询内存使用情况
+	 * 返回 x0 = 当前用户内存(字节), x1 = 配额(字节), x2 = 大页数量 */
+	case HVC_MEM_QUERY: {
+		regs->regs[0] = get_task_memory_usage(current);
+		regs->regs[1] = current->mm.max_memory;
+		regs->regs[2] = current->mm.huge_pages_count;
+		break;
+	}
+
+	/* Phase 22: 设置内存配额
+	 * x0 = max_bytes (0 表示无限制)
+	 * 返回 x0 = 0 成功，-1 失败 */
+	case HVC_MEM_SET_QUOTA: {
+		unsigned long max_bytes = (unsigned long)regs->regs[0];
+		regs->regs[0] = set_task_memory_quota(current, max_bytes);
+		break;
+	}
+
+	/* Phase 22: 映射 2MB 大页
+	 * x0 = ipa (2MB 对齐), x1 = prot (0=RW, 1=RO, 2=NONE)
+	 * 返回 x0 = 0 成功，-1 失败 */
+	case HVC_MEM_HUGE_MAP: {
+		paddr_t ipa = (paddr_t)regs->regs[0];
+		uint64_t prot = regs->regs[1];
+		uint64_t ap;
+		uint64_t flags;
+		int npages = 1 << (LV2_SHIFT - PAGE_SHIFT);
+
+		switch (prot) {
+		case 0: ap = S2_AP_RW;   break;
+		case 1: ap = S2_AP_RO;   break;
+		case 2: ap = S2_AP_NONE; break;
+		default:
+			regs->regs[0] = -1;
+			break;
+		}
+		if (prot > 2)
+			break;
+
+		/* 配额检查：分配 2MB */
+		if (quota_check(current, SECTION_SIZE) < 0) {
+			regs->regs[0] = -1;
+			break;
+		}
+
+		/* 分配连续 512 个物理页（2MB） */
+		paddr_t block_pa = allocate_block_pages(npages);
+		if (!block_pa) {
+			regs->regs[0] = -1;
+			break;
+		}
+
+		flags = (MMU_STAGE2_BLOCK_FLAGS & ~S2_AP_MASK) | ap;
+		regs->regs[0] = map_stage2_block(current, ipa, block_pa, flags);
+
+		/* 如果映射失败，释放已分配的物理页 */
+		if (regs->regs[0] != 0)
+			free_block_pages(block_pa, npages);
+		break;
+	}
+
+	/* Phase 22: 取消 2MB 大页映射
+	 * x0 = ipa (2MB 对齐)
+	 * 返回 x0 = 0 成功，-1 失败 */
+	case HVC_MEM_HUGE_UNMAP: {
+		paddr_t ipa = (paddr_t)regs->regs[0];
+		regs->regs[0] = unmap_stage2_block(current, ipa, 1);
+		break;
+	}
+
+	/* Phase 22: 修改 2MB 大页权限
+	 * x0 = ipa (2MB 对齐), x1 = prot (0=RW, 1=RO, 2=NONE)
+	 * 返回 x0 = 0 成功，-1 失败 */
+	case HVC_MEM_HUGE_PROTECT: {
+		paddr_t ipa = (paddr_t)regs->regs[0];
+		uint64_t prot = regs->regs[1];
+		uint64_t ap;
+
+		switch (prot) {
+		case 0: ap = S2_AP_RW;   break;
+		case 1: ap = S2_AP_RO;   break;
+		case 2: ap = S2_AP_NONE; break;
+		default:
+			regs->regs[0] = -1;
+			break;
+		}
+		if (prot > 2)
+			break;
+
+		regs->regs[0] = mprotect_stage2_block(current, ipa, ap);
 		break;
 	}
 
@@ -368,9 +484,15 @@ void handle_sync_exception(unsigned long esr, unsigned long elr,
 		if (handle_mem_abort(far, esr) < 0)
 			PANIC("handle_mem_abort() failed.");
 		break;
-	default:
-		PANIC("uncaught synchronous exception:\n%s\nesr: %x, elr(el2)=%lx",
-		      sync_error_reasons[eclass], esr, elr);
+	default: {
+		uint64_t hpfar = 0;
+		asm volatile("mrs %0, hpfar_el2" : "=r"(hpfar));
+		PANIC("uncaught synchronous exception:\n%s\n"
+		      "esr=%lx elr_el2=%lx far_el2=%lx hpfar_el2=%lx\n"
+		      "vmid=%d pc=0x%lx",
+		      sync_error_reasons[eclass], esr, elr, far, hpfar,
+		      current->pid, task_pt_regs(current)->pc);
 		break;
+	}
 	}
 }

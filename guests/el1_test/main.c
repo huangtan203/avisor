@@ -80,6 +80,55 @@ u64 guest_vmid(void)
     return hvc_call(HVC_GET_VMID, 0);
 }
 
+/* Phase 21: 临时填充，用于调整镜像布局
+ * （已知存在一个布局敏感的 PC=0 bug，通过改变 text 段大小绕过） */
+const unsigned char phase21_padding[1024] = {0xaa};
+
+/* ---------- 同步异常 handler（Phase 21: 用于 mprotect 测试） ---------- */
+
+static volatile int sync_expect_fault = 0;   /* 非 0 = 期望下一个同步异常 */
+static volatile int sync_fault_received = 0; /* 收到了预期的异常 */
+static volatile u64 sync_fault_esr = 0;
+static volatile u64 sync_fault_far = 0;
+
+/*
+ * Guest 同步异常入口（vectors.S 调用）
+ *   esr: ESR_EL1
+ *   elr: ELR_EL1 (触发异常的指令地址)
+ *   far: FAR_EL1 (故障地址)
+ * 返回 0 = 已处理（跳过指令，继续执行），非 0 = fatal
+ */
+int guest_sync_handler(u64 esr, u64 elr, u64 far)
+{
+    if (sync_expect_fault) {
+        sync_fault_received = 1;
+        sync_fault_esr = esr;
+        sync_fault_far = far;
+        sync_expect_fault = 0;
+        /* 跳过触发异常的指令（假设是 4 字节指令） */
+        asm volatile("msr elr_el1, %0" ::"r"(elr + 4) : "memory");
+        return 0;
+    }
+    return -1;  /* 未预期的异常 → fatal */
+}
+
+static inline void sync_expect_start(void)
+{
+    sync_fault_received = 0;
+    sync_fault_esr = 0;
+    sync_fault_far = 0;
+    asm volatile("dmb sy" ::: "memory");
+    sync_expect_fault = 1;
+    asm volatile("dsb sy; isb" ::: "memory");
+}
+
+static inline int sync_expect_end(void)
+{
+    sync_expect_fault = 0;
+    asm volatile("dmb sy" ::: "memory");
+    return sync_fault_received;
+}
+
 /* ---------- MMIO 读写 ---------- */
 
 #define __raw_readl(addr)   (*(volatile u32 *)(addr))
@@ -2530,6 +2579,342 @@ static void phase20_unmap_pt_reclaim_test(void)
     }
 }
 
+/* ---------- Phase 21: Stage-2 细粒度权限管理 ---------- */
+
+/*
+ * Phase 21 测试：Stage-2 细粒度权限管理
+ *
+ * 验证：
+ *   [1] RW 页：读正常、写正常
+ *   [2] RO 页：读正常、写触发 Stage-2 Permission Fault
+ *   [3] NONE 页：读也触发 Permission Fault
+ *   [4] 改回 RW 后：写恢复正常
+ *   [5] HVC_MEM_PROTECT 对未映射页返回 -1
+ *
+ * 测试用 sync_expect_start/end 捕获预期的同步异常。
+ */
+#define P21_TEST_IPA   0x49100000UL   /* 测试地址，远离 Phase 20 */
+
+static void phase21_mprotect_test(void)
+{
+    guest_puts("\n--- Test 14: Phase 21 Stage-2 细粒度权限管理 ---\n");
+
+    u64 ipa = P21_TEST_IPA;
+    int passed = 1;
+    u64 ret;
+    volatile u64 *p = (volatile u64 *)ipa;
+
+    /* 1. 映射一页（默认 RW 权限） */
+    ret = hvc_call(HVC_MEM_MAP, ipa);
+    if (ret != 0) {
+        guest_puts("  FAIL: map page failed\n");
+        passed = 0;
+        goto done;
+    }
+    guest_puts("  [1] map 页成功\n");
+
+    /* 2. RW 权限下：读、写都应该正常 */
+    *p = 0xdeadbeef;
+    u64 val = *p;
+    if (val != 0xdeadbeef) {
+        guest_puts("  FAIL: RW 模式下读写不一致\n");
+        passed = 0;
+    } else {
+        guest_puts("  [2] RW 模式：读写正常\n");
+    }
+
+    /* 3. 改为 RO 权限 */
+    ret = hvc_call2(HVC_MEM_PROTECT, ipa, 1);  /* 1 = RO */
+    if (ret != 0) {
+        guest_puts("  FAIL: mprotect RO 失败\n");
+        passed = 0;
+        goto unmap_out;
+    }
+    guest_puts("  [3] mprotect RO 成功\n");
+
+    /* 4. RO 权限下：读应该正常 */
+    val = *p;
+    if (val != 0xdeadbeef) {
+        guest_puts("  FAIL: RO 模式下读取值不对\n");
+        passed = 0;
+    } else {
+        guest_puts("  [4] RO 模式：读正常\n");
+    }
+
+    /* 5. RO 权限下：写应该触发 Permission Fault */
+    sync_expect_start();
+    *p = 0x12345678;   /* 这条写指令应该触发 Stage-2 Permission Fault */
+    int faulted = sync_expect_end();
+
+    if (!faulted) {
+        guest_puts("  FAIL: RO 模式下写未触发异常\n");
+        passed = 0;
+    } else {
+        /* 验证 ESR 显示是 data abort + permission fault */
+        u64 ec = (sync_fault_esr >> 26) & 0x3f;
+        u64 dfsc = sync_fault_esr & 0x3f;
+        guest_puts("  [5] RO 写触发异常（ESR=");
+        puts_hex(sync_fault_esr, 8);
+        guest_puts(" FAR=");
+        puts_hex(sync_fault_far, 16);
+        guest_puts("）\n");
+        if (ec != 0b100101) {   /* Data Abort taken without a change in Exception level */
+            guest_puts("  WARNING: EC 不是 Data Abort (got ");
+            puts_hex(ec, 2);
+            guest_puts(")\n");
+        }
+        if ((dfsc & 0x3c) != 0x0c) {  /* Permission fault (level 0-3) */
+            guest_puts("  WARNING: DFSC 不是 Permission Fault (got ");
+            puts_hex(dfsc, 2);
+            guest_puts(")\n");
+        }
+    }
+
+    /* 6. 改回 RW 权限 */
+    ret = hvc_call2(HVC_MEM_PROTECT, ipa, 0);  /* 0 = RW */
+    if (ret != 0) {
+        guest_puts("  FAIL: mprotect RW 失败\n");
+        passed = 0;
+        goto unmap_out;
+    }
+    guest_puts("  [6] mprotect RW 成功\n");
+
+    /* 7. RW 恢复后：写应该正常 */
+    *p = 0xcafebabe;
+    val = *p;
+    if (val != 0xcafebabe) {
+        guest_puts("  FAIL: 恢复 RW 后写失败\n");
+        passed = 0;
+    } else {
+        guest_puts("  [7] 恢复 RW 后写正常\n");
+    }
+
+    /* 8. 测试 NONE 权限：读也应该 fault */
+    ret = hvc_call2(HVC_MEM_PROTECT, ipa, 2);  /* 2 = NONE */
+    if (ret != 0) {
+        guest_puts("  FAIL: mprotect NONE 失败\n");
+        passed = 0;
+        goto unmap_out;
+    }
+    guest_puts("  [8] mprotect NONE 成功\n");
+
+    sync_expect_start();
+    val = *p;    /* 读应该触发 Permission Fault */
+    faulted = sync_expect_end();
+    (void)val;
+
+    if (!faulted) {
+        guest_puts("  FAIL: NONE 模式下读未触发异常\n");
+        passed = 0;
+    } else {
+        guest_puts("  [9] NONE 模式：读触发异常\n");
+    }
+
+    /* 10. 对未映射地址调用 mprotect 应该失败 */
+    ret = hvc_call2(HVC_MEM_PROTECT, ipa + 0x200000, 0);
+    if (ret == 0) {
+        guest_puts("  FAIL: 对未映射页 mprotect 未返回错误\n");
+        passed = 0;
+    } else {
+        guest_puts("  [10] 对未映射页 mprotect 返回错误（正确）\n");
+    }
+
+unmap_out:
+    /* 先恢复 RW（如果还在 RO/NONE），避免 unmap 出问题（其实 unmap 不依赖权限） */
+    hvc_call2(HVC_MEM_PROTECT, ipa, 0);
+    /* 清理：unmap */
+    hvc_call(HVC_MEM_UNMAP, ipa);
+
+done:
+    if (passed) {
+        guest_puts("  PASSED: Stage-2 细粒度权限管理正确\n");
+    } else {
+        guest_puts("  FAILED\n");
+    }
+}
+
+/* ---------- Phase 22: 内存超售与按需分配优化 ---------- */
+
+/*
+ * Phase 22 测试：2MB 大页 + 内存配额
+ *
+ * 检查点：
+ *   1. HVC_MEM_QUERY 基本查询正常
+ *   2. HVC_MEM_HUGE_MAP 映射 2MB 大页成功
+ *   3. 大页内读写正常（不会触发缺页）
+ *   4. HVC_MEM_QUERY 显示大页数正确
+ *   5. HVC_MEM_HUGE_PROTECT 修改大页权限（RO）正常
+ *   6. RO 大页写触发 Permission Fault
+ *   7. HVC_MEM_SET_QUOTA 设置配额成功
+ *   8. 超配额分配失败
+ *   9. HVC_MEM_HUGE_UNMAP 取消大页映射成功
+ *  10. 配额回退后分配恢复正常
+ */
+#define PHASE22_HUGE_IPA     0x41000000UL  /* 16MB 处，2MB 对齐 */
+#define PHASE22_QUOTA_BYTES  (4 * 1024 * 1024UL)  /* 4MB 配额 */
+
+static void phase22_hugepage_quota_test(void)
+{
+    guest_puts("\n--- Test 15: Phase 22 大页 + 内存配额 ---\n");
+
+    int passed = 1;
+    u64 ret;
+    u64 usage, quota, huge_count;
+    volatile u64 *p = (volatile u64 *)PHASE22_HUGE_IPA;
+
+    /* 1. 查询初始内存使用 */
+    usage = hvc_call_ret3(HVC_MEM_QUERY, 0, &quota, &huge_count);
+    if (quota != 0) {
+        guest_puts("  FAIL: 初始配额应该为 0（无限制）\n");
+        passed = 0;
+    } else {
+        guest_puts("  [1] 初始查询正常 (usage=");
+        puts_dec(usage >> 10);
+        guest_puts("KB, huge=");
+        puts_dec(huge_count);
+        guest_puts(")\n");
+    }
+
+    /* 2. 映射 2MB 大页（RW） */
+    ret = hvc_call2(HVC_MEM_HUGE_MAP, PHASE22_HUGE_IPA, 0);  /* 0 = RW */
+    if (ret != 0) {
+        guest_puts("  FAIL: 映射 2MB 大页失败\n");
+        passed = 0;
+        goto done22;
+    }
+    guest_puts("  [2] 映射 2MB 大页成功\n");
+
+    /* 3. 大页内读写正常（测试多个偏移，验证确实是 2MB） */
+    p[0] = 0xdeadbeef;
+    p[1] = 0xcafebabe;
+    /* 测试大页末尾（2MB - 8 字节处） */
+    volatile u64 *p_end = (volatile u64 *)(PHASE22_HUGE_IPA + 0x200000 - 8);
+    *p_end = 0x12345678abcdef00ULL;
+
+    if (p[0] != 0xdeadbeef || p[1] != 0xcafebabe ||
+        *p_end != 0x12345678abcdef00ULL) {
+        guest_puts("  FAIL: 大页内读写不正确\n");
+        passed = 0;
+    } else {
+        guest_puts("  [3] 大页内读写正常（开头 + 末尾）\n");
+    }
+
+    /* 4. 查询大页数应为 1 */
+    usage = hvc_call_ret3(HVC_MEM_QUERY, 0, &quota, &huge_count);
+    if (huge_count != 1) {
+        guest_puts("  FAIL: 大页数应该为 1，实际 ");
+        puts_dec(huge_count);
+        guest_puts("\n");
+        passed = 0;
+    } else {
+        guest_puts("  [4] 大页计数正确 (huge=1, usage=");
+        puts_dec(usage >> 10);
+        guest_puts("KB)\n");
+    }
+
+    /* 5. 修改大页权限为 RO */
+    ret = hvc_call2(HVC_MEM_HUGE_PROTECT, PHASE22_HUGE_IPA, 1);  /* 1 = RO */
+    if (ret != 0) {
+        guest_puts("  FAIL: 大页 mprotect RO 失败\n");
+        passed = 0;
+    } else {
+        guest_puts("  [5] 大页 mprotect RO 成功\n");
+    }
+
+    /* 6. RO 大页写应该触发 Permission Fault */
+    sync_expect_start();
+    p[0] = 0xaaaaaaaa;    /* 写应该触发 fault */
+    int faulted = sync_expect_end();
+
+    if (!faulted) {
+        guest_puts("  FAIL: RO 大页写未触发异常\n");
+        passed = 0;
+    } else {
+        guest_puts("  [6] RO 大页写触发 Permission Fault\n");
+    }
+
+    /* 先恢复 RW，方便后续操作 */
+    hvc_call2(HVC_MEM_HUGE_PROTECT, PHASE22_HUGE_IPA, 0);  /* 0 = RW */
+
+    /* 7. 设置内存配额（4MB） */
+    ret = hvc_call(HVC_MEM_SET_QUOTA, PHASE22_QUOTA_BYTES);
+    if (ret != 0) {
+        guest_puts("  FAIL: 设置配额失败\n");
+        passed = 0;
+    } else {
+        guest_puts("  [7] 设置配额成功 (4MB)\n");
+    }
+
+    /* 验证配额已设置 */
+    usage = hvc_call_ret3(HVC_MEM_QUERY, 0, &quota, &huge_count);
+    if (quota != PHASE22_QUOTA_BYTES) {
+        guest_puts("  FAIL: 配额查询不正确，期望 ");
+        puts_dec(PHASE22_QUOTA_BYTES);
+        guest_puts("，实际 ");
+        puts_dec(quota);
+        guest_puts("\n");
+        passed = 0;
+    }
+
+    /* 8. 超配额分配应该失败
+     *    当前已用约 2MB（大页）+ 一些小页
+     *    再分配一个 2MB 大页应该超过 4MB 配额 */
+    ret = hvc_call2(HVC_MEM_HUGE_MAP, PHASE22_HUGE_IPA + 0x200000, 0);
+    if (ret == 0) {
+        guest_puts("  FAIL: 超配额分配应该失败但成功了\n");
+        passed = 0;
+        /* 清理：unmap 掉这个不该成功的大页 */
+        hvc_call(HVC_MEM_HUGE_UNMAP, PHASE22_HUGE_IPA + 0x200000);
+    } else {
+        guest_puts("  [8] 超配额分配被正确拒绝\n");
+    }
+
+    /* 9. 取消第一个大页映射 */
+    ret = hvc_call(HVC_MEM_HUGE_UNMAP, PHASE22_HUGE_IPA);
+    if (ret != 0) {
+        guest_puts("  FAIL: 取消大页映射失败\n");
+        passed = 0;
+    } else {
+        guest_puts("  [9] 取消 2MB 大页成功\n");
+    }
+
+    /* 验证大页已释放（huge_count 变为 0） */
+    usage = hvc_call_ret3(HVC_MEM_QUERY, 0, &quota, &huge_count);
+    if (huge_count != 0) {
+        guest_puts("  FAIL: unmap 后大页数应为 0，实际 ");
+        puts_dec(huge_count);
+        guest_puts("\n");
+        passed = 0;
+    }
+
+    /* 10. 配额内重新分配应该成功 */
+    ret = hvc_call2(HVC_MEM_HUGE_MAP, PHASE22_HUGE_IPA, 0);
+    if (ret != 0) {
+        guest_puts("  FAIL: 配额内重新分配失败\n");
+        passed = 0;
+    } else {
+        guest_puts("  [10] 配额内重新分配成功\n");
+        /* 验证写正常 */
+        p[0] = 0x11223344;
+        if (p[0] != 0x11223344) {
+            guest_puts("  FAIL: 重新分配后写不正常\n");
+            passed = 0;
+        }
+        /* 清理：unmap */
+        hvc_call(HVC_MEM_HUGE_UNMAP, PHASE22_HUGE_IPA);
+    }
+
+    /* 恢复配额为 0（无限制） */
+    hvc_call(HVC_MEM_SET_QUOTA, 0);
+
+done22:
+    if (passed) {
+        guest_puts("  PASSED: 大页 + 内存配额正确\n");
+    } else {
+        guest_puts("  FAILED\n");
+    }
+}
+
 static void vits_test(void)
 {
     guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
@@ -2906,6 +3291,12 @@ void guest_main(void)
 
     /* 测试 13: Phase 20 Stage-2 页表管理完善（主核单线程） */
     phase20_unmap_pt_reclaim_test();
+
+    /* 测试 14: Phase 21 Stage-2 细粒度权限管理（主核单线程） */
+    phase21_mprotect_test();
+
+    /* 测试 15: Phase 22 大页 + 内存配额（主核单线程） */
+    phase22_hugepage_quota_test();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 

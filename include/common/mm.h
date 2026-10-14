@@ -81,6 +81,23 @@ typedef uint64_t vaddr_t;
 void map_stage2_page(struct task_struct *task, vaddr_t va, paddr_t page,
 		     uint64_t flags);
 int unmap_stage2_page(struct task_struct *task, vaddr_t va, int do_free);
+int mprotect_stage2_page(struct task_struct *task, vaddr_t va, uint64_t new_ap);
+
+/* Phase 22: 2MB 大页（block mapping）接口 */
+int map_stage2_block(struct task_struct *task, vaddr_t va, paddr_t pa,
+		     uint64_t flags);
+int unmap_stage2_block(struct task_struct *task, vaddr_t va, int do_free);
+int mprotect_stage2_block(struct task_struct *task, vaddr_t va, uint64_t new_ap);
+
+/* Phase 22: VM 内存配额 */
+int set_task_memory_quota(struct task_struct *task, unsigned long max_bytes);
+unsigned long get_task_memory_usage(struct task_struct *task);
+int quota_check(struct task_struct *task, unsigned long add_bytes);
+
+/* Phase 22: 连续物理页分配（用于 2MB 大页） */
+paddr_t allocate_block_pages(int npages);
+void free_block_pages(paddr_t block_pa, int npages);
+
 void *allocate_page(void);
 void deallocate_page(void *);
 void *allocate_task_page(struct task_struct *task, vaddr_t va);

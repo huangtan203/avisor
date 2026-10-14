@@ -49,6 +49,40 @@
 	(MM_TYPE_PAGE | MM_STAGE2_ACCESS | MM_STAGE2_SH | MM_STAGE2_AP | \
 	 MM_STAGE2_MEMATTR)
 
+/*
+ * Phase 22: Stage-2 2MB Block 映射标志
+ *
+ * Stage-2 L2 可以直接做 block 映射（2MB 粒度），跳过 L3 表：
+ *   - bit[1:0] = 01 → block descriptor
+ *   - 其他位含义与 page descriptor 相同
+ *   - 物理地址必须 2MB 对齐（bit[20:0] 为 0）
+ *
+ * 好处：
+ *   1. 节省 1 级页表（每个 2MB 大页节省 4KB 的 L3 表）
+ *   2. TLB 命中后性能更高（单条 TLB 覆盖 2MB 而非 4KB）
+ *   3. 减少 translation fault 的次数（一次 fault 映射 2MB）
+ */
+#define MMU_STAGE2_BLOCK_FLAGS                                            \
+	(MM_TYPE_BLOCK | MM_STAGE2_ACCESS | MM_STAGE2_SH | MM_STAGE2_AP | \
+	 MM_STAGE2_MEMATTR)
+
+#define MMU_STAGE2_BLOCK_AP_MASK  (3 << 6)
+
+/*
+ * Phase 21: Stage-2 细粒度权限常量
+ *
+ * Stage-2 AP 位在 descriptor bit[7:6]，共 2 位：
+ *   S2_AP_RW   = 0b11  → 可读可写
+ *   S2_AP_RO   = 0b10  → 只读（写触发 Stage-2 Permission Fault）
+ *   S2_AP_NONE = 0b00  → 无权限（读写都触发 Permission Fault）
+ *
+ * 注：bit 7 控制读权限，bit 6 控制写权限。
+ */
+#define S2_AP_RW    (3 << 6)
+#define S2_AP_RO    (2 << 6)
+#define S2_AP_NONE  (0 << 6)
+#define S2_AP_MASK  (3 << 6)
+
 #define MM_STAGE2_AP_NONE	 (0 << 6)
 #define MM_STAGE2_DEVICE_MEMATTR (0x0 << 2)
 #define MMU_STAGE2_MMIO_PAGE_FLAGS                                            \
