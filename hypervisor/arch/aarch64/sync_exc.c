@@ -13,6 +13,7 @@
 #include "common/hvc.h"
 #include "common/irq.h"
 #include "common/mm.h"
+#include "common/ksm.h"
 #include "arch/aarch64/mmu.h"
 #include "common/sched.h"
 #include "common/task.h"
@@ -304,6 +305,27 @@ void handle_hvc64(unsigned long hvc_nr)
 		break;
 	}
 
+	/* Phase 24: 触发 KSM 扫描合并
+	 * x0 = 最大扫描页数 (0 = 全部扫描)
+	 * 返回 x0 = 实际合并的页面数 */
+	case HVC_MEM_KSM_SCAN: {
+		int max_pages = (int)regs->regs[0];
+		regs->regs[0] = ksm_scan_vm(current, max_pages);
+		break;
+	}
+
+	/* Phase 24: 查询 KSM 统计
+	 * 返回 x0=共享页数, x1=共享映射数, x2=累计合并, x3=累计分离 */
+	case HVC_MEM_KSM_STATS: {
+		struct ksm_stats stats;
+		ksm_get_stats(&stats);
+		regs->regs[0] = stats.pages_shared;
+		regs->regs[1] = stats.pages_sharing;
+		regs->regs[2] = stats.pages_merged;
+		regs->regs[3] = stats.pages_unmerged;
+		break;
+	}
+
 	/* Phase 10: 共享内存 hypercall */
 	case HVC_SHM_CREATE: {
 		uint32_t key = (uint32_t)regs->regs[0];
@@ -358,6 +380,7 @@ void handle_hvc64(unsigned long hvc_nr)
 	case HVC_GICR_INJECT:
 		regs->regs[0] = vgic_inject_virq((uint32_t)regs->regs[0]);
 		break;
+
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);

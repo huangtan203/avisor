@@ -43,6 +43,10 @@
 /* Phase 23: 页面回收 hypercall */
 #define HVC_MEM_RECLAIM_STATS 29  /* 查询回收统计：返回 x0=回收页数 x1=回收失败次数 */
 #define HVC_MEM_RECLAIM       34  /* 主动回收：x0=目标页数，返回实际回收页数 */
+
+/* Phase 24: KSM 内存去重 hypercall */
+#define HVC_MEM_KSM_SCAN      35  /* 触发 KSM 扫描合并：x0=最大扫描页数，返回合并页数 */
+#define HVC_MEM_KSM_STATS     36  /* 查询 KSM 统计：返回 x0=共享页 x1=共享映射数 x2=累计合并 x3=累计分离 */
 #define HVC_SHM_CREATE      30  /* 创建共享内存区：x0=key x1=size，返回 shmid/-1 */
 #define HVC_SHM_ATTACH      31  /* 附加共享内存：x0=shmid x1=ipa，返回 0/-1 */
 #define HVC_SHM_DETACH      32  /* 分离共享内存：x0=shmid，返回 0/-1 */

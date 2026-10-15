@@ -91,6 +91,23 @@
 
 #define MM_STAGE2_AP_NONE	 (0 << 6)
 #define MM_STAGE2_DEVICE_MEMATTR (0x0 << 2)
+
+/* Phase 24: KSM 共享页标记（使用 Stage-2 descriptor 的 IGNORED bit 55）
+ * ARMv8 Stage-2 page/block descriptor 的 bits [55:50] 是 IGNORED，
+ * 软件可自由使用。用 bit 55 标记 KSM 共享页，用于 permission fault
+ * 时快速判断是否需要 CoW 分离。
+ */
+#define MM_STAGE2_KSM_SHARED (1ULL << 55)
+
+/*
+ * Stage-2 页表 descriptor 的物理地址掩码。
+ *
+ * 48-bit IPA 下，Stage-2 descriptor 的 Output Address 是 bits[47:12]。
+ * 注意不能用 PAGE_MASK（0xfffffffffffff000），因为 Stage-2 descriptor
+ * 的高位 bit[63:48] 是 IGNORED / 软件可用位（如 KSM 的 bit 55），
+ * 必须一并清掉，否则提取出的 PA 会带着 bit 55 等高位，导致读非法地址。
+ */
+#define MM_STAGE2_PA_MASK (0x0000FFFFFFFFF000ULL)
 #define MMU_STAGE2_MMIO_PAGE_FLAGS                                            \
 	(MM_TYPE_PAGE | MM_STAGE2_ACCESS | MM_STAGE2_SH | MM_STAGE2_AP_NONE | \
 	 MM_STAGE2_DEVICE_MEMATTR)

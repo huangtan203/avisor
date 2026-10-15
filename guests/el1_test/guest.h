@@ -66,6 +66,10 @@ typedef int bool;
 #define HVC_MEM_RECLAIM_STATS 29  /* 查询回收统计：返回 x0=回收页数 x1=失败次数 */
 #define HVC_MEM_RECLAIM       34  /* 主动回收：x0=目标页数，返回实际回收页数 */
 
+/* Phase 24: KSM 内存去重 */
+#define HVC_MEM_KSM_SCAN      35  /* 触发 KSM 扫描：x0=最大页数，返回合并页数 */
+#define HVC_MEM_KSM_STATS     36  /* 查询 KSM 统计：返回 x0=共享页 x1=共享映射数 x2=累计合并 x3=累计分离 */
+
 #define HVC_SHM_CREATE      30
 #define HVC_SHM_ATTACH      31
 #define HVC_SHM_DETACH      32
@@ -79,7 +83,7 @@ typedef int bool;
 #define HVC_GICD_INJECT     42  /* x0=vintid，直接注入虚拟 SPI，返回 0/-1 */
 
 /* Phase 16: 虚拟 GICR 测试 hypercall */
-#define HVC_GICR_INJECT     43  /* x0=vPPI(16-31)，直接注入虚拟 PPI，返回 0/-1 */
+#define HVC_GICR_INJECT     43  /* x0=vPPI(16-31)，直接经 vgic_inject_virq 注入，返回 0/-1 */
 
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60
@@ -194,6 +198,29 @@ static inline u64 hvc_call_ret3(u64 nr, u64 arg0, u64 *ret1, u64 *ret2)
 		*ret1 = x1;
 	if (ret2)
 		*ret2 = x2;
+	return x0;
+}
+
+/* Phase 24: 返回 x0, x1, x2, x3 四个返回值的 hvc_call */
+static inline u64 hvc_call_ret4(u64 nr, u64 arg0, u64 *ret1, u64 *ret2, u64 *ret3)
+{
+	register u64 x0 __asm__("x0") = arg0;
+	register u64 x1 __asm__("x1");
+	register u64 x2 __asm__("x2");
+	register u64 x3 __asm__("x3");
+	register u64 x8 __asm__("x8") = nr;
+
+	asm volatile("hvc #0"
+		     : "+r"(x0), "=r"(x1), "=r"(x2), "=r"(x3)
+		     : "r"(x8)
+		     : "memory");
+
+	if (ret1)
+		*ret1 = x1;
+	if (ret2)
+		*ret2 = x2;
+	if (ret3)
+		*ret3 = x3;
 	return x0;
 }
 

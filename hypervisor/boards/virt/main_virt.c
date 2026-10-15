@@ -36,6 +36,7 @@
 #include "common/debug.h"
 #include "common/irq.h"
 #include "common/mm.h"
+#include "common/ksm.h"
 #include "common/printf.h"
 #include "common/sched.h"
 #include "common/smp.h"
@@ -177,6 +178,10 @@ void hypervisor_main()
     /* 4.4 初始化跨 VM 共享内存子系统 */
     shmem_init();
     printf("[4.4] shared memory initialized (cross-VM shm)\n");
+
+    /* 4.45 初始化 KSM 内存去重子系统 */
+    ksm_init();
+    printf("[4.45] KSM initialized (memory deduplication)\n");
 
     /* 4.5 初始化 PCI 直通（必须在创建 VM 之前，使 virt_initialize
      * 调用 pci_passthrough_map 时 edu 已枚举完成） */

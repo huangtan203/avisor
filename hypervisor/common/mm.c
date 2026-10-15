@@ -14,6 +14,7 @@
 #include "common/debug.h"
 #include "common/task.h"
 #include "common/utils.h"
+#include "common/ksm.h"
 
 /*
  * 平台相关的页池（page pool）获取函数
@@ -1164,6 +1165,27 @@ int handle_mem_abort(vaddr_t addr, uint64_t esr)
 		if (HAVE_FUNC(ops, is_mmio_addr) &&
 		    ops->is_mmio_addr(current, ipa))
 			is_mmio = 1;
+	}
+
+	/*
+	 * Phase 24: KSM 共享页写时复制（CoW）
+	 *
+	 * 对于 permission fault，如果是写操作，先检查是不是 KSM
+	 * 共享页（页表 entry 的 bit 55 = 1）。如果是，就做 CoW 分离
+	 * （分配新页 + 拷贝内容 + 重映射为 RW），而不是注入异常。
+	 *
+	 * 判断条件：
+	 *   - dfsc >> 2 == 0x3 (permission fault)
+	 *   - WnR == 1 (写操作)
+	 *   - 不是 MMIO 地址
+	 */
+	if ((dfsc >> 2) == 0x3 && !is_mmio && ((esr >> 6) & 1)) {
+		/* 检查是不是 KSM 共享页 */
+		if (ksm_cow_break(current, ipa) == 0) {
+			/* CoW 分离成功，返回重试 */
+			return 0;
+		}
+		/* 不是 KSM 共享页，继续原来的处理（mprotect 等） */
 	}
 
 	/*
