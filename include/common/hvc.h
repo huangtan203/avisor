@@ -39,6 +39,10 @@
 #define HVC_MEM_HUGE_MAP     26  /* 映射 2MB 大页：x0=ipa x1=prot，返回 0/-1 */
 #define HVC_MEM_HUGE_UNMAP   27  /* 取消 2MB 大页映射：x0=ipa，返回 0/-1 */
 #define HVC_MEM_HUGE_PROTECT 28  /* 修改 2MB 大页权限：x0=ipa x1=prot，返回 0/-1 */
+
+/* Phase 23: 页面回收 hypercall */
+#define HVC_MEM_RECLAIM_STATS 29  /* 查询回收统计：返回 x0=回收页数 x1=回收失败次数 */
+#define HVC_MEM_RECLAIM       34  /* 主动回收：x0=目标页数，返回实际回收页数 */
 #define HVC_SHM_CREATE      30  /* 创建共享内存区：x0=key x1=size，返回 shmid/-1 */
 #define HVC_SHM_ATTACH      31  /* 附加共享内存：x0=shmid x1=ipa，返回 0/-1 */
 #define HVC_SHM_DETACH      32  /* 分离共享内存：x0=shmid，返回 0/-1 */

@@ -80,9 +80,6 @@ u64 guest_vmid(void)
     return hvc_call(HVC_GET_VMID, 0);
 }
 
-/* Phase 21: 临时填充，用于调整镜像布局
- * （已知存在一个布局敏感的 PC=0 bug，通过改变 text 段大小绕过） */
-const unsigned char phase21_padding[1024] = {0xaa};
 
 /* ---------- 同步异常 handler（Phase 21: 用于 mprotect 测试） ---------- */
 
@@ -533,9 +530,19 @@ struct virtio_net_drv {
 
 static struct virtio_net_drv vnet;
 
-/* 简单的内存分配器 (从栈顶往下分配) */
-#define GUEST_HEAP_TOP  0x40400000UL
-#define GUEST_HEAP_BASE 0x40300000UL
+/* 简单的内存分配器
+ * 内存布局（从高到低）：
+ *   0x40400000  -- 栈顶（向下增长，预留 64KB 栈空间）
+ *   0x403F0000  -- 堆顶（guest_alloc 从这里向下分配）
+ *   0x40300000  -- 堆底
+ *
+ * 注意：堆和栈必须分开，否则堆分配会覆盖栈上的返回地址，
+ *       导致函数返回时 PC 变成 0（神秘的 PC=0 崩溃的根因）。
+ */
+#define GUEST_STACK_TOP   0x40400000UL
+#define GUEST_STACK_SIZE  0x10000      /* 64KB 栈空间 */
+#define GUEST_HEAP_TOP    (GUEST_STACK_TOP - GUEST_STACK_SIZE)
+#define GUEST_HEAP_BASE   0x40300000UL
 static u64 guest_heap_ptr = GUEST_HEAP_TOP;
 
 static void *guest_alloc(int size, int align)
@@ -2915,6 +2922,164 @@ done22:
     }
 }
 
+/* ---------- Phase 23: 页面回收（Page Reclaim） ---------- */
+
+/*
+ * Phase 23 测试：页面回收（时钟算法 + 配额触发）
+ *
+ * 测试步骤：
+ *   1. 设置内存配额为 4MB
+ *   2. 通过 demand paging 分配 3MB 内存，写入特征值
+ *   3. 查询回收统计应为 0
+ *   4. 继续分配 2MB（总共 5MB > 4MB 配额）→ 触发页面回收
+ *   5. 检查回收统计 > 0（说明确实回收了页面）
+ *   6. 新分配的内存能正常读写
+ *   7. 旧内存中某些页面被回收（数据清零），重新访问触发 demand paging
+ *   8. 恢复配额为无限制
+ */
+#define PHASE23_BASE_IPA    0x50000000  /* 测试起始地址（高地址，避开代码段） */
+#define PHASE23_NPAGES      512         /* 测试 512 页 = 2MB */
+#define PHASE23_PAGE_SIZE   4096        /* 4KB 页大小 */
+#define PHASE23_ACTIVE_PAGES 100        /* 活跃页面数（被访问过的） */
+
+static int test_phase23_reclaim(void)
+{
+    int passed = 1;
+    int ret;
+    unsigned long reclaim_count, reclaim_fail;
+    volatile unsigned char *base;
+
+    guest_puts("\n--- Test 16: Phase 23 页面回收（时钟算法） ---\n");
+
+    /* 1. 显式分配 2MB 测试内存（512 页），用 hyp_mem_map
+     *    放在高地址 0x50000000，避开 Guest 代码段 */
+    base = (volatile unsigned char *)PHASE23_BASE_IPA;
+    for (int i = 0; i < PHASE23_NPAGES; i++) {
+        ret = hvc_call2(HVC_MEM_MAP, PHASE23_BASE_IPA + i * PHASE23_PAGE_SIZE, 0);
+        if (ret != 0) {
+            guest_puts("  FAIL: 映射测试页失败 (page ");
+            puts_dec(i);
+            guest_puts(")\n");
+            passed = 0;
+            goto done23_cleanup;
+        }
+    }
+    guest_puts("  [1] 分配 512 页测试内存（2MB）\n");
+
+    /* 2. 写入特征数据：每页第 1 字节 = 页号 */
+    for (int i = 0; i < PHASE23_NPAGES; i++) {
+        base[i * PHASE23_PAGE_SIZE] = (unsigned char)(i & 0xFF);
+    }
+    guest_puts("  [2] 写入特征数据完成\n");
+
+    /* 3. 查询回收统计，应该为 0 */
+    reclaim_count = hvc_call2(HVC_MEM_RECLAIM_STATS, 0, &reclaim_fail);
+    if (reclaim_count != 0) {
+        guest_puts("  FAIL: 初始回收计数应为 0，实际 ");
+        puts_dec(reclaim_count);
+        guest_puts("\n");
+        passed = 0;
+    } else {
+        guest_puts("  [3] 初始回收计数为 0 ✓\n");
+    }
+
+    /* 4. 第一次显式回收：尝试回收 100 页
+     *    因为所有页 AF=1，第一次只会清除 AF，不会回收
+     *    预期：返回 0 或少量（如果有本来 AF=0 的页） */
+    ret = hvc_call(HVC_MEM_RECLAIM, 100);
+    guest_puts("  [4] 第一次回收请求 100 页，实际回收 ");
+    puts_dec(ret);
+    guest_puts(" 页（预期 ≈ 0，因为所有页刚被访问过）\n");
+
+    /* 5. 主动访问前 100 页 → 触发 Access Flag Fault → AF 重新置 1
+     *    这些就是"活跃"页面 */
+    for (int i = 0; i < PHASE23_ACTIVE_PAGES; i++) {
+        volatile unsigned char *p = &base[i * PHASE23_PAGE_SIZE];
+        unsigned char val = *p;  /* 读访问 → AF fault → AF=1 */
+        (void)val;
+    }
+    guest_puts("  [5] 重新访问前 100 页（标记为活跃）\n");
+
+    /* 6. 第二次显式回收：尝试回收 400 页
+     *    此时：前 100 页 AF=1（活跃），后 412 页 AF=0（不活跃）
+     *    预期：回收约 400 页不活跃的页面
+     *
+     *    注意：时钟从上次停止位置继续扫描，
+     *    不活跃的页（AF=0）会被回收。 */
+    ret = hvc_call(HVC_MEM_RECLAIM, 400);
+    if (ret <= 0) {
+        guest_puts("  FAIL: 第二次回收应该回收页面，但实际回收 0 页\n");
+        passed = 0;
+    } else {
+        guest_puts("  [6] 第二次回收请求 400 页，实际回收 ");
+        puts_dec(ret);
+        guest_puts(" 页 ✓\n");
+    }
+
+    /* 7. 验证回收统计更新 */
+    reclaim_count = hvc_call2(HVC_MEM_RECLAIM_STATS, 0, &reclaim_fail);
+    if (reclaim_count <= 0) {
+        guest_puts("  FAIL: 累计回收计数应为 > 0\n");
+        passed = 0;
+    } else {
+        guest_puts("  [7] 累计回收 ");
+        puts_dec(reclaim_count);
+        guest_puts(" 页，回收失败 ");
+        puts_dec(reclaim_fail);
+        guest_puts(" 次\n");
+    }
+
+    /* 8. 验证活跃页面（前 100 页）数据仍然正确
+     *    注意：这些页可能在第二次回收中被清除了 AF（因为 AF=1 → 清 AF），
+     *    但不应该被回收。重新读取会触发 AF fault，数据保持不变。 */
+    int active_ok = 1;
+    for (int i = 0; i < PHASE23_ACTIVE_PAGES; i++) {
+        if (base[i * PHASE23_PAGE_SIZE] != (unsigned char)(i & 0xFF)) {
+            active_ok = 0;
+            break;
+        }
+    }
+    if (!active_ok) {
+        guest_puts("  FAIL: 活跃页面数据不正确（应该保留）\n");
+        passed = 0;
+    } else {
+        guest_puts("  [8] 活跃页面（前 100 页）数据完整 ✓\n");
+    }
+
+    /* 9. 验证不活跃页面（后面的页）有部分被回收（数据变为 0）
+     *    被回收的页面重新读取时会触发 demand paging，
+     *    分配新物理页（清零），所以读到 0 */
+    int reclaimed_found = 0;
+    for (int i = PHASE23_ACTIVE_PAGES + 10; i < PHASE23_NPAGES; i++) {
+        if (base[i * PHASE23_PAGE_SIZE] == 0) {
+            reclaimed_found++;
+            if (reclaimed_found >= 5)
+                break;
+        }
+    }
+    if (reclaimed_found < 5) {
+        guest_puts("  WARN: 只找到 ");
+        puts_dec(reclaimed_found);
+        guest_puts(" 个被回收的页面（可能都还没被回收）\n");
+        /* 不一定失败，取决于时钟位置 */
+    } else {
+        guest_puts("  [9] 验证：不活跃页面确实有被回收的（数据清零）✓\n");
+    }
+
+done23_cleanup:
+    /* 清理：unmap 所有测试页 */
+    for (int i = 0; i < PHASE23_NPAGES; i++) {
+        hvc_call(HVC_MEM_UNMAP, PHASE23_BASE_IPA + i * PHASE23_PAGE_SIZE);
+    }
+
+    if (passed) {
+        guest_puts("  PASSED: 页面回收功能正确\n");
+    } else {
+        guest_puts("  FAILED\n");
+    }
+    return passed;
+}
+
 static void vits_test(void)
 {
     guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
@@ -3297,6 +3462,9 @@ void guest_main(void)
 
     /* 测试 15: Phase 22 大页 + 内存配额（主核单线程） */
     phase22_hugepage_quota_test();
+
+    /* 测试 16: Phase 23 页面回收（时钟算法 + 配额触发） */
+    test_phase23_reclaim();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 

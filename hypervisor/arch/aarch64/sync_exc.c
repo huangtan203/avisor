@@ -288,6 +288,22 @@ void handle_hvc64(unsigned long hvc_nr)
 		break;
 	}
 
+	/* Phase 23: 查询页面回收统计
+	 * 返回 x0 = 累计回收页数（4KB）, x1 = 回收失败次数 */
+	case HVC_MEM_RECLAIM_STATS: {
+		regs->regs[0] = current->mm.reclaim_count;
+		regs->regs[1] = current->mm.reclaim_fail_count;
+		break;
+	}
+
+	/* Phase 23: 主动回收页面
+	 * x0 = 目标回收页数，返回 x0 = 实际回收页数 */
+	case HVC_MEM_RECLAIM: {
+		int nr = (int)regs->regs[0];
+		regs->regs[0] = reclaim_pages(current, nr);
+		break;
+	}
+
 	/* Phase 10: 共享内存 hypercall */
 	case HVC_SHM_CREATE: {
 		uint32_t key = (uint32_t)regs->regs[0];
@@ -455,6 +471,7 @@ sys_fin:
 #define ESR_EL2_EC_TRAP_SYSTEM 24
 #define ESR_EL2_EC_TRAP_SVE    25
 #define ESR_EL2_EC_DABT_LOW    36
+#define ESR_EL2_EC_IABT_LOW    32  /* Instruction Abort from lower EL */
 
 void handle_sync_exception(unsigned long esr, unsigned long elr,
 			   unsigned long far, unsigned long hvc_nr)
@@ -483,6 +500,19 @@ void handle_sync_exception(unsigned long esr, unsigned long elr,
 	case ESR_EL2_EC_DABT_LOW:
 		if (handle_mem_abort(far, esr) < 0)
 			PANIC("handle_mem_abort() failed.");
+		break;
+	case ESR_EL2_EC_IABT_LOW:
+		/* Instruction Abort from lower EL
+		 * 处理方式与 Data Abort 类似：
+		 *   - AF fault → 设置 AF 位
+		 *   - Translation fault → demand paging
+		 *   - Permission fault → 注入异常给 Guest
+		 *
+		 * 注意：FAR_EL2 是出错的指令虚拟地址，
+		 * 用 get_ipa() 转换成 IPA 来查 Stage-2 表。
+		 */
+		if (handle_mem_abort(far, esr) < 0)
+			PANIC("handle_instr_abort() failed.");
 		break;
 	default: {
 		uint64_t hpfar = 0;

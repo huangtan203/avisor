@@ -142,6 +142,18 @@ struct mm_struct {
 	 */
 	unsigned long max_memory;
 	/*
+	 * Phase 23: 页面回收（Page Reclaim）
+	 *   - reclaim_count: 累计回收的 4KB 页面数
+	 *   - reclaim_fail_count: 回收失败次数（没有可回收页面）
+	 *   - clock_hand: 时钟算法指针（当前扫描 IPA，页对齐）
+	 *   - 利用页表 AF 位做访问跟踪：
+	 *     扫描时清除 AF 位，Access Flag Fault 时重新设置 AF 位
+	 *     回收时找 AF=0 的页面（最近未访问）
+	 */
+	int reclaim_count;
+	int reclaim_fail_count;
+	unsigned long clock_hand;  /* 下一次扫描的起始 IPA */
+	/*
 	 * 虚拟计数器偏移（virt 平台）：
 	 * 创建 VM 时快照物理计数器，Guest 的 CNTVCT 从 0 开始。
 	 * 每次进入 VM 时由 board_ops->entering_vm 写入 CNTVOFF_EL2。

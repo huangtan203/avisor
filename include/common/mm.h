@@ -98,6 +98,20 @@ int quota_check(struct task_struct *task, unsigned long add_bytes);
 paddr_t allocate_block_pages(int npages);
 void free_block_pages(paddr_t block_pa, int npages);
 
+/* Phase 23: 页面回收（Page Reclaim） */
+/* Access Flag Fault 处理：设置 AF 位，标记页面已访问 */
+int handle_access_flag_fault(struct task_struct *task, vaddr_t ipa);
+
+/* 大页拆分：将 2MB block 拆成 512 个 4KB page */
+int split_stage2_block(struct task_struct *task, vaddr_t va);
+
+/* 页面回收：尝试回收 nr_pages 个页面，返回实际回收数量 */
+int reclaim_pages(struct task_struct *task, int nr_pages);
+
+/* 回收统计查询 */
+int get_reclaim_stats(struct task_struct *task, int *reclaim_count,
+		      int *reclaim_fail_count);
+
 void *allocate_page(void);
 void deallocate_page(void *);
 void *allocate_task_page(struct task_struct *task, vaddr_t va);

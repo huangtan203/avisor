@@ -61,6 +61,11 @@ typedef int bool;
 #define HVC_MEM_HUGE_MAP     26  /* 映射 2MB 大页：x0=ipa x1=prot，返回 0/-1 */
 #define HVC_MEM_HUGE_UNMAP   27  /* 取消 2MB 大页：x0=ipa，返回 0/-1 */
 #define HVC_MEM_HUGE_PROTECT 28  /* 修改 2MB 大页权限：x0=ipa x1=prot，返回 0/-1 */
+
+/* Phase 23: 页面回收 hypercall */
+#define HVC_MEM_RECLAIM_STATS 29  /* 查询回收统计：返回 x0=回收页数 x1=失败次数 */
+#define HVC_MEM_RECLAIM       34  /* 主动回收：x0=目标页数，返回实际回收页数 */
+
 #define HVC_SHM_CREATE      30
 #define HVC_SHM_ATTACH      31
 #define HVC_SHM_DETACH      32

@@ -171,12 +171,25 @@ static paddr_t map_stage2_table(vaddr_t table, uint64_t shift, vaddr_t va,
 		*new_table = 1;
 		paddr_t next_level_table =
 			get_free_page(get_page_pool());
-		uint64_t entry = next_level_table | MM_TYPE_PAGE_TABLE;
+		/*
+		 * Stage-2 table descriptor 也需要 AF 位，否则首次访问
+		 * 该表下的页面时会触发 table level AF fault。
+		 * QEMU 可能把 table-level AF fault 误报为 translation fault。
+		 */
+		uint64_t entry = next_level_table | MM_TYPE_PAGE_TABLE |
+				 MM_STAGE2_ACCESS;
+
+		/* 清零新分配的页表页，避免垃圾数据导致异常 */
+		memset((void *)TO_VADDR(next_level_table), 0, PAGE_SIZE);
 
 		((uint64_t *)table)[index] = entry;
 		return next_level_table;
 	} else {
 		*new_table = 0;
+		/* 兼容旧的 table entry：确保 AF 位已设置 */
+		uint64_t *ep = &((uint64_t *)table)[index];
+		if ((*ep & MM_STAGE2_ACCESS) == 0)
+			*ep |= MM_STAGE2_ACCESS;
 	}
 
 	return ((uint64_t *)table)[index] & PAGE_MASK;
@@ -188,6 +201,7 @@ bool check_task_page_mapped(struct task_struct *task, vaddr_t va)
 
 	if (!task->mm.first_table) {
 		task->mm.first_table = get_free_page(get_page_pool());
+		memset((void *)TO_VADDR(task->mm.first_table), 0, PAGE_SIZE);
 		task->mm.kernel_pages_count++;
 	}
 
@@ -218,6 +232,7 @@ void map_stage2_page(struct task_struct *task, vaddr_t va, paddr_t page,
 
 	if (!task->mm.first_table) {
 		task->mm.first_table = get_free_page(get_page_pool());
+		memset((void *)TO_VADDR(task->mm.first_table), 0, PAGE_SIZE);
 		task->mm.kernel_pages_count++;
 	}
 
@@ -443,6 +458,7 @@ int map_stage2_block(struct task_struct *task, vaddr_t va, paddr_t pa,
 
 	if (!task->mm.first_table) {
 		task->mm.first_table = get_free_page(get_page_pool());
+		memset((void *)TO_VADDR(task->mm.first_table), 0, PAGE_SIZE);
 		task->mm.kernel_pages_count++;
 	}
 
@@ -746,21 +762,385 @@ paddr_t get_ipa(vaddr_t va)
 	if ((READ_SYSREG64(sctlr_el1) & 1) == 0)
 		return va;
 
-	paddr_t ipa = translate_el1(va);
+	paddr_t par = translate_el1(va);
 
-	ipa &= 0xFFFFFFFFF000;
+	/* 检查 PAR_EL1.F 位：1 = 翻译失败，退回 VA == IPA */
+	if (par & 1)
+		return va;
+
+	paddr_t ipa = par & 0xFFFFFFFFF000;
 	ipa |= va & 0xFFF;
 	return ipa;
 }
 
 #define ISS_ABORT_DFSC_MASK 0x3f
 
+/*
+ * Phase 23: Access Flag Fault 处理
+ *   - 设置页表 entry 的 AF 位（bit 10）
+ *   - 刷新 TLB
+ *   - 返回 0 表示已处理（Guest 可以重试指令）
+ *
+ * 支持 L3 page 和 L2 block 两种情况。
+ */
+int handle_access_flag_fault(struct task_struct *task, vaddr_t ipa)
+{
+	paddr_t lv1_table, lv2_table_pa;
+	uint64_t entry;
+	int idx1, idx2, idx3;
+
+	if (!task || !task->mm.first_table)
+		return -1;
+
+	ipa &= PAGE_MASK;
+	lv1_table = task->mm.first_table;
+
+	/* Level 1 */
+	idx1 = (ipa >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv1_table))[idx1];
+	if ((entry & 0x3) != 3)
+		return -1;
+	lv2_table_pa = entry & PAGE_MASK;
+
+	/* Level 2 — 可能是 block 也可能是 table */
+	idx2 = (ipa >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
+	entry = ((uint64_t *)TO_VADDR(lv2_table_pa))[idx2];
+	if ((entry & 0x3) == 1) {
+		/* L2 block entry（2MB 大页） */
+		if ((entry & MM_STAGE2_ACCESS) == 0) {
+			entry |= MM_STAGE2_ACCESS;
+			((uint64_t *)TO_VADDR(lv2_table_pa))[idx2] = entry;
+			asm volatile("tlbi vmalle1" ::: "memory");
+			asm volatile("dsb ish" ::: "memory");
+			asm volatile("isb" ::: "memory");
+			return 0;
+		}
+		return -1;  /* AF 已经置位了，不是 AF fault */
+	} else if ((entry & 0x3) != 3) {
+		return -1;  /* 无效 entry */
+	}
+
+	/* Level 3 — page entry（4KB 小页） */
+	paddr_t lv3_table_pa = entry & PAGE_MASK;
+	idx3 = (ipa >> PAGE_SHIFT) & (PTRS_PER_TABLE - 1);
+	uint64_t *l3_entry_p = &((uint64_t *)TO_VADDR(lv3_table_pa))[idx3];
+	entry = *l3_entry_p;
+
+	if ((entry & 0x3) != 0x3)  /* 不是 page descriptor */
+		return -1;
+
+	if (entry & MM_STAGE2_ACCESS)
+		return -1;  /* AF 已经是 1，不应该 */
+
+	entry |= MM_STAGE2_ACCESS;
+	*l3_entry_p = entry;
+
+	asm volatile("tlbi vmalle1" ::: "memory");
+	asm volatile("dsb ish" ::: "memory");
+	asm volatile("isb" ::: "memory");
+
+	return 0;
+}
+
+/*
+ * Phase 23: 大页拆分（split 2MB block into 512 4KB pages）
+ *
+ * 步骤：
+ *   1. 找到 L2 block entry，确认是 block descriptor
+ *   2. 分配一个 L3 页表页
+ *   3. 填充 512 个 L3 page entry（继承 block 的属性）
+ *   4. 将 L2 entry 改为 table descriptor，指向新 L3 表
+ *   5. 刷新 TLB
+ *   6. 更新计数：huge_pages_count--, user_pages_count += 512, kernel_pages_count++
+ *
+ * 返回：0 成功，-1 失败
+ */
+int split_stage2_block(struct task_struct *task, vaddr_t va)
+{
+	paddr_t lv1_table, lv2_table_pa;
+	uint64_t *l2_entry_p;
+	uint64_t block_entry;
+	int idx1, idx2;
+
+	if (!task || !task->mm.first_table)
+		return -1;
+
+	va &= ~((1ULL << LV2_SHIFT) - 1);  /* 2MB 对齐 */
+	lv1_table = task->mm.first_table;
+
+	/* Level 1 */
+	idx1 = (va >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
+	block_entry = ((uint64_t *)TO_VADDR(lv1_table))[idx1];
+	if ((block_entry & 0x3) != 3)
+		return -1;
+	lv2_table_pa = block_entry & PAGE_MASK;
+
+	/* Level 2 — 必须是 block entry */
+	idx2 = (va >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
+	l2_entry_p = &((uint64_t *)TO_VADDR(lv2_table_pa))[idx2];
+	block_entry = *l2_entry_p;
+
+	if ((block_entry & 0x3) != 1)  /* 不是 block descriptor */
+		return -1;
+
+	/* 提取 block 的物理地址和属性 */
+	paddr_t block_pa = block_entry & ~((1ULL << LV2_SHIFT) - 1);
+	uint64_t block_attrs = block_entry & 0xfff;  /* 低 12 位属性 */
+
+	/* 分配 L3 页表页 */
+	paddr_t lv3_table_pa = get_free_page(get_page_pool());
+	if (!lv3_table_pa)
+		return -1;
+
+	uint64_t *lv3_table = (uint64_t *)TO_VADDR(lv3_table_pa);
+	memset(lv3_table, 0, PAGE_SIZE);
+
+	/* 构造 L3 page entry 的属性基值：
+	 *   - 保留低 12 位属性（AF, SH, AP, MemAttr 等）
+	 *   - 把类型位从 block (01) 改为 page (11)
+	 */
+	uint64_t page_attr_base = (block_attrs & ~0x3ULL) | MM_TYPE_PAGE;
+
+	/* 填充 512 个 L3 entry */
+	for (int i = 0; i < PTRS_PER_TABLE; i++) {
+		paddr_t page_pa = block_pa + ((uint64_t)i << PAGE_SHIFT);
+		lv3_table[i] = (page_pa & PAGE_MASK) | page_attr_base;
+	}
+
+	/* 将 L2 entry 改为 table descriptor */
+	*l2_entry_p = (lv3_table_pa & PAGE_MASK) | 0x3;  /* table = bits[1:0]=11 */
+
+	/* 刷新 TLB */
+	asm volatile("tlbi vmalle1" ::: "memory");
+	asm volatile("dsb ish" ::: "memory");
+	asm volatile("isb" ::: "memory");
+
+	/* 更新计数 */
+	task->mm.huge_pages_count--;
+	task->mm.user_pages_count += 512;
+	task->mm.kernel_pages_count++;
+
+	return 0;
+}
+
+/*
+ * Phase 23: 页面回收 — 时钟算法（CLOCK / second-chance）
+ *
+ * 原理：
+ *   利用页表的 AF (Access Flag) 位跟踪页面访问情况。
+ *   - 页面首次映射时 AF=1
+ *   - 时钟扫描时清除 AF 位（给"第二次机会"）
+ *   - 如果 Guest 访问了页面，硬件会重新设置 AF=1（通过 Access Flag Fault）
+ *   - 下次扫描时如果 AF=0，说明这段时间没被访问过 → 回收
+ *
+ * 算法流程：
+ *   从 clock_hand 开始扫描页表：
+ *     - entry 是大页 (block) 且 AF=0 → 整体回收（512 页）
+ *     - entry 是大页 (block) 且 AF=1 → 清除 AF 位，指针前进 2MB
+ *     - entry 是小页 (page) 且 AF=0 → 回收（1 页）
+ *     - entry 是小页 (page) 且 AF=1 → 清除 AF 位，指针前进 4KB
+ *     - entry 空 → 指针前进 4KB，不计数
+ *
+ *   最多扫描 2 * total_mapped_pages 个映射页（约两圈），
+ *   达到目标回收数或扫完两圈就停止。
+ *
+ * 返回：实际回收的 4KB 页面数
+ */
+int reclaim_pages(struct task_struct *task, int nr_pages)
+{
+	int reclaimed = 0;
+	int total_pages;
+	int max_scan;
+	int scanned_mapped = 0;  /* 已扫描的有映射页面数（按 4KB 计） */
+
+	if (!task || !task->mm.first_table || nr_pages <= 0)
+		return 0;
+
+	total_pages = task->mm.user_pages_count + task->mm.huge_pages_count * 512;
+	if (total_pages == 0)
+		return 0;
+
+	/*
+	 * 渐进式回收：每次最多扫描一圈映射的页面。
+	 *   - 第一遍遇到 AF=1 → 清 AF（给第二次机会）
+	 *   - 第二遍（下次调用）遇到 AF=0 → 回收
+	 *
+	 * 这样 Guest 在两次回收之间有机会运行，
+	 * 活跃页面的 AF 会被重新设置（通过 Access Flag Fault），
+	 * 不活跃页面保持 AF=0 并被回收。
+	 */
+	max_scan = total_pages;
+
+	while (reclaimed < nr_pages && scanned_mapped < max_scan) {
+		vaddr_t ipa = task->mm.clock_hand;
+		paddr_t lv1_table = task->mm.first_table;
+		int idx1, idx2, idx3;
+		uint64_t entry;
+
+		idx1 = (ipa >> LV1_SHIFT) & (PTRS_PER_TABLE - 1);
+		entry = ((uint64_t *)TO_VADDR(lv1_table))[idx1];
+		if ((entry & 0x3) != 3) {
+			/* L1 无效 → 整个 1GB 都没映射，跳过整个 1GB */
+			task->mm.clock_hand = (ipa & ~((1ULL << LV1_SHIFT) - 1)) +
+					      (1ULL << LV1_SHIFT);
+			/* 检查是否回绕 */
+			if (task->mm.clock_hand == 0)
+				task->mm.clock_hand = 0;  /* 从 0 开始 */
+			continue;
+		}
+
+		/* 确保 L1 table entry 有 AF 位（旧的 entry 可能没有） */
+		if ((entry & MM_STAGE2_ACCESS) == 0) {
+			entry |= MM_STAGE2_ACCESS;
+			((uint64_t *)TO_VADDR(lv1_table))[idx1] = entry;
+		}
+
+		paddr_t lv2_table_pa = entry & PAGE_MASK;
+		idx2 = (ipa >> LV2_SHIFT) & (PTRS_PER_TABLE - 1);
+		entry = ((uint64_t *)TO_VADDR(lv2_table_pa))[idx2];
+
+		if ((entry & 0x3) == 1) {
+			/* L2 block（2MB 大页） */
+			scanned_mapped += 512;
+
+			if (entry & MM_STAGE2_ACCESS) {
+				/* AF=1 → 清除 AF 位，给第二次机会 */
+				entry &= ~MM_STAGE2_ACCESS;
+				((uint64_t *)TO_VADDR(lv2_table_pa))[idx2] = entry;
+			} else {
+				/* AF=0 → 回收整个大页 */
+				vaddr_t block_va = ipa & ~((1ULL << LV2_SHIFT) - 1);
+				unmap_stage2_block(task, block_va, 1);
+				reclaimed += 512;
+			}
+
+			/* 指针前进 2MB */
+			task->mm.clock_hand = (ipa & ~((1ULL << LV2_SHIFT) - 1)) +
+					      (1ULL << LV2_SHIFT);
+
+		} else if ((entry & 0x3) == 3) {
+			/* L2 → L3 table */
+
+			/* 确保 L2 table entry 有 AF 位（旧的 entry 可能没有） */
+			if ((entry & MM_STAGE2_ACCESS) == 0) {
+				entry |= MM_STAGE2_ACCESS;
+				((uint64_t *)TO_VADDR(lv2_table_pa))[idx2] = entry;
+			}
+
+			paddr_t lv3_table_pa = entry & PAGE_MASK;
+			idx3 = (ipa >> PAGE_SHIFT) & (PTRS_PER_TABLE - 1);
+			uint64_t *l3_entry_p =
+				&((uint64_t *)TO_VADDR(lv3_table_pa))[idx3];
+			entry = *l3_entry_p;
+
+			if ((entry & 0x3) == 0x3) {
+				/* L3 page（4KB 小页） */
+				scanned_mapped++;
+
+				if (entry & MM_STAGE2_ACCESS) {
+					/* AF=1 → 清除 AF 位 */
+					entry &= ~MM_STAGE2_ACCESS;
+					*l3_entry_p = entry;
+				} else {
+					/* AF=0 → 回收该页 */
+					vaddr_t page_va = ipa & PAGE_MASK;
+					unmap_stage2_page(task, page_va, 1);
+					reclaimed++;
+				}
+			}
+			/* 空 entry: scanned_mapped 不增加 */
+
+			/* 指针前进 4KB */
+			task->mm.clock_hand = (ipa & PAGE_MASK) + PAGE_SIZE;
+
+		} else {
+			/* L2 空 entry → 前进 4KB（到下一个 L3 slot） */
+			task->mm.clock_hand = (ipa & PAGE_MASK) + PAGE_SIZE;
+		}
+
+		/* 地址空间回绕：32-bit IPA (4GB) 后回到 0 */
+		if (task->mm.clock_hand >= (1ULL << 32))
+			task->mm.clock_hand = 0;
+	}
+
+	/* 刷新 TLB（批量操作后统一刷新） */
+	if (scanned_mapped > 0) {
+		asm volatile("tlbi vmalle1" ::: "memory");
+		asm volatile("dsb ish" ::: "memory");
+		asm volatile("isb" ::: "memory");
+	}
+
+	/* 更新统计 */
+	task->mm.reclaim_count += reclaimed;
+	if (reclaimed == 0 && nr_pages > 0)
+		task->mm.reclaim_fail_count++;
+
+	return reclaimed;
+}
+
+/*
+ * Phase 23: 查询回收统计
+ */
+int get_reclaim_stats(struct task_struct *task, int *reclaim_count,
+		      int *reclaim_fail_count)
+{
+	if (!task)
+		return -1;
+	if (reclaim_count)
+		*reclaim_count = task->mm.reclaim_count;
+	if (reclaim_fail_count)
+		*reclaim_fail_count = task->mm.reclaim_fail_count;
+	return 0;
+}
+
 int handle_mem_abort(vaddr_t addr, uint64_t esr)
 {
 	struct pt_regs *regs = task_pt_regs(current);
 	uint64_t dfsc = esr & ISS_ABORT_DFSC_MASK;
 	const struct board_ops *ops = current->board_ops;
-	vaddr_t ipa = get_ipa(addr);
+	vaddr_t ipa;
+
+	/*
+	 * S1PTW (bit 7): Stage 1 translation table walk fault.
+	 *   S1PTW=1: Stage-2 fault 发生在 Stage-1 页表遍历过程中。
+	 *            FAR_EL2 = 触发翻译的虚拟地址（不是 fault 地址）。
+	 *            HPFAR_EL2 = Stage-2 fault 的真实 IPA。
+	 *   S1PTW=0: 普通的 Stage-2 fault。
+	 *            FAR_EL2 = 触发 fault 的虚拟地址。
+	 */
+	if (esr & (1 << 7)) {
+		uint64_t hpfar;
+		asm volatile("mrs %0, hpfar_el2" : "=r"(hpfar));
+		/* HPFAR 格式：IPA[39:12] 存放在 bits [31:4]，
+		 * bit 0=F, bits[3:1]=RES0。
+		 * 即 ipa = (hpfar & ~0xF) << 8 */
+		ipa = (hpfar & 0xFFFFFFFFF0ULL) << 8;
+	} else {
+		ipa = get_ipa(addr);
+	}
+
+	/*
+	 * Phase 23: Access Flag Fault
+	 *   dfsc >> 2 == 0x2 → Access flag fault (level 0-3)
+	 *   处理：设置页表 entry 的 AF 位，刷新 TLB，返回重试
+	 */
+	if ((dfsc >> 2) == 0x2) {
+		if (handle_access_flag_fault(current, ipa) == 0)
+			return 0;
+		/* 如果不是 AF fault（比如 entry 不存在），继续后面的处理 */
+	}
+
+	/*
+	 * 容错处理：QEMU 可能将某些 Stage-2 Access Flag Fault 误报为
+	 * Translation Fault（特别是 S1PTW=1 时，即 Stage-1 页表遍历
+	 * 过程中发生的 Stage-2 AF fault）。对于 translation fault，
+	 * 先尝试按 AF fault 处理：如果 entry 存在但 AF=0，设置 AF
+	 * 位并刷新 TLB。
+	 */
+	if ((dfsc >> 2) == 0x1) {
+		if (handle_access_flag_fault(current, ipa) == 0)
+			return 0;
+	}
 
 	/*
 	 * 检查是否是 MMIO 地址：
@@ -773,13 +1153,79 @@ int handle_mem_abort(vaddr_t addr, uint64_t esr)
 	int is_mmio = 0;
 
 	if ((dfsc >> 2) == 0x3) {
-		/* permission fault -> 肯定是 MMIO */
-		is_mmio = 1;
+		/* Phase 21 fix: permission fault 不一定是 MMIO！
+		 * 可能是 mprotect 设置的权限限制（RO/NONE）。
+		 * 需要先判断是否是 MMIO 地址。 */
+		if (HAVE_FUNC(ops, is_mmio_addr) &&
+		    ops->is_mmio_addr(current, ipa))
+			is_mmio = 1;
 	} else if ((dfsc >> 2) == 0x1) {
 		/* translation fault -> 检查是否是 MMIO 区域 */
 		if (HAVE_FUNC(ops, is_mmio_addr) &&
 		    ops->is_mmio_addr(current, ipa))
 			is_mmio = 1;
+	}
+
+	/*
+	 * Phase 21: 非 MMIO 的 Permission Fault → mprotect 导致的权限错误
+	 * 需要把异常转发给 Guest（模拟 Guest 自己发生了 Data Abort）。
+	 *
+	 * 注入方式：
+	 *   - 修改 current->cpu_sysregs 中的 EL1 系统寄存器
+	 *     （elr_el1, esr_el1, far_el1, spsr_el1）
+	 *   - 修改 pt_regs.pc，让 Guest 返回到向量表入口
+	 *   - 注意：不能直接 msr 写物理寄存器，因为 kernel_exit 里的
+	 *     vm_entering_work → restore_sysregs 会从 cpu_sysregs
+	 *     恢复所有 EL1 寄存器，覆盖直接写入的值。
+	 */
+	if ((dfsc >> 2) == 0x3 && !is_mmio) {
+		uint64_t vbar = current->cpu_sysregs.vbar_el1;
+		uint64_t elr = regs->pc;
+		uint64_t spsr = regs->pstate;
+
+		/* 模拟 Guest Data Abort：
+		 *   ESR_EL1: EC=0x25 (Data Abort, same EL),
+		 *   IL=1 (32-bit instruction), ISV=1
+		 *   SAS, SRT, SF, WnR, DFSC 从原始 ESR 透传
+		 *
+		 * ESR Data Abort 位域：
+		 *   EC[31:26], IL[25], ISV[24], SAS[23:22], SSE[21],
+		 *   SRT[20:16], SF[15], AR[14], VNCR[13], LST[12:11],
+		 *   FnV[10], EA[9], CM[8], S1PTW[7], WnR[6], DFSC[5:0]
+		 */
+		uint64_t srt = (esr >> 16) & 0x1f;
+		uint64_t wnr = (esr >> 6) & 0x1;
+		uint64_t sf  = (esr >> 15) & 0x1;
+		uint64_t sas = (esr >> 22) & 0x3;
+		uint64_t sse = (esr >> 21) & 0x1;
+		uint64_t guest_esr =
+			(0x25ULL << 26) | /* EC: Data Abort, same EL */
+			(1ULL << 25)     | /* IL = 1 (32-bit) */
+			(1ULL << 24)     | /* ISV = 1 */
+			(sas << 22)      | /* SAS */
+			(sse << 21)      | /* SSE */
+			(srt << 16)      | /* SRT */
+			(sf  << 15)      | /* SF */
+			(wnr << 6)       | /* WnR */
+			(dfsc & 0x3f);     /* DFSC */
+
+		/* 修改 cpu_sysregs 中的 EL1 寄存器（restore_sysregs 时生效）
+		 * 注意：不能直接 msr 写物理寄存器，因为 kernel_exit 里的
+		 * vm_entering_work → restore_sysregs 会从 cpu_sysregs
+		 * 恢复所有 EL1 寄存器，覆盖直接写入的值。 */
+		current->cpu_sysregs.elr_el1 = elr;
+		current->cpu_sysregs.esr_el1 = guest_esr;
+		current->cpu_sysregs.far_el1 = addr;
+		current->cpu_sysregs.spsr_el1 = spsr;
+
+		/* 跳转到 Guest 向量表：Current EL with SPx → offset 0x200 */
+		regs->pc = vbar + 0x200;
+
+		/* 模拟异常进入：设置 DAIF 屏蔽（和硬件自动行为一致）
+		 * Guest 已经在 EL1h，所以 M 位不变 */
+		regs->pstate |= (0xf << 6);
+
+		return 0;
 	}
 
 	if (is_mmio) {
@@ -824,9 +1270,14 @@ int handle_mem_abort(vaddr_t addr, uint64_t esr)
 		// translation fault -> demand paging
 		/* Phase 22: 配额检查：超出则拒绝分配 */
 		if (quota_check(current, PAGE_SIZE) < 0) {
-			WARN("demand page: quota exceeded (vm=%d, ipa=0x%lx)",
-			     current->pid, ipa & PAGE_MASK);
-			return -1;
+			/* Phase 23: 配额不足时先尝试回收页面 */
+			int reclaimed = reclaim_pages(current, 1);
+			if (reclaimed <= 0 || quota_check(current, PAGE_SIZE) < 0) {
+				WARN("demand page: quota exceeded (vm=%d, ipa=0x%lx)",
+				     current->pid, ipa & PAGE_MASK);
+				return -1;
+			}
+			/* 回收成功，继续分配 */
 		}
 
 		paddr_t page = get_free_page(get_page_pool());
@@ -948,6 +1399,16 @@ int hyp_mem_map(paddr_t ipa, uint64_t flags)
 		WARN("hyp_mem_map: ipa 0x%lx already mapped",
 		     (unsigned long)ipa);
 		return -1;
+	}
+
+	/* Phase 23: 配额检查，不足则尝试回收 */
+	if (quota_check(current, PAGE_SIZE) < 0) {
+		int reclaimed = reclaim_pages(current, 1);
+		if (reclaimed <= 0 || quota_check(current, PAGE_SIZE) < 0) {
+			WARN("hyp_mem_map: quota exceeded (ipa=0x%lx)",
+			     (unsigned long)(ipa & PAGE_MASK));
+			return -1;
+		}
 	}
 
 	/* 分配物理页 */

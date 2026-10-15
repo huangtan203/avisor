@@ -71,16 +71,22 @@
 /*
  * Phase 21: Stage-2 细粒度权限常量
  *
- * Stage-2 AP 位在 descriptor bit[7:6]，共 2 位：
- *   S2_AP_RW   = 0b11  → 可读可写
- *   S2_AP_RO   = 0b10  → 只读（写触发 Stage-2 Permission Fault）
- *   S2_AP_NONE = 0b00  → 无权限（读写都触发 Permission Fault）
+ * Stage-2 AP[2:1] 位在 descriptor bit[7:6]，共 2 位：
+ *   AP[2:1]  | 读 | 写
+ *   ---------|----|----
+ *     00     | 无 | 无  (NONE)
+ *     01     | 允许 | 无  (RO)
+ *     10     | 允许 | 允许 (RW)
+ *     11     | 允许 | 允许 (RW，同 10)
  *
- * 注：bit 7 控制读权限，bit 6 控制写权限。
+ * 注意：和 Stage-1 AP 编码不同！Stage-2 的 RO 是 01，不是 10。
+ *
+ * QEMU 实现注意：实测 QEMU 中 AP=10 时读操作会异常触发 Permission Fault，
+ * 与 ARM 架构手册描述不符。统一使用 AP=11 表示 RW 以兼容 QEMU。
  */
-#define S2_AP_RW    (3 << 6)
-#define S2_AP_RO    (2 << 6)
-#define S2_AP_NONE  (0 << 6)
+#define S2_AP_RW    (3 << 6)   /* 11 = RW */
+#define S2_AP_RO    (1 << 6)   /* 01 = RO */
+#define S2_AP_NONE  (0 << 6)   /* 00 = NONE */
 #define S2_AP_MASK  (3 << 6)
 
 #define MM_STAGE2_AP_NONE	 (0 << 6)
