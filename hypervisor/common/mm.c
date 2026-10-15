@@ -947,6 +947,20 @@ int split_stage2_block(struct task_struct *task, vaddr_t va)
  *
  * 返回：实际回收的 4KB 页面数
  */
+
+/*
+ * Guest 静态内存保护阈值（virt 平台）。
+ *
+ * Guest 的代码镜像（load_addr=0x40000000）、堆和栈（栈顶 GUEST_STACK_TOP
+ * =0x40400000）都位于 IPA 前 4MB。这些页面是 Guest 运行所必需的：
+ * 一旦被回收，下次中断会跳到向量表，而向量表所在的页已被 unmap 并
+ * 在 demand paging 时被清零，导致 Guest 执行零字节后崩溃。
+ *
+ * 因此回收时钟算法必须跳过这段"Guest 内核区"，只回收 Guest 显式
+ * 申请的数据页（测试页都在 0x48000000 以上）。
+ */
+#define GUEST_STATIC_REGION_END 0x40400000UL
+
 int reclaim_pages(struct task_struct *task, int nr_pages)
 {
 	int reclaimed = 0;
@@ -1002,22 +1016,23 @@ int reclaim_pages(struct task_struct *task, int nr_pages)
 
 		if ((entry & 0x3) == 1) {
 			/* L2 block（2MB 大页） */
+			vaddr_t block_va = ipa & ~((1ULL << LV2_SHIFT) - 1);
 			scanned_mapped += 512;
 
-			if (entry & MM_STAGE2_ACCESS) {
+			if (block_va < GUEST_STATIC_REGION_END) {
+				/* Guest 静态内核区 → 跳过，不回收 */
+			} else if (entry & MM_STAGE2_ACCESS) {
 				/* AF=1 → 清除 AF 位，给第二次机会 */
 				entry &= ~MM_STAGE2_ACCESS;
 				((uint64_t *)TO_VADDR(lv2_table_pa))[idx2] = entry;
 			} else {
 				/* AF=0 → 回收整个大页 */
-				vaddr_t block_va = ipa & ~((1ULL << LV2_SHIFT) - 1);
 				unmap_stage2_block(task, block_va, 1);
 				reclaimed += 512;
 			}
 
 			/* 指针前进 2MB */
-			task->mm.clock_hand = (ipa & ~((1ULL << LV2_SHIFT) - 1)) +
-					      (1ULL << LV2_SHIFT);
+			task->mm.clock_hand = block_va + (1ULL << LV2_SHIFT);
 
 		} else if ((entry & 0x3) == 3) {
 			/* L2 → L3 table */
@@ -1036,15 +1051,17 @@ int reclaim_pages(struct task_struct *task, int nr_pages)
 
 			if ((entry & 0x3) == 0x3) {
 				/* L3 page（4KB 小页） */
+				vaddr_t page_va = ipa & PAGE_MASK;
 				scanned_mapped++;
 
-				if (entry & MM_STAGE2_ACCESS) {
+				if (page_va < GUEST_STATIC_REGION_END) {
+					/* Guest 静态内核区 → 跳过，不回收 */
+				} else if (entry & MM_STAGE2_ACCESS) {
 					/* AF=1 → 清除 AF 位 */
 					entry &= ~MM_STAGE2_ACCESS;
 					*l3_entry_p = entry;
 				} else {
 					/* AF=0 → 回收该页 */
-					vaddr_t page_va = ipa & PAGE_MASK;
 					unmap_stage2_page(task, page_va, 1);
 					reclaimed++;
 				}

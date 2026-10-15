@@ -551,6 +551,32 @@ void virt_board_set_ivshmem_peer(struct task_struct *tsk, int peer_id)
         ivshmem_set_peer_id(&devs->ivshmem, peer_id);
 }
 
+/*
+ * Phase 25: 迁移时把源 VM 的 vGIC MMIO 状态拷贝到目标 VM。
+ *
+ * 注意：struct vgic_rdist 是 44 字节（非 8 的倍数），不能直接 memcpy
+ * （utils.S 的 memcpy 以 8 字节批量 ldr/str 步进，会越界写 4 字节），
+ * 所以 vgicr 逐字段拷贝；vgic_dist 是 1280 字节（8 对齐），可整块 memcpy。
+ */
+void virt_copy_vgic_state(struct task_struct *dst, struct task_struct *src)
+{
+    struct virt_vm_devices *sd = (struct virt_vm_devices *)src->board_data;
+    struct virt_vm_devices *dd = (struct virt_vm_devices *)dst->board_data;
+
+    if (!sd || !dd)
+        return;
+
+    /* 1280 字节，8 对齐，安全 */
+    memcpy(&dd->vgicd, &sd->vgicd, sizeof(struct vgic_dist));
+
+    /* 44 字节，逐字段拷贝（见上） */
+    dd->vgicr.ctlr = sd->vgicr.ctlr;
+    dd->vgicr.ppi_enable = sd->vgicr.ppi_enable;
+    dd->vgicr.pending = sd->vgicr.pending;
+    for (int i = 0; i < 32; i++)
+        dd->vgicr.priority[i] = sd->vgicr.priority[i];
+}
+
 /* ---------- 世界切换 ---------- */
 
 static void virt_leaving_vm(struct task_struct *tsk)

@@ -59,3 +59,8 @@ int virt_vgicr_ppi_enabled(struct task_struct *vm, uint32_t vintid);
  * SGI/PPI 查 GICR、SPI 查 GICD、LPI 返回默认 0xA0。
  * 供 vgic.c 注入路径把优先级写入 ICH_LR 的 Priority 字段。 */
 uint8_t virt_vgic_vintid_priority(struct task_struct *vm, uint32_t vintid);
+
+/* Phase 25: 迁移时把源 VM 的 vGIC MMIO 状态（GICD/GICR）拷贝到目标 VM。
+ * 注意 vgic_rdist 为 44 字节（非 8 的倍数），不能用 memcpy 整块拷贝，
+ * 内部对 vgicr 逐字段拷贝；vgic_dist（1280 字节）用 memcpy。 */
+void virt_copy_vgic_state(struct task_struct *dst, struct task_struct *src);

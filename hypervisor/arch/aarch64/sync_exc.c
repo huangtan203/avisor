@@ -14,6 +14,7 @@
 #include "common/irq.h"
 #include "common/mm.h"
 #include "common/ksm.h"
+#include "common/migration.h"
 #include "arch/aarch64/mmu.h"
 #include "common/sched.h"
 #include "common/task.h"
@@ -381,6 +382,16 @@ void handle_hvc64(unsigned long hvc_nr)
 		regs->regs[0] = vgic_inject_virq((uint32_t)regs->regs[0]);
 		break;
 
+	/* Phase 25: Live Migration 热迁移 hypercall */
+	case HVC_MIGRATE_START:
+		regs->regs[0] = migration_start(current);
+		break;
+	case HVC_MIGRATE_PRECOPY:
+		regs->regs[0] = migration_precopy(current);
+		break;
+	case HVC_MIGRATE_FINISH:
+		regs->regs[0] = migration_finish(current);
+		break;
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);

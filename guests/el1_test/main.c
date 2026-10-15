@@ -3263,6 +3263,130 @@ done24_cleanup:
     return passed;
 }
 
+#define PHASE25_BASE_IPA    0x70000000  /* 迁移测试专用内存区（与 Phase24 的 0x60000000 错开） */
+#define PHASE25_PAGE_SIZE   4096
+#define PHASE25_TOTAL_PAGES 8           /* 8 页迁移测试内存 */
+#define PHASE25_DIRTY_PAGES 4           /* 制造脏页的前 4 页 */
+
+/*
+ * Phase 25: Live Migration 热迁移测试
+ *
+ * 仅 VM2（vmid==2）的主核发起迁移，把自身迁移到 dormant VM3（vmid=3）。
+ * 迁移流程：START（清 AF + 全量拷贝）→ 修改页面制造脏页 →
+ * PRECOPY（迭代预拷贝）→ FINISH（stop-and-copy + 状态转移）。
+ * FINISH 之后 vCPU 已在 VM3 上恢复执行，后续代码在 VM3 上运行，
+ * 通过 guest_vmid() 验证 vmid 变为 3，并校验迁移后内存内容。
+ */
+static int test_phase25_migration(void)
+{
+    int passed = 1;
+    int ret;
+    int i;
+    volatile unsigned char *base;
+    int precopy_dirty;
+    int finish_dirty;
+    u64 new_vmid;
+
+    guest_puts("\n--- Test 18: Phase 25 Live Migration ---\n");
+
+    /* 1. 分配迁移测试内存（8 页） */
+    base = (volatile unsigned char *)PHASE25_BASE_IPA;
+    for (i = 0; i < PHASE25_TOTAL_PAGES; i++) {
+        ret = hvc_call2(HVC_MEM_MAP,
+                        PHASE25_BASE_IPA + i * PHASE25_PAGE_SIZE, 0);
+        if (ret != 0) {
+            guest_puts("  FAIL: 映射测试页失败 (page ");
+            puts_dec(i);
+            guest_puts(")\n");
+            passed = 0;
+            goto done25;
+        }
+    }
+    guest_puts("  [1] 分配 8 页迁移测试内存\n");
+
+    /* 2. 写入初始内容（每页一个独特模式 0x50..0x57） */
+    for (i = 0; i < PHASE25_TOTAL_PAGES; i++) {
+        volatile unsigned char *p = base + i * PHASE25_PAGE_SIZE;
+        unsigned char pattern = (unsigned char)(0x50 + i);
+        for (int j = 0; j < PHASE25_PAGE_SIZE; j++)
+            p[j] = pattern;
+    }
+    guest_puts("  [2] 写入初始内容（每页一个独特模式）\n");
+
+    /* 3. START：清 AF（开启脏页跟踪）+ 全量拷贝 */
+    ret = (int)hvc_call(HVC_MIGRATE_START, 0);
+    if (ret != 0) {
+        guest_puts("  FAIL: HVC_MIGRATE_START 返回 ");
+        puts_dec(ret);
+        guest_puts("\n");
+        passed = 0;
+        goto done25;
+    }
+    guest_puts("  [3] START：清 AF + 全量拷贝完成\n");
+
+    /* 4. 制造脏页：修改前 4 页内容（0xA0..0xA3） */
+    for (i = 0; i < PHASE25_DIRTY_PAGES; i++) {
+        volatile unsigned char *p = base + i * PHASE25_PAGE_SIZE;
+        unsigned char pattern = (unsigned char)(0xA0 + i);
+        for (int j = 0; j < PHASE25_PAGE_SIZE; j++)
+            p[j] = pattern;
+    }
+    guest_puts("  [4] 修改前 4 页内容（制造脏页）\n");
+
+    /* 5. PRECOPY：迭代预拷贝，收集并拷贝 AF=1 的脏页 */
+    precopy_dirty = (int)hvc_call(HVC_MIGRATE_PRECOPY, 0);
+    guest_puts("  [5] PRECOPY：本轮拷贝脏页数 = ");
+    puts_dec(precopy_dirty);
+    guest_puts("\n");
+    if (precopy_dirty < PHASE25_DIRTY_PAGES) {
+        guest_puts("  WARN: 脏页数偏少（预期 >= 4）\n");
+    }
+
+    /* 6. FINISH：stop-and-copy + 状态转移。
+     *    执行完这一句后 vCPU 已迁移到 VM3（vmid=3），
+     *    以下所有代码（含 guest_puts）都在 VM3 上运行。 */
+    finish_dirty = (int)hvc_call(HVC_MIGRATE_FINISH, 0);
+    guest_puts("  [6] FINISH：完成迁移，最后一轮脏页数 = ");
+    puts_dec(finish_dirty);
+    guest_puts("\n");
+
+    /* 7. 验证迁移后 vmid 变为 3（fresh 查询，不能沿用 guest_main 里缓存的 vmid） */
+    new_vmid = guest_vmid();
+    guest_puts("  [7] 迁移后 VMID = ");
+    puts_dec(new_vmid);
+    guest_puts("\n");
+    if (new_vmid != 3) {
+        guest_puts("  FAIL: 迁移后 VMID 不是 3\n");
+        passed = 0;
+    }
+
+    /* 8. 验证迁移后内存内容：前 4 页 = 0xA0..0xA3，后 4 页 = 0x54..0x57 */
+    guest_puts("  [8] 验证迁移后内存内容...\n");
+    for (i = 0; i < PHASE25_TOTAL_PAGES; i++) {
+        volatile unsigned char *p = base + i * PHASE25_PAGE_SIZE;
+        unsigned char expected = (i < PHASE25_DIRTY_PAGES)
+                                     ? (unsigned char)(0xA0 + i)
+                                     : (unsigned char)(0x50 + i);
+        if (p[0] != expected || p[PHASE25_PAGE_SIZE - 1] != expected) {
+            guest_puts("  FAIL: 第 ");
+            puts_dec(i);
+            guest_puts(" 页内容错误\n");
+            passed = 0;
+            break;
+        }
+    }
+    if (passed)
+        guest_puts("  [8] 迁移后内存内容正确\n");
+
+    if (passed)
+        guest_puts("  PASSED: Live Migration 成功（VM2 -> VM3）\n");
+    else
+        guest_puts("  FAILED\n");
+
+done25:
+    return passed;
+}
+
 static void vits_test(void)
 {
     guest_puts("\n--- Test 4: vITS (virtual ITS) ---\n");
@@ -3651,6 +3775,9 @@ void guest_main(void)
 
     /* 测试 17: Phase 24 KSM 内存去重（主核单线程） */
     test_phase24_ksm();
+
+    /* 测试 18: Phase 25 Live Migration（仅 VM2 发起，迁移到 VM3） */
+    if (vmid == 2) test_phase25_migration();
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 

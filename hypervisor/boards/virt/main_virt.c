@@ -37,6 +37,7 @@
 #include "common/irq.h"
 #include "common/mm.h"
 #include "common/ksm.h"
+#include "common/migration.h"
 #include "common/printf.h"
 #include "common/sched.h"
 #include "common/smp.h"
@@ -326,6 +327,23 @@ void hypervisor_main()
             printf("[8.4] VM2 vcpu1 created (vmid=2, cpu1, pid=%d)\n", pid);
             /* 注册 vCPU 到板级查找表（用于 vSGI 等跨 vCPU 操作） */
             virt_register_vcpu(cpu1_tasks[pid], 2, 1);
+        }
+
+        /* Phase 25: 创建 dormant 迁移目标 VM3（vmid=3，单 vCPU，等待迁移恢复） */
+        {
+            int pid = create_task_on_cpu(0, migration_resume_loader, NULL);
+            if (pid < 0)
+                PANIC("failed to create VM3 (migration target)");
+            cpu0_tasks[pid]->vmid = 3;
+            cpu0_tasks[pid]->vcpu_id = 0;
+            cpu0_tasks[pid]->phys_cpu = 0;
+            cpu0_tasks[pid]->priority = 10;
+            cpu0_tasks[pid]->counter = 10;
+            cpu0_tasks[pid]->state = TASK_WAITING;  /* dormant，直到迁移 FINISH 唤醒 */
+            (void)strncpy(cpu0_tasks[pid]->name, "vm3-cpu0", 36);
+            virt_register_vcpu(cpu0_tasks[pid], 3, 0);
+            migration_set_dest(cpu0_tasks[pid]);
+            printf("[8.5] VM3 vcpu0 created (vmid=3, migration target, pid=%d)\n", pid);
         }
 
         /*
