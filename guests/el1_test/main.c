@@ -3322,6 +3322,13 @@ static int test_phase25_migration(void)
                 guest_puts("\n");
                 return 0;
             }
+            if (hvc_call_ret2(HVC_SMP_FREEZE_SNAPSHOT_STATUS, 1,
+                              &snapshot_generation) != 0) {
+                guest_puts("  FAIL: release 后冻结快照仍被标记有效，轮次 ");
+                puts_dec(i);
+                guest_puts("\n");
+                return 0;
+            }
         }
         guest_puts("  PASS: 双 vCPU 冻结/释放握手完成 100 轮\n");
         if (hvc_call(HVC_SMP_FREEZE_RELEASE, 0) != -1) {
