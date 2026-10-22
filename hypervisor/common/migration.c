@@ -197,8 +197,20 @@ void migration_set_dest(struct task_struct *dst)
 /* 迁移阶段一：清 AF（开脏页跟踪）+ 全量拷贝 */
 int migration_start(struct task_struct *src)
 {
-	if (!mig_dst || mig_active)
+	if (!src || !src->mm.first_table || !mig_dst || src == mig_dst ||
+	    src->state != TASK_RUNNING || mig_dst->state != TASK_WAITING ||
+	    src->vmid == mig_dst->vmid || mig_active)
 		return -1;
+
+#ifdef PLATFORM_VIRT
+	for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+		for (int i = 0; i < cpu_state[cpu].nr_tasks; i++) {
+			struct task_struct *vcpu = cpu_state[cpu].task[i];
+			if (vcpu && vcpu != src && vcpu->pid != 0 &&
+			    vcpu->vmid == src->vmid && vcpu->state != TASK_ZOMBIE)
+				return -1;
+		}
+#endif
 
 	mig_active = 1;
 
@@ -211,7 +223,8 @@ int migration_start(struct task_struct *src)
 /* 迁移阶段二：迭代预拷贝，返回本轮拷贝的脏页数 */
 int migration_precopy(struct task_struct *src)
 {
-	if (!mig_active || !mig_dst)
+	if (!src || !mig_active || !mig_dst || src->state != TASK_RUNNING ||
+	    mig_dst->state != TASK_WAITING)
 		return -1;
 
 	return mig_walk(src, MIG_OP_COLLECT_DIRTY);
@@ -227,7 +240,8 @@ int migration_finish(struct task_struct *src)
 {
 	int dirty;
 
-	if (!mig_active || !mig_dst)
+	if (!src || !mig_active || !mig_dst || src->state != TASK_RUNNING ||
+	    mig_dst->state != TASK_WAITING)
 		return -1;
 
 	/* 1. 最后一轮脏页拷贝 */

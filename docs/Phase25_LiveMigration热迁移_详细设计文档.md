@@ -8,13 +8,13 @@
 
 前面的 Phase 已经建立了完整的 VM 生命周期：创建、调度、内存虚拟化、中断虚拟化、设备直通。但一个生产级 Hypervisor 还需要**热迁移（Live Migration）**能力——在不中断 Guest 运行的前提下，把一个 VM 从一台物理机（或一个 Hypervisor 实例）迁移到另一台，用于负载均衡、硬件维护、故障规避。
 
-Phase 25 在单 Hypervisor 实例内实现了 **pre-copy 热迁移**的完整闭环：把源 VM（VM2）迁移到预先创建的 dormant 目标 VM（VM3），迁移过程中 Guest 几乎无感地继续运行，最终在目标 VM 上恢复执行。
+Phase 25 实现了单 Hypervisor 实例内两个 task 之间的 **pre-copy 迁移原型**。当前实现只转移发起迁移的 vCPU；当源 VM 含有其他 vCPU 时，Hypervisor 会拒绝启动迁移。因此当前版本不支持双 vCPU VM 的整体迁移，也不应视为生产级 Live Migration。
 
 ### 1.2 目标
 
 - ✅ 实现基于 Stage-2 AF 位的脏页跟踪
 - ✅ 实现迭代预拷贝（pre-copy）迁移流程
-- ✅ 实现 stop-and-copy：停止源 VM + 转移 vCPU / vGIC / 定时器状态
+- ⚠️ 单 vCPU stop-and-copy 原型；双 vCPU VM 整体停机和状态转移尚未实现
 - ✅ 实现目标 VM 的恢复执行路径（ERET 到 HVC+4）
 - ✅ 迁移后 Guest 可正确感知新的 VMID 并校验内存内容
 - ✅ 新增 3 个 HVC 接口：MIGRATE_START / PRECOPY / FINISH

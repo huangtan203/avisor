@@ -1481,11 +1481,8 @@ int hyp_mem_map(paddr_t ipa, uint64_t flags)
 int hyp_mem_unmap(paddr_t ipa)
 {
 	int ret = unmap_stage2_page(current, ipa, 1);
-	if (ret < 0) {
-		WARN("hyp_mem_unmap: ipa 0x%lx not mapped",
-		     (unsigned long)ipa);
+	if (ret < 0)
 		return -1;
-	}
 
 	INFO("hyp_mem_unmap: vm=%lu ipa=0x%lx",
 	     current->vmid, (unsigned long)(ipa & PAGE_MASK));

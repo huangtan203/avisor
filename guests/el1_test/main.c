@@ -2758,7 +2758,6 @@ done:
  *  10. 配额回退后分配恢复正常
  */
 #define PHASE22_HUGE_IPA     0x41000000UL  /* 16MB 处，2MB 对齐 */
-#define PHASE22_QUOTA_BYTES  (4 * 1024 * 1024UL)  /* 4MB 配额 */
 
 static void phase22_hugepage_quota_test(void)
 {
@@ -2767,6 +2766,7 @@ static void phase22_hugepage_quota_test(void)
     int passed = 1;
     u64 ret;
     u64 usage, quota, huge_count;
+    u64 quota_limit;
     volatile u64 *p = (volatile u64 *)PHASE22_HUGE_IPA;
 
     /* 1. 查询初始内存使用 */
@@ -2843,8 +2843,10 @@ static void phase22_hugepage_quota_test(void)
     /* 先恢复 RW，方便后续操作 */
     hvc_call2(HVC_MEM_HUGE_PROTECT, PHASE22_HUGE_IPA, 0);  /* 0 = RW */
 
-    /* 7. 设置内存配额（4MB） */
-    ret = hvc_call(HVC_MEM_SET_QUOTA, PHASE22_QUOTA_BYTES);
+    /* 7. 将配额设为当前用量，额外的大页申请应被拒绝 */
+    usage = hvc_call_ret3(HVC_MEM_QUERY, 0, &quota, &huge_count);
+    quota_limit = usage;
+    ret = hvc_call(HVC_MEM_SET_QUOTA, quota_limit);
     if (ret != 0) {
         guest_puts("  FAIL: 设置配额失败\n");
         passed = 0;
@@ -2854,9 +2856,9 @@ static void phase22_hugepage_quota_test(void)
 
     /* 验证配额已设置 */
     usage = hvc_call_ret3(HVC_MEM_QUERY, 0, &quota, &huge_count);
-    if (quota != PHASE22_QUOTA_BYTES) {
+    if (quota != quota_limit) {
         guest_puts("  FAIL: 配额查询不正确，期望 ");
-        puts_dec(PHASE22_QUOTA_BYTES);
+        puts_dec(quota_limit);
         guest_puts("，实际 ");
         puts_dec(quota);
         guest_puts("\n");
@@ -3282,6 +3284,16 @@ static int test_phase25_migration(void)
     int passed = 1;
     int ret;
     int i;
+
+    if (guest_vmid() == 2) {
+        ret = (int)hvc_call(HVC_MIGRATE_START, 0);
+        if (ret == -1) {
+            guest_puts("  PASS: 双 vCPU VM 迁移被安全拒绝（整 VM 协调尚未实现）\n");
+            return 1;
+        }
+        guest_puts("  FAIL: 双 vCPU VM 迁移未被拒绝\n");
+        return 0;
+    }
     volatile unsigned char *base;
     int precopy_dirty;
     int finish_dirty;
