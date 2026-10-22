@@ -94,6 +94,7 @@ typedef int bool;
 #define HVC_SMP_FREEZE_RELEASE  55
 #define HVC_SMP_FREEZE_ACK      56
 #define HVC_SMP_FREEZE_PROGRESS 57
+#define HVC_SMP_FREEZE_SNAPSHOT_STATUS 58
 
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60

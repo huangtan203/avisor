@@ -28,3 +28,4 @@ int smp_freeze_begin(int target_cpu);
 int smp_freeze_release(void);
 unsigned long smp_freeze_progress(int cpu);
 unsigned long smp_freeze_ack(int cpu);
+int smp_freeze_snapshot_status(int cpu, unsigned long *generation);

@@ -3302,7 +3302,11 @@ static int test_phase25_migration(void)
             }
 
             ack = hvc_call(HVC_SMP_FREEZE_ACK, 1);
-            if (ack == 0 ||
+            u64 snapshot_generation = 0;
+            u64 snapshot_valid = hvc_call_ret2(
+                HVC_SMP_FREEZE_SNAPSHOT_STATUS, 1, &snapshot_generation);
+            if (ack == 0 || snapshot_valid != 1 ||
+                snapshot_generation != ack ||
                 hvc_call(HVC_SMP_FREEZE_PROGRESS, 1) != progress + 1) {
                 guest_puts("  FAIL: 冻结 ACK/进展计数无效，轮次 ");
                 puts_dec(i);

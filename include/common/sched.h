@@ -192,6 +192,8 @@ struct vm_virt_state {
 };
 
 struct freeze_context {
+	struct cpu_sysregs cpu_sysregs;
+	struct vm_virt_state virt;
 	unsigned long regs[31];
 	unsigned long sp;
 	unsigned long pc;

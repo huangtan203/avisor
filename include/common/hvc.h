@@ -71,3 +71,4 @@
 #define HVC_SMP_FREEZE_RELEASE  55  /* 释放已冻结的目标物理核 */
 #define HVC_SMP_FREEZE_ACK      56  /* x0=核号，返回该核 ACK generation */
 #define HVC_SMP_FREEZE_PROGRESS 57  /* x0=核号，返回冻结处理次数 */
+#define HVC_SMP_FREEZE_SNAPSHOT_STATUS 58 /* x0=核号，返回 x0=有效 x1=generation */

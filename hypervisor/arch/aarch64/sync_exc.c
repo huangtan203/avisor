@@ -419,6 +419,14 @@ void handle_hvc64(unsigned long hvc_nr)
 			 smp_processor_id() == 0)
 				? smp_freeze_progress((int)regs->regs[0]) : 0;
 		break;
+	case HVC_SMP_FREEZE_SNAPSHOT_STATUS:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_freeze_snapshot_status((int)regs->regs[0],
+							    &regs->regs[1])
+				: 0;
+		break;
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);

@@ -12,10 +12,13 @@
  * Group 1 后，即触发一次 IRQ 陷入 EL2。
  */
 
+#include "boards/virt/arch_timer.h"
 #include "boards/virt/gicv3.h"
 #include "boards/virt/vgic.h"
+#include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
 #include "common/smp.h"
+#include "common/utils.h"
 #include "common/task.h"
 
 /* 各核就绪标志：次核在 hypervisor_secondary_main 开中断后置 1 */
@@ -182,6 +185,25 @@ unsigned long smp_freeze_ack(int cpu)
     return __atomic_load_n(&freeze_ack_generation[cpu], __ATOMIC_ACQUIRE);
 }
 
+int smp_freeze_snapshot_status(int cpu, unsigned long *generation)
+{
+    struct task_struct *target = freeze_target_task;
+    unsigned long active_generation =
+        __atomic_load_n(&freeze_generation, __ATOMIC_ACQUIRE);
+
+    if (cpu < 0 || cpu >= MAX_CPUS || cpu != freeze_target_cpu ||
+        !__atomic_load_n(&freeze_active, __ATOMIC_ACQUIRE) || !target ||
+        !target->freeze_context.active ||
+        target->freeze_context.generation != active_generation ||
+        __atomic_load_n(&freeze_ack_generation[cpu], __ATOMIC_ACQUIRE) !=
+            active_generation)
+        return 0;
+
+    if (generation)
+        *generation = target->freeze_context.generation;
+    return 1;
+}
+
 /*
  * 向指定物理核发送核间中断
  */
@@ -231,6 +253,16 @@ void smp_ipi_handle(int sgi_id)
             target->vcpu_id != 1 || target->vmid != 2 ||
             target->state != TASK_RUNNING)
             break;
+
+        memcpy(&target->freeze_context.cpu_sysregs, &target->cpu_sysregs,
+               sizeof(target->cpu_sysregs));
+        memcpy(&target->freeze_context.virt, &target->virt,
+               sizeof(target->virt));
+        vgic_save_state(&target->freeze_context.virt);
+        target->freeze_context.virt.cntv_ctl = READ_SYSREG64(CNTV_CTL_EL0);
+        target->freeze_context.virt.cntv_cval = READ_SYSREG64(CNTV_CVAL_EL0);
+        target->freeze_context.virt.vtimer_pending =
+            !!(target->freeze_context.virt.cntv_ctl & TIMER_CTL_ISTATUS);
 
         regs = task_pt_regs(target);
         for (int i = 0; i < 31; i++)
