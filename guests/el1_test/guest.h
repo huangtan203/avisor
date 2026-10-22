@@ -90,6 +90,10 @@ typedef int bool;
 #define HVC_MIGRATE_PRECOPY  51
 #define HVC_MIGRATE_FINISH   52
 #define HVC_MIGRATE_STATUS   53
+#define HVC_SMP_FREEZE_BEGIN    54
+#define HVC_SMP_FREEZE_RELEASE  55
+#define HVC_SMP_FREEZE_ACK      56
+#define HVC_SMP_FREEZE_PROGRESS 57
 
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60

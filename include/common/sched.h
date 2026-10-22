@@ -191,8 +191,18 @@ struct vm_virt_state {
 	unsigned int vgic_ipi_vintid;   /* 跨核 vGIC 注入：待注入的虚拟中断号 */
 };
 
+struct freeze_context {
+	unsigned long regs[31];
+	unsigned long sp;
+	unsigned long pc;
+	unsigned long pstate;
+	unsigned long generation;
+	int active;
+};
+
 struct task_struct {
 	struct cpu_context cpu_context;
+	struct freeze_context freeze_context;
 	long state;
 	long counter;
 	long priority;
@@ -341,7 +351,8 @@ extern void sched_wait(void);
 
 #define INIT_TASK                                                              \
 	{                                                                      \
-		/* cpu_context */ { 0 }, /* state etc */ 0, 0, 1, 0, 0,        \
+		/* cpu_context */ { 0 }, /* freeze_context */ { 0 },          \
+		/* state etc */ 0, 0, 1, 0, 0,                                \
 			/* vmid */ 0, /* flags */ 0, "", 0, 0,                 \
 			/* mm */ { 0 }, /* cpu_sysregs */ { 0 },               \
 			/* stat */ { 0 }, /* console */ { 0 },                 \

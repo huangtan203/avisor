@@ -24,3 +24,7 @@ void smp_send_ipi(int cpu, int sgi_id);
 
 /* 处理当前核收到的 SGI（在 irq.c 的 handle_irq 中分发调用） */
 void smp_ipi_handle(int sgi_id);
+int smp_freeze_begin(int target_cpu);
+int smp_freeze_release(void);
+unsigned long smp_freeze_progress(int cpu);
+unsigned long smp_freeze_ack(int cpu);

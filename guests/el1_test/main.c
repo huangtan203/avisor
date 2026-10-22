@@ -3287,7 +3287,45 @@ static int test_phase25_migration(void)
     u64 new_vmid;
 
     if (guest_vmid() == 2) {
-        guest_puts("\n--- Test 18: Phase 26 Migration State Machine ---\n");
+        guest_puts("\n--- Test 18: Phase 27 SMP Freeze Handshake ---\n");
+        u64 progress;
+        u64 ack;
+
+        for (i = 0; i < 100; i++) {
+            progress = hvc_call(HVC_SMP_FREEZE_PROGRESS, 1);
+            ret = (int)hvc_call(HVC_SMP_FREEZE_BEGIN, 1);
+            if (ret != 0) {
+                guest_puts("  FAIL: 冻结请求失败，轮次 ");
+                puts_dec(i);
+                guest_puts("\n");
+                return 0;
+            }
+
+            ack = hvc_call(HVC_SMP_FREEZE_ACK, 1);
+            if (ack == 0 ||
+                hvc_call(HVC_SMP_FREEZE_PROGRESS, 1) != progress + 1) {
+                guest_puts("  FAIL: 冻结 ACK/进展计数无效，轮次 ");
+                puts_dec(i);
+                guest_puts("\n");
+                (void)hvc_call(HVC_SMP_FREEZE_RELEASE, 0);
+                return 0;
+            }
+
+            ret = (int)hvc_call(HVC_SMP_FREEZE_RELEASE, 0);
+            if (ret != 0) {
+                guest_puts("  FAIL: 冻结释放失败，轮次 ");
+                puts_dec(i);
+                guest_puts("\n");
+                return 0;
+            }
+        }
+        guest_puts("  PASS: 双 vCPU 冻结/释放握手完成 100 轮\n");
+        if (hvc_call(HVC_SMP_FREEZE_RELEASE, 0) != -1) {
+            guest_puts("  FAIL: 无活动冻结时 release 应被拒绝\n");
+            return 0;
+        }
+        guest_puts("  PASS: 无活动冻结时重复 release 被拒绝\n");
+
         if (hvc_call(HVC_MIGRATE_STATUS, 0) != 0 ||
             hvc_call(HVC_MIGRATE_PRECOPY, 0) != -1 ||
             hvc_call(HVC_MIGRATE_STATUS, 0) != 0) {

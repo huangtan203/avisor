@@ -67,3 +67,7 @@
 #define HVC_MIGRATE_PRECOPY  51  /* 迭代预拷贝：收集并拷贝脏页，返回脏页数 */
 #define HVC_MIGRATE_FINISH   52  /* 完成迁移：stop-and-copy + 状态转移，不返回源 VM */
 #define HVC_MIGRATE_STATUS   53  /* 查询全局迁移状态 */
+#define HVC_SMP_FREEZE_BEGIN    54  /* x0=目标物理核，等待冻结 ACK */
+#define HVC_SMP_FREEZE_RELEASE  55  /* 释放已冻结的目标物理核 */
+#define HVC_SMP_FREEZE_ACK      56  /* x0=核号，返回该核 ACK generation */
+#define HVC_SMP_FREEZE_PROGRESS 57  /* x0=核号，返回冻结处理次数 */

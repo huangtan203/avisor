@@ -15,6 +15,7 @@
 #include "common/mm.h"
 #include "common/ksm.h"
 #include "common/migration.h"
+#include "common/smp.h"
 #include "arch/aarch64/mmu.h"
 #include "common/sched.h"
 #include "common/task.h"
@@ -394,6 +395,29 @@ void handle_hvc64(unsigned long hvc_nr)
 		break;
 	case HVC_MIGRATE_STATUS:
 		regs->regs[0] = migration_get_state();
+		break;
+	case HVC_SMP_FREEZE_BEGIN:
+		regs->regs[0] = (current->vmid == 2 && current->vcpu_id == 0 &&
+				 smp_processor_id() == 0)
+				? smp_freeze_begin(1) : -1;
+		break;
+	case HVC_SMP_FREEZE_RELEASE:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_freeze_release() : -1;
+		break;
+	case HVC_SMP_FREEZE_ACK:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_freeze_ack((int)regs->regs[0]) : 0;
+		break;
+	case HVC_SMP_FREEZE_PROGRESS:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_freeze_progress((int)regs->regs[0]) : 0;
 		break;
 #endif
 	default:

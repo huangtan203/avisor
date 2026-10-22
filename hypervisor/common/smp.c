@@ -16,12 +16,171 @@
 #include "boards/virt/vgic.h"
 #include "common/debug.h"
 #include "common/smp.h"
+#include "common/task.h"
 
 /* 各核就绪标志：次核在 hypervisor_secondary_main 开中断后置 1 */
 volatile int smp_online[MAX_CPUS] = { 0 };
 
 /* 各核收到的 IPI 计数（调试/统计用） */
 static volatile unsigned long ipi_count[MAX_CPUS];
+static volatile int freeze_lock;
+static volatile unsigned long freeze_generation;
+static volatile unsigned long release_generation;
+static volatile unsigned long release_ack_generation[MAX_CPUS];
+static volatile int freeze_active;
+static volatile int freeze_target_cpu = -1;
+static volatile unsigned long freeze_ack_generation[MAX_CPUS];
+static volatile unsigned long freeze_progress_count[MAX_CPUS];
+static struct task_struct *freeze_target_task;
+
+static void smp_freeze_lock_acquire(void)
+{
+    unsigned int old;
+    unsigned int failed;
+
+    for (;;) {
+        asm volatile("ldaxr %w0, [%1]"
+                     : "=&r"(old) : "r"(&freeze_lock) : "memory");
+        if (old) {
+            asm volatile("clrex" ::: "memory");
+            continue;
+        }
+
+        asm volatile("stxr %w0, %w2, [%1]"
+                     : "=&r"(failed)
+                     : "r"(&freeze_lock), "r"(1) : "memory");
+        if (!failed)
+            return;
+    }
+}
+
+static void smp_freeze_lock_release(void)
+{
+    asm volatile("stlr wzr, [%0]" :: "r"(&freeze_lock) : "memory");
+}
+
+int smp_freeze_begin(int target_cpu)
+{
+    unsigned long generation;
+    unsigned long timeout = 10000000;
+
+    if (target_cpu < 0 || target_cpu >= MAX_CPUS || target_cpu == smp_processor_id() ||
+        !smp_online[target_cpu])
+        return -1;
+
+    smp_freeze_lock_acquire();
+    if (freeze_active) {
+        unsigned long active_generation = freeze_generation;
+        int active_cpu = freeze_target_cpu;
+        if (__atomic_load_n(&release_generation, __ATOMIC_ACQUIRE) ==
+                active_generation && active_cpu >= 0 &&
+            __atomic_load_n(&release_ack_generation[active_cpu],
+                            __ATOMIC_ACQUIRE) == active_generation) {
+            __atomic_store_n(&freeze_target_cpu, -1, __ATOMIC_RELAXED);
+            freeze_target_task = NULL;
+            freeze_active = 0;
+        } else {
+            smp_freeze_lock_release();
+            return -1;
+        }
+    }
+    freeze_active = 1;
+    smp_freeze_lock_release();
+
+    generation = ++freeze_generation;
+    struct task_struct *target = NULL;
+    for (int i = 0; i < cpu_state[target_cpu].nr_tasks; i++) {
+        struct task_struct *task = cpu_state[target_cpu].task[i];
+        if (task && task->pid != 0 && task->vmid == current->vmid &&
+            task->vcpu_id == 1 && task->phys_cpu == target_cpu &&
+            task->state == TASK_RUNNING) {
+            target = task;
+            break;
+        }
+    }
+    if (!target) {
+        smp_freeze_lock_acquire();
+        freeze_active = 0;
+        smp_freeze_lock_release();
+        return -1;
+    }
+
+    __atomic_store_n(&freeze_target_cpu, target_cpu, __ATOMIC_RELAXED);
+    freeze_target_task = target;
+    __atomic_store_n(&release_generation, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&freeze_ack_generation[target_cpu], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&release_ack_generation[target_cpu], 0, __ATOMIC_RELAXED);
+    smp_send_ipi(target_cpu, SGI_VM_FREEZE);
+
+    while (timeout--) {
+        if (__atomic_load_n(&freeze_ack_generation[target_cpu], __ATOMIC_ACQUIRE) == generation)
+            return 0;
+        if ((timeout & 0xffff) == 0)
+            smp_send_ipi(target_cpu, SGI_VM_FREEZE);
+        asm volatile("yield" ::: "memory");
+    }
+
+    __atomic_store_n(&release_generation, generation, __ATOMIC_RELEASE);
+    timeout = 10000000;
+    while (timeout--) {
+        if (__atomic_load_n(&release_ack_generation[target_cpu], __ATOMIC_ACQUIRE) == generation) {
+            smp_freeze_lock_acquire();
+            __atomic_store_n(&freeze_target_cpu, -1, __ATOMIC_RELAXED);
+            freeze_target_task = NULL;
+            __atomic_store_n(&freeze_active, 0, __ATOMIC_RELEASE);
+            smp_freeze_lock_release();
+            return -1;
+        }
+        asm volatile("yield" ::: "memory");
+    }
+    return -1;
+}
+
+int smp_freeze_release(void)
+{
+    unsigned long generation = __atomic_load_n(&freeze_generation, __ATOMIC_ACQUIRE);
+    unsigned long timeout = 10000000;
+    int target_cpu = __atomic_load_n(&freeze_target_cpu, __ATOMIC_ACQUIRE);
+
+    if (!__atomic_load_n(&freeze_active, __ATOMIC_ACQUIRE) ||
+        target_cpu < 0 || target_cpu >= MAX_CPUS ||
+        __atomic_load_n(&freeze_ack_generation[target_cpu],
+                        __ATOMIC_ACQUIRE) != generation ||
+        __atomic_load_n(&release_generation, __ATOMIC_ACQUIRE) == generation)
+        return -1;
+
+    __atomic_store_n(&release_generation, generation, __ATOMIC_RELEASE);
+
+    while (timeout--) {
+        if (__atomic_load_n(&release_ack_generation[target_cpu],
+                            __ATOMIC_ACQUIRE) == generation) {
+            smp_freeze_lock_acquire();
+            __atomic_store_n(&freeze_target_cpu, -1, __ATOMIC_RELAXED);
+            freeze_target_task = NULL;
+            __atomic_store_n(&freeze_active, 0, __ATOMIC_RELEASE);
+            smp_freeze_lock_release();
+            return 0;
+        }
+
+        asm volatile("yield" ::: "memory");
+    }
+
+    return -1;
+}
+
+unsigned long smp_freeze_progress(int cpu)
+{
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return 0;
+    return __atomic_load_n(&freeze_progress_count[cpu], __ATOMIC_ACQUIRE);
+}
+
+unsigned long smp_freeze_ack(int cpu)
+{
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return 0;
+    return __atomic_load_n(&freeze_ack_generation[cpu], __ATOMIC_ACQUIRE);
+}
 
 /*
  * 向指定物理核发送核间中断
@@ -59,6 +218,51 @@ void smp_ipi_handle(int sgi_id)
         if (cpu == 1)
             gic_send_sgi(0, SGI_IPI_TEST);
         break;
+
+    case SGI_VM_FREEZE: {
+        unsigned long generation = __atomic_load_n(&freeze_generation,
+                                                   __ATOMIC_ACQUIRE);
+        struct task_struct *target = freeze_target_task;
+        struct pt_regs *regs;
+
+        if (!__atomic_load_n(&freeze_active, __ATOMIC_ACQUIRE) ||
+            cpu != __atomic_load_n(&freeze_target_cpu, __ATOMIC_RELAXED) ||
+            !target || current != target || target->phys_cpu != cpu ||
+            target->vcpu_id != 1 || target->vmid != 2 ||
+            target->state != TASK_RUNNING)
+            break;
+
+        regs = task_pt_regs(target);
+        for (int i = 0; i < 31; i++)
+            target->freeze_context.regs[i] = regs->regs[i];
+        target->freeze_context.sp = regs->sp;
+        target->freeze_context.pc = regs->pc;
+        target->freeze_context.pstate = regs->pstate;
+        target->freeze_context.generation = generation;
+        target->freeze_context.active = 1;
+        asm volatile("dmb ish" ::: "memory");
+
+        freeze_progress_count[cpu]++;
+        __atomic_store_n(&freeze_ack_generation[cpu], generation,
+                         __ATOMIC_RELEASE);
+        while (__atomic_load_n(&release_generation, __ATOMIC_ACQUIRE) != generation)
+            asm volatile("yield" ::: "memory");
+
+        asm volatile("dmb ish" ::: "memory");
+        if (target->freeze_context.generation != generation ||
+            !target->freeze_context.active)
+            break;
+
+        regs = task_pt_regs(target);
+        for (int i = 0; i < 31; i++)
+            regs->regs[i] = target->freeze_context.regs[i];
+        regs->sp = target->freeze_context.sp;
+        regs->pc = target->freeze_context.pc;
+        regs->pstate = target->freeze_context.pstate;
+        target->freeze_context.active = 0;
+        __atomic_store_n(&release_ack_generation[cpu], generation, __ATOMIC_RELEASE);
+        break;
+    }
 
     case SGI_VGIC_UPDATE:
         /*
