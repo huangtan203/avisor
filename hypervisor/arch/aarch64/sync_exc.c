@@ -392,6 +392,9 @@ void handle_hvc64(unsigned long hvc_nr)
 	case HVC_MIGRATE_FINISH:
 		regs->regs[0] = migration_finish(current);
 		break;
+	case HVC_MIGRATE_STATUS:
+		regs->regs[0] = migration_get_state();
+		break;
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);

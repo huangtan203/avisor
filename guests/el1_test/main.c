@@ -3271,13 +3271,9 @@ done24_cleanup:
 #define PHASE25_DIRTY_PAGES 4           /* 制造脏页的前 4 页 */
 
 /*
- * Phase 25: Live Migration 热迁移测试
- *
- * 仅 VM2（vmid==2）的主核发起迁移，把自身迁移到 dormant VM3（vmid=3）。
- * 迁移流程：START（清 AF + 全量拷贝）→ 修改页面制造脏页 →
- * PRECOPY（迭代预拷贝）→ FINISH（stop-and-copy + 状态转移）。
- * FINISH 之后 vCPU 已在 VM3 上恢复执行，后续代码在 VM3 上运行，
- * 通过 guest_vmid() 验证 vmid 变为 3，并校验迁移后内存内容。
+ * Phase 26: 迁移状态机测试。
+ * 默认双 vCPU VM2 验证非法阶段调用和整 VM 迁移拒绝边界；
+ * 下方单 vCPU 迁移原型代码保留供专用拓扑回归使用。
  */
 static int test_phase25_migration(void)
 {
@@ -3285,21 +3281,28 @@ static int test_phase25_migration(void)
     int ret;
     int i;
 
-    if (guest_vmid() == 2) {
-        ret = (int)hvc_call(HVC_MIGRATE_START, 0);
-        if (ret == -1) {
-            guest_puts("  PASS: 双 vCPU VM 迁移被安全拒绝（整 VM 协调尚未实现）\n");
-            return 1;
-        }
-        guest_puts("  FAIL: 双 vCPU VM 迁移未被拒绝\n");
-        return 0;
-    }
     volatile unsigned char *base;
     int precopy_dirty;
     int finish_dirty;
     u64 new_vmid;
 
-    guest_puts("\n--- Test 18: Phase 25 Live Migration ---\n");
+    if (guest_vmid() == 2) {
+        guest_puts("\n--- Test 18: Phase 26 Migration State Machine ---\n");
+        if (hvc_call(HVC_MIGRATE_STATUS, 0) != 0 ||
+            hvc_call(HVC_MIGRATE_PRECOPY, 0) != -1 ||
+            hvc_call(HVC_MIGRATE_STATUS, 0) != 0) {
+            guest_puts("  FAIL: IDLE 状态下 PRECOPY 应拒绝且状态不变\n");
+            return 0;
+        }
+        guest_puts("  PASS: IDLE 下非法 PRECOPY 被拒绝，状态保持不变\n");
+        ret = (int)hvc_call(HVC_MIGRATE_START, 0);
+        if (ret == -1 && hvc_call(HVC_MIGRATE_STATUS, 0) == 3) {
+            guest_puts("  PASS: 双 vCPU START 被拒绝，状态为 REJECTED\n");
+            return 1;
+        }
+        guest_puts("  FAIL: 双 vCPU 拒绝状态不正确\n");
+        return 0;
+    }
 
     /* 1. 分配迁移测试内存（8 页） */
     base = (volatile unsigned char *)PHASE25_BASE_IPA;

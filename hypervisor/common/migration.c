@@ -32,7 +32,7 @@
 
 /* 迁移目标 VM（main_virt.c 创建 dormant VM3 后通过 migration_set_dest 注册） */
 static struct task_struct *mig_dst;
-static int mig_active;
+static enum migration_state mig_state = MIGRATION_IDLE;
 
 /* FINISH 时捕获的源 VM pt_regs（ERET 现场），目标 VM 首次调度时恢复 */
 static struct pt_regs mig_saved_regs;
@@ -188,6 +188,11 @@ static int mig_walk(struct task_struct *src, int op)
 	return dirty;
 }
 
+enum migration_state migration_get_state(void)
+{
+	return mig_state;
+}
+
 /* 注册迁移目标 VM */
 void migration_set_dest(struct task_struct *dst)
 {
@@ -197,22 +202,29 @@ void migration_set_dest(struct task_struct *dst)
 /* 迁移阶段一：清 AF（开脏页跟踪）+ 全量拷贝 */
 int migration_start(struct task_struct *src)
 {
+	if (mig_state == MIGRATION_PRECOPY)
+		return -1;
+
 	if (!src || !src->mm.first_table || !mig_dst || src == mig_dst ||
 	    src->state != TASK_RUNNING || mig_dst->state != TASK_WAITING ||
-	    src->vmid == mig_dst->vmid || mig_active)
+	    src->vmid == mig_dst->vmid) {
+		mig_state = MIGRATION_REJECTED;
 		return -1;
+	}
 
 #ifdef PLATFORM_VIRT
 	for (int cpu = 0; cpu < MAX_CPUS; cpu++)
 		for (int i = 0; i < cpu_state[cpu].nr_tasks; i++) {
 			struct task_struct *vcpu = cpu_state[cpu].task[i];
 			if (vcpu && vcpu != src && vcpu->pid != 0 &&
-			    vcpu->vmid == src->vmid && vcpu->state != TASK_ZOMBIE)
+			    vcpu->vmid == src->vmid && vcpu->state != TASK_ZOMBIE) {
+				mig_state = MIGRATION_REJECTED;
 				return -1;
+			}
 		}
 #endif
 
-	mig_active = 1;
+	mig_state = MIGRATION_PRECOPY;
 
 	mig_walk(src, MIG_OP_CLEAR_AF);
 	mig_walk(src, MIG_OP_FULL_COPY);
@@ -223,8 +235,8 @@ int migration_start(struct task_struct *src)
 /* 迁移阶段二：迭代预拷贝，返回本轮拷贝的脏页数 */
 int migration_precopy(struct task_struct *src)
 {
-	if (!src || !mig_active || !mig_dst || src->state != TASK_RUNNING ||
-	    mig_dst->state != TASK_WAITING)
+	if (!src || mig_state != MIGRATION_PRECOPY || !mig_dst ||
+	    src->state != TASK_RUNNING || mig_dst->state != TASK_WAITING)
 		return -1;
 
 	return mig_walk(src, MIG_OP_COLLECT_DIRTY);
@@ -240,8 +252,8 @@ int migration_finish(struct task_struct *src)
 {
 	int dirty;
 
-	if (!src || !mig_active || !mig_dst || src->state != TASK_RUNNING ||
-	    mig_dst->state != TASK_WAITING)
+	if (!src || mig_state != MIGRATION_PRECOPY || !mig_dst ||
+	    src->state != TASK_RUNNING || mig_dst->state != TASK_WAITING)
 		return -1;
 
 	/* 1. 最后一轮脏页拷贝 */
@@ -283,7 +295,7 @@ int migration_finish(struct task_struct *src)
 	mig_dst->state = TASK_RUNNING;
 	mig_dst->priority = src->priority;
 	mig_dst->counter = 1000;
-	mig_active = 0;
+	mig_state = MIGRATION_COMPLETED;
 
 	schedule();
 

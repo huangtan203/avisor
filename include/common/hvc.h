@@ -66,3 +66,4 @@
 #define HVC_MIGRATE_START    50  /* 开始迁移：清 AF + 全量拷贝，返回 0/-1 */
 #define HVC_MIGRATE_PRECOPY  51  /* 迭代预拷贝：收集并拷贝脏页，返回脏页数 */
 #define HVC_MIGRATE_FINISH   52  /* 完成迁移：stop-and-copy + 状态转移，不返回源 VM */
+#define HVC_MIGRATE_STATUS   53  /* 查询全局迁移状态 */

@@ -23,6 +23,15 @@
 
 struct pt_regs;
 
+enum migration_state {
+	MIGRATION_IDLE,
+	MIGRATION_PRECOPY,
+	MIGRATION_COMPLETED,
+	MIGRATION_REJECTED,
+};
+
+enum migration_state migration_get_state(void);
+
 /* 迁移目标 VM 设置（main_virt.c 创建 dormant VM3 后调用） */
 void migration_set_dest(struct task_struct *dst);
 
