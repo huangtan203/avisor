@@ -3347,6 +3347,94 @@ static int test_phase25_migration(void)
         ret = (int)hvc_call(HVC_MIGRATE_START, 0);
         if (ret == -1 && hvc_call(HVC_MIGRATE_STATUS, 0) == 3) {
             guest_puts("  PASS: 双 vCPU START 被拒绝，状态为 REJECTED\n");
+
+            /*
+             * Phase 31: 事务式冻结测试。
+             *
+             * vCPU1 在 WFI 循环持续递增共享计数器。事务冻结后：
+             * 1. 状态 = FROZEN(1)，期间计数静止（两次采样相同）；
+             * 2. COMMIT 后计数恢复递增；
+             * 3. 再次冻结 + ROLLBACK 后计数同样从冻结值继续
+             *    （CPU 现场恢复，重执行从冻结点开始）；
+             * 4. 无事务时 COMMIT/ROLLBACK 均被拒绝，状态回 NONE。
+             */
+            guest_puts("\n--- Test 19: Phase 31 Transactional Freeze ---\n");
+            volatile u64 *hold_counter =
+                (volatile u64 *)(SMP_TEST_ADDR + P31_HOLD_COUNTER_OFF);
+            u64 frozen_at, sample;
+
+            /* --- 轮次 1：COMMIT 路径 --- */
+            if (hvc_call(HVC_SMP_TXN_FREEZE_BEGIN, 1) != 0 ||
+                hvc_call(HVC_SMP_TXN_FREEZE_STATUS, 0) != 1) {
+                guest_puts("  FAIL: 事务冻结 BEGIN 失败\n");
+                return 0;
+            }
+            frozen_at = *hold_counter;
+            /* 忙等一小段时间后再次采样：冻结期间必须静止 */
+            for (volatile int d = 0; d < 200000; d++)
+                asm volatile("nop");
+            sample = *hold_counter;
+            if (sample != frozen_at) {
+                guest_puts("  FAIL: 冻结期间计数仍在推进\n");
+                (void)hvc_call(HVC_SMP_TXN_FREEZE_COMMIT, 0);
+                return 0;
+            }
+            guest_puts("  PASS: 冻结期间 vCPU1 计数静止\n");
+
+            if (hvc_call(HVC_SMP_TXN_FREEZE_COMMIT, 0) != 0) {
+                guest_puts("  FAIL: COMMIT 失败\n");
+                return 0;
+            }
+            /* 等计数恢复推进（commit 后 vCPU1 继续 WFI 循环） */
+            {
+                int spins = 0;
+                while (*hold_counter <= frozen_at && spins++ < 100000000)
+                    asm volatile("yield");
+                if (*hold_counter <= frozen_at) {
+                    guest_puts("  FAIL: COMMIT 后计数未恢复推进\n");
+                    return 0;
+                }
+            }
+            guest_puts("  PASS: COMMIT 后 vCPU1 恢复执行\n");
+
+            /* --- 轮次 2：ROLLBACK 路径 --- */
+            if (hvc_call(HVC_SMP_TXN_FREEZE_BEGIN, 1) != 0 ||
+                hvc_call(HVC_SMP_TXN_FREEZE_STATUS, 0) != 1) {
+                guest_puts("  FAIL: 第二轮事务冻结 BEGIN 失败\n");
+                return 0;
+            }
+            frozen_at = *hold_counter;
+            for (volatile int d = 0; d < 200000; d++)
+                asm volatile("nop");
+            if (*hold_counter != frozen_at) {
+                guest_puts("  FAIL: 第二轮冻结期间计数仍在推进\n");
+                (void)hvc_call(HVC_SMP_TXN_FREEZE_ROLLBACK, 0);
+                return 0;
+            }
+            if (hvc_call(HVC_SMP_TXN_FREEZE_ROLLBACK, 0) != 0) {
+                guest_puts("  FAIL: ROLLBACK 失败\n");
+                return 0;
+            }
+            /* rollback 后从冻结点重新执行，计数继续递增 */
+            {
+                int spins = 0;
+                while (*hold_counter <= frozen_at && spins++ < 100000000)
+                    asm volatile("yield");
+                if (*hold_counter <= frozen_at) {
+                    guest_puts("  FAIL: ROLLBACK 后计数未恢复推进\n");
+                    return 0;
+                }
+            }
+            guest_puts("  PASS: ROLLBACK 后 vCPU1 从冻结点恢复执行\n");
+
+            /* --- 边界：无事务时决策被拒绝，状态回 NONE --- */
+            if (hvc_call(HVC_SMP_TXN_FREEZE_COMMIT, 0) != -1 ||
+                hvc_call(HVC_SMP_TXN_FREEZE_ROLLBACK, 0) != -1 ||
+                hvc_call(HVC_SMP_TXN_FREEZE_STATUS, 0) != 0) {
+                guest_puts("  FAIL: 无事务时 COMMIT/ROLLBACK 应被拒绝\n");
+                return 0;
+            }
+            guest_puts("  PASS: 无事务时决策被拒绝，状态回 NONE\n");
             return 1;
         }
         guest_puts("  FAIL: 双 vCPU 拒绝状态不正确\n");
@@ -3988,6 +4076,35 @@ void guest_secondary_main(void)
     guest_puts("[vcpu");
     puts_dec(cpu_id);
     guest_puts("] guest: entering main loop\n");
+
+    /*
+     * Phase 31: 事务式冻结观测循环（仅 VM2）。
+     *
+     * VM2 次核在 WFI 主循环里持续递增 p31_hold_counter 并记录 epoch，
+     * 主核冻结它后读取计数：冻结期间计数必须完全静止。
+     * commit 后计数从冻结值继续单调递增；
+     * rollback 后从冻结点重新执行，计数同样从冻结值继续。
+     *
+     * 注意：观测循环必须限定 vmid==2。事务冻结协议只针对 VM2 的
+     * vCPU1；且 VM1 的 0x40300000 共享页可能被 KSM 扫描与其他页
+     * 合并成只读共享页，VM1 次核持续写它会在 KSM CoW 哈希失效时
+     * （合并后内容变化导致 lookup miss）把 Data Abort 注入 Guest，
+     * 次核走 fatal wfe 死循环独占物理核，饿死同核的 VM2 vCPU1。
+     * VM1 次核保持纯 WFI 循环（Phase 11 之前的行为）。
+     */
+    if (vmid == 2) {
+        volatile u64 *hold_counter =
+            (volatile u64 *)(SMP_TEST_ADDR + P31_HOLD_COUNTER_OFF);
+        volatile u64 *hold_epoch =
+            (volatile u64 *)(SMP_TEST_ADDR + P31_HOLD_EPOCH_OFF);
+
+        while (1) {
+            (*hold_counter)++;
+            (*hold_epoch) = *hold_counter; /* 观察值 = 计数快照 */
+            asm volatile("dmb ish" ::: "memory");
+            asm volatile("wfi" ::: "memory");
+        }
+    }
 
     while (1) {
         asm volatile("wfi" ::: "memory");

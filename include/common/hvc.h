@@ -72,3 +72,7 @@
 #define HVC_SMP_FREEZE_ACK      56  /* x0=核号，返回该核 ACK generation */
 #define HVC_SMP_FREEZE_PROGRESS 57  /* x0=核号，返回冻结处理次数 */
 #define HVC_SMP_FREEZE_SNAPSHOT_STATUS 58 /* x0=核号，返回 x0=有效 x1=generation */
+#define HVC_SMP_TXN_FREEZE_BEGIN    59 /* x0=目标物理核，事务冻结并等待 ACK */
+#define HVC_SMP_TXN_FREEZE_COMMIT   60 /* 提交事务：目标核按保存现场恢复执行 */
+#define HVC_SMP_TXN_FREEZE_ROLLBACK 61 /* 回滚事务：目标核从冻结点重新执行 */
+#define HVC_SMP_TXN_FREEZE_STATUS   62 /* 查询事务状态：0=无 1=冻结 2=已提交 -1=已回滚 */

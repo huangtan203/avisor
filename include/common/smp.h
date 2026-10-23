@@ -29,3 +29,15 @@ int smp_freeze_release(void);
 unsigned long smp_freeze_progress(int cpu);
 unsigned long smp_freeze_ack(int cpu);
 int smp_freeze_snapshot_status(int cpu, unsigned long *generation);
+
+/* Phase 31: 事务式冻结（quiesce + commit/rollback）
+ *
+ * 与 Phase 27 的瞬时冻结不同，事务冻结在目标核 ACK 后保持冻结，
+ * 直到协调核显式 COMMIT（按冻结点保存的现场恢复执行）或
+ * ROLLBACK（从冻结点重新执行）。冻结期间目标 vCPU 完全静止，
+ * 因此快照保持有效，可安全用于迁移等状态消费。
+ */
+int smp_txn_freeze_begin(int target_cpu);
+int smp_txn_freeze_commit(void);
+int smp_txn_freeze_rollback(void);
+int smp_txn_freeze_status(void);

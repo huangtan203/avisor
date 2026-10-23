@@ -95,6 +95,10 @@ typedef int bool;
 #define HVC_SMP_FREEZE_ACK      56
 #define HVC_SMP_FREEZE_PROGRESS 57
 #define HVC_SMP_FREEZE_SNAPSHOT_STATUS 58
+#define HVC_SMP_TXN_FREEZE_BEGIN   59 /* x0=目标物理核，事务冻结并等待 ACK */
+#define HVC_SMP_TXN_FREEZE_COMMIT  60 /* 提交事务：目标核按保存现场恢复执行 */
+#define HVC_SMP_TXN_FREEZE_ROLLBACK 61 /* 回滚事务：目标核从冻结点重新执行 */
+#define HVC_SMP_TXN_FREEZE_STATUS  62 /* 查询事务状态：0=无事务 1=冻结 2=已提交 -1=已回滚 */
 
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60
@@ -346,3 +350,12 @@ static inline void spin_unlock(spinlock_t *lock)
 
 /* Phase 17: 虚拟 SGI trap-and-emulate 测试用 SGI 号（区别于 Phase 12 的 #5） */
 #define VSGI_TRAP_TEST_SGI_ID 6
+
+/* Phase 31: 事务式冻结测试共享内存布局
+ *
+ * 继续复用 0x40300000 页面：
+ *   offset 0x40: p31_hold_counter (u64)  vCPU1 主循环递增计数器
+ *   offset 0x48: p31_hold_epoch   (u64)  vCPU1 观察到的冻结 epoch
+ */
+#define P31_HOLD_COUNTER_OFF 0x40
+#define P31_HOLD_EPOCH_OFF   0x48

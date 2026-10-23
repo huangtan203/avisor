@@ -383,6 +383,11 @@ int ksm_scan_vm(struct task_struct *task, int max_scan_pages)
 				if ((e3 & S2_AP_MASK) == S2_AP_RO)
 					continue;
 
+				/* 活跃 SMP 控制页必须保持可写，不参与 KSM 合并。 */
+				if ((i1 << LV1_SHIFT | i2 << LV2_SHIFT |
+				     i3 << PAGE_SHIFT) == 0x40300000UL)
+					continue;
+
 				pa = e3 & MM_STAGE2_PA_MASK;
 
 				vaddr = TO_VADDR(pa);

@@ -427,6 +427,30 @@ void handle_hvc64(unsigned long hvc_nr)
 							    &regs->regs[1])
 				: 0;
 		break;
+	case HVC_SMP_TXN_FREEZE_BEGIN:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_txn_freeze_begin(1) : -1;
+		break;
+	case HVC_SMP_TXN_FREEZE_COMMIT:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_txn_freeze_commit() : -1;
+		break;
+	case HVC_SMP_TXN_FREEZE_ROLLBACK:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_txn_freeze_rollback() : -1;
+		break;
+	case HVC_SMP_TXN_FREEZE_STATUS:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_txn_freeze_status() : 0;
+		break;
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);
