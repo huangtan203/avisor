@@ -100,6 +100,12 @@ typedef int bool;
 #define HVC_SMP_TXN_FREEZE_ROLLBACK 61 /* 回滚事务：目标核从冻结点重新执行 */
 #define HVC_SMP_TXN_FREEZE_STATUS  62 /* 查询事务状态：0=无事务 1=冻结 2=已提交 -1=已回滚 */
 
+/* Phase 32: VM 级双 vCPU 事务冻结（stop-the-world） */
+#define HVC_VM_TXN_BEGIN    63 /* 整 VM 冻结，返回 0=成功 1=回放 -1=失败 */
+#define HVC_VM_TXN_COMMIT   64 /* 提交：vCPU1 继续执行，vCPU0 从 COMMIT 边界继续 */
+#define HVC_VM_TXN_ROLLBACK 65 /* 回滚：整 VM 回卷到冻结点 */
+#define HVC_VM_TXN_STATUS   66 /* 查询 VM 级事务状态：0=无 1=冻结 2=回放 */
+
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60
 
@@ -359,3 +365,12 @@ static inline void spin_unlock(spinlock_t *lock)
  */
 #define P31_HOLD_COUNTER_OFF 0x40
 #define P31_HOLD_EPOCH_OFF   0x48
+
+/* Phase 32: VM 级事务冻结测试共享内存布局
+ *
+ * 继续复用 0x40300000 页面：
+ *   offset 0x50: p32_coord_scratch (u64) vCPU0 冻结窗口内写的草稿值
+ *   offset 0x58: p32_replay_count  (u64) vCPU0 BEGIN 重放次数计数
+ */
+#define P32_COORD_SCRATCH_OFF 0x50
+#define P32_REPLAY_COUNT_OFF  0x58

@@ -451,6 +451,32 @@ void handle_hvc64(unsigned long hvc_nr)
 			 smp_processor_id() == 0)
 				? smp_txn_freeze_status() : 0;
 		break;
+	/* Phase 32: VM 级双 vCPU 事务冻结（stop-the-world）
+	 * 拓扑约束与 Phase 27/31 相同：VM2 的 vCPU0 在 CPU0 发起 */
+	case HVC_VM_TXN_BEGIN:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_vm_txn_begin() : -1;
+		break;
+	case HVC_VM_TXN_COMMIT:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_vm_txn_commit() : -1;
+		break;
+	case HVC_VM_TXN_ROLLBACK:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_vm_txn_rollback() : -1;
+		break;
+	case HVC_VM_TXN_STATUS:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? smp_vm_txn_status() : 0;
+		break;
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);

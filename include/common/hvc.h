@@ -76,3 +76,10 @@
 #define HVC_SMP_TXN_FREEZE_COMMIT   60 /* 提交事务：目标核按保存现场恢复执行 */
 #define HVC_SMP_TXN_FREEZE_ROLLBACK 61 /* 回滚事务：目标核从冻结点重新执行 */
 #define HVC_SMP_TXN_FREEZE_STATUS   62 /* 查询事务状态：0=无 1=冻结 2=已提交 -1=已回滚 */
+
+/* Phase 32: VM 级双 vCPU 事务冻结（stop-the-world）hypercall */
+#define HVC_VM_TXN_BEGIN    63 /* 整 VM 冻结：vCPU1 经 SGI 硬保持 + vCPU0 协调核同步捕获快照
+                                * 返回 0=冻结成功 1=回放（上次 ROLLBACK 后重执行 BEGIN）-1=失败 */
+#define HVC_VM_TXN_COMMIT   64 /* 提交：vCPU1 恢复现场继续，vCPU0 从 COMMIT 边界继续 */
+#define HVC_VM_TXN_ROLLBACK 65 /* 回滚：vCPU1 从冻结点重执行，vCPU0 现场回卷到 BEGIN 的 HVC */
+#define HVC_VM_TXN_STATUS   66 /* 查询 VM 级事务状态：0=无 1=冻结 2=回放 */

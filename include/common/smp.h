@@ -41,3 +41,20 @@ int smp_txn_freeze_begin(int target_cpu);
 int smp_txn_freeze_commit(void);
 int smp_txn_freeze_rollback(void);
 int smp_txn_freeze_status(void);
+
+/* Phase 32: VM 级双 vCPU 事务冻结（stop-the-world）
+ *
+ * Phase 31 只冻结一个远端 vCPU，协调核自身继续执行；本接口把
+ * 协调核（vCPU0）也纳入冻结——BEGIN 在 HVC 边界同步捕获自身快照，
+ * 整个 VM 的两个 vCPU 同时静止，形成 VM 级一致快照窗口。
+ *
+ * BEGIN 返回值：
+ *   0  = 冻结成功（正常路径）
+ *   1  = 回放：上次 ROLLBACK 后 vCPU0 的现场被回卷到 BEGIN 的
+ *        HVC 指令重新执行——Guest 借此感知"回到了事务入口"
+ *  -1  = 失败（无 vCPU1 / 事务进行中 / 超时）
+ */
+int smp_vm_txn_begin(void);
+int smp_vm_txn_commit(void);
+int smp_vm_txn_rollback(void);
+int smp_vm_txn_status(void);

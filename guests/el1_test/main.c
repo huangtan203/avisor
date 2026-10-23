@@ -3435,6 +3435,150 @@ static int test_phase25_migration(void)
                 return 0;
             }
             guest_puts("  PASS: 无事务时决策被拒绝，状态回 NONE\n");
+
+            /*
+             * Phase 32: VM 级双 vCPU 事务冻结测试。
+             *
+             * vCPU1 在 WFI 循环递增 p31_hold_counter；vCPU0（本核）
+             * 发起 VM 级冻结。验证：
+             * 1. BEGIN 后整 VM 静止：vCPU1 计数冻结期间不变；
+             *    本核写 scratch 后读回一致（冻结窗口内存可用）。
+             * 2. COMMIT：vCPU1 恢复递增，scratch 保留（已提交）。
+             * 3. 第二轮 BEGIN：冻结前把探针值写入 x20（局部寄存器变量，
+             *    编译器保证驻留）；冻结窗口内改写 x20 探针与 scratch。
+             *    ROLLBACK 回卷 vCPU0 现场到 BEGIN 的 HVC：重放落地后
+             *    BEGIN 返回 1，x20 恢复冻结前探针值（寄存器回卷）。
+             *    注意：内存写不回滚（寄存器级回卷语义），scratch
+             *    保留窗口内的值——重放代码不得重复写 scratch。
+             * 4. 边界：无事务时 COMMIT/ROLLBACK 拒绝，状态回 NONE。
+             */
+            guest_puts("\n--- Test 20: Phase 32 VM-wide Transactional Freeze ---\n");
+            volatile u64 *scratch =
+                (volatile u64 *)(SMP_TEST_ADDR + P32_COORD_SCRATCH_OFF);
+            volatile u64 *replay_count =
+                (volatile u64 *)(SMP_TEST_ADDR + P32_REPLAY_COUNT_OFF);
+            register u64 x20_probe __asm__("x20");
+            u64 ret2;
+            u64 replay_before = *replay_count;
+            const u64 probe_a = 0xA5A50001UL;
+            const u64 probe_b = 0xB5B50002UL;
+
+            /* --- 轮次 1：COMMIT 路径 --- */
+            if (hvc_call(HVC_VM_TXN_BEGIN, 0) != 0 ||
+                hvc_call(HVC_VM_TXN_STATUS, 0) != 1) {
+                guest_puts("  FAIL: VM 级 BEGIN 失败或状态错误\n");
+                return 0;
+            }
+            frozen_at = *hold_counter;
+            *scratch = 0xAAAA1111;
+            for (volatile int d = 0; d < 200000; d++)
+                asm volatile("nop");
+            if (*hold_counter != frozen_at) {
+                guest_puts("  FAIL: 冻结期间 vCPU1 计数仍在推进\n");
+                (void)hvc_call(HVC_VM_TXN_COMMIT, 0);
+                return 0;
+            }
+            if (*scratch != 0xAAAA1111) {
+                guest_puts("  FAIL: 冻结窗口内协调核内存访问不一致\n");
+                (void)hvc_call(HVC_VM_TXN_COMMIT, 0);
+                return 0;
+            }
+            guest_puts("  PASS: 冻结期间整 VM 静止（vCPU1 计数不变）\n");
+
+            if (hvc_call(HVC_VM_TXN_COMMIT, 0) != 0) {
+                guest_puts("  FAIL: VM 级 COMMIT 失败\n");
+                return 0;
+            }
+            {
+                int spins = 0;
+                while (*hold_counter <= frozen_at && spins++ < 100000000)
+                    asm volatile("yield");
+                if (*hold_counter <= frozen_at) {
+                    guest_puts("  FAIL: COMMIT 后 vCPU1 计数未恢复推进\n");
+                    return 0;
+                }
+            }
+            if (*scratch != 0xAAAA1111) {
+                guest_puts("  FAIL: COMMIT 后 scratch 未保留\n");
+                return 0;
+            }
+            guest_puts("  PASS: COMMIT 后 vCPU1 恢复执行，协调核改动保留\n");
+
+            /* --- 轮次 2：ROLLBACK 路径（vCPU0 回卷 + 重放） --- */
+            /* 冻结前写入探针：x20 = probe_a（回卷后应恢复此值） */
+            x20_probe = probe_a;
+            asm volatile("" : "+r"(x20_probe):: "memory");
+            ret2 = hvc_call(HVC_VM_TXN_BEGIN, 0);
+            if (ret2 == 1)
+                goto p32_replayed; /* 上一次 ROLLBACK 的重放 */
+            if (ret2 != 0 || hvc_call(HVC_VM_TXN_STATUS, 0) != 1) {
+                guest_puts("  FAIL: 第二轮 VM 级 BEGIN 失败\n");
+                return 0;
+            }
+            frozen_at = *hold_counter;
+            /* 冻结窗口内改写：x20 = probe_b、scratch = 0xBBBB2222 */
+            x20_probe = probe_b;
+            asm volatile("" : "+r"(x20_probe):: "memory");
+            *scratch = 0xBBBB2222;
+            for (volatile int d = 0; d < 200000; d++)
+                asm volatile("nop");
+            if (*hold_counter != frozen_at) {
+                guest_puts("  FAIL: 第二轮冻结期间 vCPU1 计数仍在推进\n");
+                (void)hvc_call(HVC_VM_TXN_ROLLBACK, 0);
+                return 0;
+            }
+            guest_puts("  PASS: 第二轮冻结期间整 VM 静止\n");
+
+            if (hvc_call(HVC_VM_TXN_ROLLBACK, 0) != 0) {
+                guest_puts("  FAIL: VM 级 ROLLBACK 失败\n");
+                return 0;
+            }
+            /* ROLLBACK 已回卷 vCPU0 到 BEGIN 的 HVC：以下不可达 */
+            guest_puts("  FAIL: ROLLBACK 后未回卷到 BEGIN（此行不应出现）\n");
+            return 0;
+
+p32_replayed:
+            /* ---- 重放路径：BEGIN 的 HVC 重执行后返回 1 ---- */
+            *replay_count = *replay_count + 1;
+            if (x20_probe != probe_a) {
+                guest_puts("  FAIL: ROLLBACK 未回卷 x20 探针（读到 0x");
+                puts_hex(x20_probe, 16);
+                guest_puts("）\n");
+                return 0;
+            }
+            if (*replay_count != replay_before + 1) {
+                guest_puts("  FAIL: 重放计数错误\n");
+                return 0;
+            }
+            guest_puts("  PASS: ROLLBACK 回卷协调核现场（x20 探针恢复）\n");
+            guest_puts("  PASS: BEGIN 重放返回 1，重放计数 +1\n");
+            /* 冻结窗口内的 guest 内存写不回滚：scratch 保留 0xBBBB2222 */
+            if (*scratch != 0xBBBB2222) {
+                guest_puts("  FAIL: 冻结窗口内内存写意外回滚\n");
+                return 0;
+            }
+            guest_puts("  PASS: 窗口内内存写保留（寄存器级回卷语义）\n");
+            /* 重放后 vCPU1 已从冻结点恢复执行，等计数推进 */
+            {
+                int spins = 0;
+                u64 now = *hold_counter;
+                while (*hold_counter <= now && spins++ < 100000000)
+                    asm volatile("yield");
+                if (*hold_counter <= now) {
+                    guest_puts("  FAIL: ROLLBACK 后 vCPU1 计数未恢复推进\n");
+                    return 0;
+                }
+            }
+            guest_puts("  PASS: ROLLBACK 后 vCPU1 从冻结点恢复执行\n");
+
+            /* --- 边界：无事务时决策被拒绝，状态回 NONE --- */
+            if (hvc_call(HVC_VM_TXN_COMMIT, 0) != -1 ||
+                hvc_call(HVC_VM_TXN_ROLLBACK, 0) != -1 ||
+                hvc_call(HVC_VM_TXN_STATUS, 0) != 0) {
+                guest_puts("  FAIL: 无 VM 事务时 COMMIT/ROLLBACK 应被拒绝\n");
+                return 0;
+            }
+            guest_puts("  PASS: 无 VM 事务时决策被拒绝，状态回 NONE\n");
             return 1;
         }
         guest_puts("  FAIL: 双 vCPU 拒绝状态不正确\n");

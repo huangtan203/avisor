@@ -157,6 +157,7 @@
 #define SGI_VGIC_UPDATE     2   /* 跨核 vGIC 维护：通知目标核刷新虚拟中断 */
 #define SGI_VM_FREEZE       3   /* SMP rendezvous：冻结远端物理核 */
 #define SGI_VM_TXN_FREEZE   4   /* Phase 31: 事务式冻结（保持到 commit/rollback） */
+#define SGI_VM_TXN_FREEZE_ALL 5 /* Phase 32: VM 级事务冻结（整 VM stop-the-world） */
 
 /* 函数声明 */
 void gic_init(void);
