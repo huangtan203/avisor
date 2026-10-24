@@ -507,6 +507,19 @@ void handle_hvc64(unsigned long hvc_nr)
 		regs->regs[3] = reused;
 		break;
 	}
+	case HVC_TASK_SLOT_REUSE_TEST: {
+		int first_pid, second_pid;
+		int ret = -1;
+
+		if (current->vmid == 3 && current->vcpu_id == 0 &&
+		    smp_processor_id() == 0)
+			ret = task_slot_reuse_selftest(smp_processor_id(),
+						      &first_pid, &second_pid);
+		regs->regs[0] = ret;
+		regs->regs[1] = ret == 0 ? first_pid : -1;
+		regs->regs[2] = ret == 0 ? second_pid : -1;
+		break;
+	}
 	case HVC_MIGRATE_RECLAIM_STATS: {
 		int pages, shm, ksm, done;
 		migration_reclaim_stats(&pages, &shm, &ksm, &done);

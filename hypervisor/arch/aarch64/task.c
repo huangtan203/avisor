@@ -178,6 +178,8 @@ int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 		pid = cpu_state[cpu].nr_tasks;
 	if (pid < 0)
 		return -1;
+	if (pid < cpu_state[cpu].nr_tasks)
+		task_reused_count[cpu]++;
 
 	p = (struct task_struct *)allocate_page();
 	if (!p)
@@ -213,11 +215,11 @@ int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 
 #ifdef PLATFORM_VIRT
 	p->board_ops = &virt_board_ops;
-	if (HAVE_FUNC(p->board_ops, initialize))
+	if (loader && HAVE_FUNC(p->board_ops, initialize))
 		p->board_ops->initialize(p);
 #else
 	p->board_ops = &bcm2837_board_ops;
-	if (HAVE_FUNC(p->board_ops, initialize))
+	if (loader && HAVE_FUNC(p->board_ops, initialize))
 		p->board_ops->initialize(p);
 #endif
 
@@ -239,6 +241,8 @@ int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 	cpu_state[cpu].task[pid] = p;
 	if (pid == cpu_state[cpu].nr_tasks)
 		cpu_state[cpu].nr_tasks++;
+	else
+		task_reused_count[cpu]++;
 	p->pid = pid;  /* pid 是 per-CPU 的，多核间可能重复 */
 
 	return pid;
@@ -307,6 +311,36 @@ int reap_zombie_tasks(int cpu)
 	}
 
 	return reaped;
+}
+
+int task_slot_reuse_selftest(int cpu, int *first_pid, int *second_pid)
+{
+	struct task_struct *probe;
+	int first;
+	int second;
+
+	if (cpu != smp_processor_id())
+		return -1;
+
+	first = create_task_on_cpu(cpu, NULL, NULL);
+	if (first < 0)
+		return -1;
+	probe = cpu_state[cpu].task[first];
+	probe->state = TASK_ZOMBIE;
+	if (reap_zombie_tasks(cpu) != 1)
+		return -1;
+
+	second = create_task_on_cpu(cpu, NULL, NULL);
+	if (second < 0)
+		return -1;
+	probe = cpu_state[cpu].task[second];
+	probe->state = TASK_ZOMBIE;
+	if (reap_zombie_tasks(cpu) != 1)
+		return -1;
+
+	*first_pid = first;
+	*second_pid = second;
+	return 0;
 }
 
 void task_reap_stats(int cpu, int *high_water, int *holes, int *reaped,

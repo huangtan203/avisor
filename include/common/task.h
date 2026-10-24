@@ -46,6 +46,7 @@ int reap_zombie_tasks(int cpu);
 void task_reap_after_switch(struct task_struct *prev);
 void task_reap_stats(int cpu, int *high_water, int *holes, int *reaped,
                      int *reused);
+int task_slot_reuse_selftest(int cpu, int *first_pid, int *second_pid);
 int is_uart_forwarded_task(struct task_struct *);
 void flush_task_console(struct task_struct *);
 void increment_current_pc(int);

@@ -3317,6 +3317,25 @@ static void test_phase42_task_reap(void)
     guest_puts("  PASS: zombie task 已在切栈后回收，空槽可供后续创建复用\n");
 }
 
+static void test_phase44_task_slot_reuse(void)
+{
+    u64 first_pid, second_pid;
+    u64 ret = hvc_call_ret3(HVC_TASK_SLOT_REUSE_TEST, 0,
+                            &first_pid, &second_pid);
+
+    guest_puts("\\n--- Test 27: Phase 44 task slot reuse self-test ---\\n");
+    guest_puts("  first-pid=");
+    puts_dec(first_pid);
+    guest_puts(" second-pid=");
+    puts_dec(second_pid);
+    guest_puts("\n");
+    if (ret != 0 || first_pid != second_pid) {
+        guest_puts("  FAIL: task 槽位未被实际复用\n");
+        return;
+    }
+    guest_puts("  PASS: 回收后的 task 槽位已被重新分配\n");
+}
+
 static int test_phase25_migration(void)
 {
     int passed = 1;
@@ -4266,6 +4285,7 @@ void guest_main(void)
     if (vmid == 2) {
         test_phase25_migration();
         test_phase42_task_reap();
+        test_phase44_task_slot_reuse();
     }
 
     guest_puts("\nguest: all tests done, entering main loop\n");

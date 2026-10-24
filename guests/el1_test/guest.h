@@ -115,6 +115,7 @@ typedef int bool;
 #define HVC_MIGRATE_ABORT_STATS  70
 #define HVC_TASK_STACK_STATS     71 /* 返回当前 task 最小剩余栈空间和 guard 状态 */
 #define HVC_TASK_REAP_STATS      72 /* 返回 task 高水位、空槽、回收和复用统计 */
+#define HVC_TASK_SLOT_REUSE_TEST 73 /* Phase 44：执行 task 槽位复用自测 */
 
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60
