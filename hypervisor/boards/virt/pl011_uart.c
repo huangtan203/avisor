@@ -22,6 +22,7 @@
 #include "common/printf.h"
 #include "common/task.h"
 #include "common/utils.h"
+#include "common/platform.h"
 
 /*
  * 当前 UART 转发到哪个任务

@@ -139,9 +139,11 @@ extern void secondary_psci_entry(void);
  */
 void hypervisor_main()
 {
-    /* 1. 初始化串口 - 必须最先做，否则 printf 没法输出 */
+    /* 1. 先用 QEMU 兼容基址开启串口，保证探针可以输出诊断。 */
     uart_init();
+    /* 2. 探测平台并覆盖有效 DTB 提供的运行时基址。 */
     platform_early_probe();
+    uart_init();
 
     printf("\n");
     printf("========================================\n");

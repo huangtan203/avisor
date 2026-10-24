@@ -17,6 +17,9 @@
 #define FDT_REG "reg"
 
 struct platform_info platform_current;
+unsigned long virt_uart_base = VA_START + VIRT_UART_BASE;
+unsigned long virt_gicd_base = VA_START + VIRT_GICD_BASE;
+unsigned long virt_gicr_base = VA_START + VIRT_GICR_BASE;
 unsigned long platform_dtb_address;
 unsigned long platform_dtb_address_alt;
 
@@ -190,6 +193,26 @@ static int fdt_parse(unsigned long dtb)
 	return 0;
 }
 
+unsigned long platform_uart_base(void)
+{
+	return platform_current.uart_base;
+}
+
+unsigned long platform_gicd_base(void)
+{
+	return platform_current.gicd_base;
+}
+
+unsigned long platform_gicr_base(int cpu_id)
+{
+	return platform_current.gicr_base + (unsigned long)cpu_id * VIRT_GICR_STRIDE;
+}
+
+int platform_runtime_config_valid(void)
+{
+	return platform_current.dtb_valid && platform_current.kind == PLATFORM_KIND_QEMU_VIRT;
+}
+
 const char *platform_kind_name(enum platform_kind kind)
 {
 	if (kind == PLATFORM_KIND_QEMU_VIRT)
@@ -217,6 +240,11 @@ void platform_early_probe(void)
 	platform_current.dtb_valid = fdt_parse(platform_current.dtb) == 0;
 	if (platform_current.dtb_valid && !platform_current.cpu_count)
 		platform_current.cpu_count = MAX_CPUS;
+	if (platform_current.dtb_valid && platform_current.kind == PLATFORM_KIND_QEMU_VIRT) {
+		virt_uart_base = VA_START + platform_current.uart_base;
+		virt_gicd_base = VA_START + platform_current.gicd_base;
+		virt_gicr_base = VA_START + platform_current.gicr_base;
+	}
 	if (!platform_current.dtb_valid) {
 		platform_current.cpu_count = MAX_CPUS;
 		platform_current.memory_base = VIRT_DRAM_BASE;

@@ -99,7 +99,17 @@
 
 /* 转换到虚拟地址 */
 #define PBASE              (VA_START + VIRT_MMIO_BASE)
+#ifdef __ASSEMBLER__
 #define UART_BASE          (VA_START + VIRT_UART_BASE)
 #define GICD_BASE          (VA_START + VIRT_GICD_BASE)
 #define GICR_BASE          (VA_START + VIRT_GICR_BASE)
+#else
+extern unsigned long virt_uart_base;
+extern unsigned long virt_gicd_base;
+extern unsigned long virt_gicr_base;
+
+#define UART_BASE          (virt_uart_base)
+#define GICD_BASE          (virt_gicd_base)
+#define GICR_BASE          (virt_gicr_base)
+#endif
 #define GITS_BASE          (VA_START + VIRT_GITS_BASE)

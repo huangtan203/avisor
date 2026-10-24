@@ -28,3 +28,7 @@ extern unsigned long platform_dtb_address_alt;
 
 void platform_early_probe(void);
 const char *platform_kind_name(enum platform_kind kind);
+unsigned long platform_uart_base(void);
+unsigned long platform_gicd_base(void);
+unsigned long platform_gicr_base(int cpu_id);
+int platform_runtime_config_valid(void);
