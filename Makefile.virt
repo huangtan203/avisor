@@ -21,6 +21,7 @@ ASM_OPS = -I$(INC_DIR) -DPLATFORM_VIRT=1 -g
 
 BUILD_DIR = build_virt
 OUTDIR = bin_virt
+QEMU_SERIAL_LOG ?= /tmp/avisor-qemu.log
 
 # Guest 镜像（Phase 2）
 GUEST_DIR = guests/el1_test
@@ -127,6 +128,20 @@ run: kernel8.img
 		-kernel $(OUTDIR)/kernel8.img \
 		-nographic \
 		-serial mon:stdio
+
+# 在 QEMU 上运行并将串口输出写入文件，适合自动化回归
+.PHONY: run-log
+run-log: kernel8.img
+	qemu-system-aarch64 \
+		-M virt,virtualization=on,gic-version=3,highmem=off \
+		-cpu max \
+		-smp 2 \
+		-m 1G \
+		-device edu \
+		-kernel $(OUTDIR)/kernel8.img \
+		-display none \
+		-monitor none \
+		-serial file:$(QEMU_SERIAL_LOG)
 
 # 在 QEMU 上运行（调试模式，开启 gdbserver，等待 gdb 连接）
 .PHONY: debug
