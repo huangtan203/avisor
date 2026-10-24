@@ -42,6 +42,13 @@ static unsigned int be32(const void *ptr)
 	       ((unsigned int)p[2] << 8) | p[3];
 }
 
+static unsigned long be64(const void *ptr)
+{
+	const unsigned char *p = ptr;
+
+	return ((unsigned long)be32(p) << 32) | be32(p + 4);
+}
+
 static unsigned long align4(unsigned long value)
 {
 	return (value + 3) & ~3UL;
@@ -62,6 +69,36 @@ static int range_within(unsigned long base, unsigned long size,
 {
 	return size && base >= window_base && base - window_base < window_size &&
 	       size <= window_size - (base - window_base);
+}
+
+static int range_valid(unsigned long base, unsigned long size)
+{
+	return size && size <= ~0UL - base;
+}
+
+static int ranges_overlap(unsigned long base1, unsigned long size1,
+			  unsigned long base2, unsigned long size2)
+{
+	if (!range_valid(base1, size1) || !range_valid(base2, size2))
+		return 0;
+	return base1 < base2 + size2 && base2 < base1 + size1;
+}
+
+static void add_reserved_range(unsigned long base, unsigned long size)
+{
+	struct platform_reserved_range *range;
+
+	if (!range_valid(base, size)) {
+		platform_current.reserved_overflow++;
+		return;
+	}
+	if (platform_current.reserved_count >= PLATFORM_MAX_RESERVED_RANGES) {
+		platform_current.reserved_overflow++;
+		return;
+	}
+	range = &platform_current.reserved[platform_current.reserved_count++];
+	range->base = base;
+	range->size = size;
 }
 
 static int text_has(const char *data, unsigned int len, const char *needle)
@@ -111,15 +148,60 @@ static const char *fdt_string(const unsigned char *strings, unsigned int size,
 	return (const char *)(strings + offset);
 }
 
+static void validate_reserved_memory(void)
+{
+	unsigned long usable_start = LOW_MEMORY;
+	unsigned long usable_end = HIGH_MEMORY;
+	unsigned int i;
+
+	platform_current.reserved_config_valid =
+		platform_current.dtb_valid && !platform_current.reserved_overflow;
+	platform_current.page_pool_conflict = 0;
+	for (i = 0; i < platform_current.reserved_count; i++) {
+		struct platform_reserved_range *range = &platform_current.reserved[i];
+		unsigned long range_end = range->base + range->size;
+
+		if (!range_within(range->base, range->size,
+				  platform_current.memory_base,
+				  platform_current.memory_size))
+			continue;
+		if (ranges_overlap(range->base, range->size,
+				   LOW_MEMORY, PAGING_MEMORY)) {
+			platform_current.page_pool_conflict = 1;
+			if (range->base <= usable_start)
+				usable_end = usable_start;
+			else if (range->base < usable_end)
+				usable_end = range->base;
+		}
+		if (range->base <= usable_start && range_end > usable_start)
+			usable_start = range_end;
+	}
+	if (usable_end < usable_start) {
+		platform_current.reserved_config_valid = 0;
+		platform_current.usable_memory_base = 0;
+		platform_current.usable_memory_size = 0;
+		return;
+	}
+	platform_current.usable_memory_base = usable_start;
+	platform_current.usable_memory_size = usable_end - usable_start;
+	if (platform_current.page_pool_conflict)
+		platform_current.reserved_config_valid = 0;
+}
+
 static int fdt_parse(unsigned long dtb)
 {
 	const unsigned char *base = (const unsigned char *)dtb;
 	const unsigned char *structs;
 	const unsigned char *strings;
-	unsigned int totalsize, struct_off, strings_off, struct_size, strings_size;
+	unsigned int totalsize, struct_off, strings_off, reserve_off;
+	unsigned int struct_size, strings_size;
 	unsigned int address_cells = 2, size_cells = 1;
+	unsigned int reserved_address_cells = 2, reserved_size_cells = 1;
 	unsigned long cursor;
+	int reserve_terminated = 0;
 	int depth = -1;
+	int reserved_depth = -1;
+	int reserved_child = 0;
 	int memory_node = 0;
 	int cpu_node = 0;
 	int uart_node = 0;
@@ -133,11 +215,27 @@ static int fdt_parse(unsigned long dtb)
 	totalsize = be32(base + 4);
 	struct_off = be32(base + 8);
 	strings_off = be32(base + 12);
+	reserve_off = be32(base + 16);
 	struct_size = be32(base + 36);
 	strings_size = be32(base + 32);
 	if (totalsize < 40 || struct_off >= totalsize || strings_off >= totalsize ||
-	    struct_size > totalsize - struct_off ||
+	    reserve_off >= totalsize || struct_size > totalsize - struct_off ||
 	    strings_size > totalsize - strings_off)
+		return -1;
+
+	cursor = reserve_off;
+	while (cursor + 16 <= totalsize) {
+		unsigned long address = be64(base + cursor);
+		unsigned long size = be64(base + cursor + 8);
+
+		cursor += 16;
+		if (!address && !size) {
+			reserve_terminated = 1;
+			break;
+		}
+		add_reserved_range(address, size);
+	}
+	if (!reserve_terminated)
 		return -1;
 
 	structs = base + struct_off;
@@ -155,6 +253,9 @@ static int fdt_parse(unsigned long dtb)
 				len++;
 			cursor = align4(cursor + len + 1);
 			depth++;
+			if (depth == 1 && text_has(name, len, "reserved-memory"))
+				reserved_depth = depth;
+			reserved_child = reserved_depth >= 0 && depth == reserved_depth + 1;
 			memory_node = text_has(name, len, "memory");
 			cpu_node = depth >= 1 && text_has(name, len, "cpu");
 			uart_node = text_has(name, len, "pl011");
@@ -164,7 +265,10 @@ static int fdt_parse(unsigned long dtb)
 			continue;
 		}
 		if (token == FDT_END_NODE) {
+			if (depth == reserved_depth)
+				reserved_depth = -1;
 			depth--;
+			reserved_child = reserved_depth >= 0 && depth == reserved_depth + 1;
 			memory_node = 0;
 			cpu_node = 0;
 			uart_node = 0;
@@ -218,6 +322,22 @@ static int fdt_parse(unsigned long dtb)
 				address_cells = be32(value);
 			if (depth == 0 && !strcmp(prop, "#size-cells") && len == 4)
 				size_cells = be32(value);
+			if (depth == reserved_depth && !strcmp(prop, "#address-cells") && len == 4)
+				reserved_address_cells = be32(value);
+			if (depth == reserved_depth && !strcmp(prop, "#size-cells") && len == 4)
+				reserved_size_cells = be32(value);
+			if (reserved_child && !strcmp(prop, FDT_REG) &&
+			    len >= (reserved_address_cells + reserved_size_cells) * 4) {
+				unsigned int tuple_cells = reserved_address_cells + reserved_size_cells;
+				unsigned int offset;
+
+				for (offset = 0; offset + tuple_cells * 4 <= len;
+				     offset += tuple_cells * 4)
+					add_reserved_range(
+						read_cells(value + offset, reserved_address_cells),
+						read_cells(value + offset + reserved_address_cells * 4,
+							   reserved_size_cells));
+			}
 			if (depth >= 2 && cpu_node && !strcmp(prop, FDT_DEVICE_TYPE) &&
 			    text_has((const char *)value, len, "cpu"))
 				platform_current.cpu_count++;
@@ -372,11 +492,13 @@ void platform_early_probe(void)
 	platform_current.dtb_valid = fdt_parse(platform_current.dtb) == 0;
 	if (platform_current.dtb_valid && !platform_current.cpu_count)
 		platform_current.cpu_count = MAX_CPUS;
+	validate_reserved_memory();
 	if (platform_current.dtb_valid && platform_current.kind == PLATFORM_KIND_QEMU_VIRT) {
 		platform_current.memory_config_valid =
 			platform_current.memory_discovered &&
 			platform_current.memory_base == VIRT_DRAM_BASE &&
-			platform_current.memory_size == PHYS_MEMORY_SIZE;
+			platform_current.memory_size == PHYS_MEMORY_SIZE &&
+			platform_current.reserved_config_valid;
 		platform_current.mmio_config_valid =
 			platform_current.uart_discovered &&
 			platform_current.gic_discovered &&
@@ -444,6 +566,12 @@ void platform_early_probe(void)
 	       (void *)platform_current.gits_size,
 	       platform_current.timer_hyp_ppi,
 	       platform_current.timer_virt_ppi);
+	printf("[platform] reserved=%u overflow=%u pool-conflict=%s usable=%p+%luMB\n",
+	       platform_current.reserved_count,
+	       platform_current.reserved_overflow,
+	       platform_current.page_pool_conflict ? "yes" : "no",
+	       (void *)platform_current.usable_memory_base,
+	       platform_current.usable_memory_size >> 20);
 	printf("[platform] memory-config=%s mmio-config=%s runtime=%s\n",
 	       platform_current.memory_config_valid ? "valid" : "fallback",
 	       platform_current.mmio_config_valid ? "valid" : "fallback",

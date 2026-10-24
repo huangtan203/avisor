@@ -9,6 +9,13 @@ enum platform_kind {
 	PLATFORM_KIND_AGX_ORIN,
 };
 
+#define PLATFORM_MAX_RESERVED_RANGES 16
+
+struct platform_reserved_range {
+	unsigned long base;
+	unsigned long size;
+};
+
 struct platform_info {
 	enum platform_kind kind;
 	const char *name;
@@ -26,6 +33,13 @@ struct platform_info {
 	unsigned long gits_size;
 	unsigned int timer_hyp_ppi;
 	unsigned int timer_virt_ppi;
+	struct platform_reserved_range reserved[PLATFORM_MAX_RESERVED_RANGES];
+	unsigned int reserved_count;
+	unsigned int reserved_overflow;
+	unsigned long usable_memory_base;
+	unsigned long usable_memory_size;
+	int reserved_config_valid;
+	int page_pool_conflict;
 	int dtb_valid;
 	int memory_config_valid;
 	int mmio_config_valid;
