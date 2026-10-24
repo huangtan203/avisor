@@ -86,3 +86,4 @@
 
 /* Phase 34: 迁移后源 VM 回收统计 hypercall */
 #define HVC_MIGRATE_RECLAIM_STATS 67 /* 查询源 VM 回收统计：返回 x0=释放页数 x1=shm detach 数 x2=KSM 释放映射数 x3=是否完成 */
+#define HVC_MIGRATE_CANCEL 68 /* 取消 PRECOPY 并回滚目标增量页，返回释放页数/-1 */

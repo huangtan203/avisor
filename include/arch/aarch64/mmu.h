@@ -99,6 +99,9 @@
  */
 #define MM_STAGE2_KSM_SHARED (1ULL << 55)
 
+/* Phase 35: 迁移期间目标 VM 新分配页的临时标记（取消时回收） */
+#define MM_STAGE2_MIGRATION_NEW (1ULL << 54)
+
 /*
  * Stage-2 页表 descriptor 的物理地址掩码。
  *

@@ -109,6 +109,9 @@ typedef int bool;
 /* Phase 34: 迁移后源 VM 回收统计 */
 #define HVC_MIGRATE_RECLAIM_STATS 67
 
+/* Phase 35: 取消 PRECOPY 并回滚目标增量页 */
+#define HVC_MIGRATE_CANCEL 68
+
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60
 

@@ -1386,7 +1386,7 @@ int ipa_to_pa(struct task_struct *vm, paddr_t ipa, paddr_t *pa)
 		return 0;
 	}
 	/* entry & 0x3 == 3: table descriptor */
-	lv2_table = entry & PAGE_MASK;
+	lv2_table = entry & MM_STAGE2_PA_MASK;
 
 	/* Level 2 */
 	{
@@ -1402,7 +1402,7 @@ int ipa_to_pa(struct task_struct *vm, paddr_t ipa, paddr_t *pa)
 		return 0;
 	}
 	/* table descriptor */
-	lv3_table = entry & PAGE_MASK;
+	lv3_table = entry & MM_STAGE2_PA_MASK;
 
 	/* Level 3 (4KB page) */
 	{
@@ -1412,7 +1412,7 @@ int ipa_to_pa(struct task_struct *vm, paddr_t ipa, paddr_t *pa)
 	if ((entry & 0x3) != 3)
 		return -1;  /* 无效或非 page */
 
-	*pa = (entry & PAGE_MASK) | (ipa & (PAGE_SIZE - 1));
+	*pa = (entry & MM_STAGE2_PA_MASK) | (ipa & (PAGE_SIZE - 1));
 	return 0;
 }
 

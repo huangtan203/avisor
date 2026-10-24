@@ -38,6 +38,7 @@ void migration_set_dest(struct task_struct *dst);
 /* 迁移三阶段：start / precopy / finish，返回 0 成功、-1 失败 */
 int migration_start(struct task_struct *src);
 int migration_precopy(struct task_struct *src);
+int migration_cancel(struct task_struct *src);
 int migration_finish(struct task_struct *src);
 
 /* 目标 VM 的 resume loader：恢复迁移过来的 pt_regs */

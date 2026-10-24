@@ -34,7 +34,8 @@
 #include "boards/virt/shmem.h"
 #endif
 
-/* 迁移目标 VM（main_virt.c 创建 dormant VM3 后通过 migration_set_dest 注册） */
+/* 迁移源/目标 VM（目标由 main_virt.c 创建 dormant VM3 后注册） */
+static struct task_struct *mig_src;
 static struct task_struct *mig_dst;
 static enum migration_state mig_state = MIGRATION_IDLE;
 
@@ -50,6 +51,7 @@ static int mig_reclaim_vm_done;
 /* 迁移遍历操作 */
 enum {
 	MIG_OP_CLEAR_AF,     /* 清除全部 AF 位（开启脏页跟踪） */
+	MIG_OP_SET_AF,       /* 恢复全部 AF 位（关闭本轮脏页跟踪） */
 	MIG_OP_FULL_COPY,    /* 全量拷贝所有映射页 */
 	MIG_OP_COLLECT_DIRTY,/* 收集并拷贝 AF=1 的脏页，同时清 AF 供下一轮 */
 };
@@ -76,7 +78,7 @@ static void mig_copy_page(struct task_struct *src, vaddr_t ipa, paddr_t src_pa)
 			return;
 		memcpy(dst_va, (void *)TO_VADDR(src_pa), PAGE_SIZE);
 		map_stage2_page(mig_dst, ipa, TO_PADDR(dst_va),
-				MMU_STAGE2_PAGE_FLAGS);
+				MMU_STAGE2_PAGE_FLAGS | MM_STAGE2_MIGRATION_NEW);
 	}
 }
 
@@ -131,6 +133,11 @@ static int mig_walk(struct task_struct *src, int op)
 						l2[i2] = e2 & ~MM_STAGE2_ACCESS;
 						touched = 1;
 					}
+				} else if (op == MIG_OP_SET_AF) {
+					if (!(e2 & MM_STAGE2_ACCESS)) {
+						l2[i2] = e2 | MM_STAGE2_ACCESS;
+						touched = 1;
+					}
 				} else if (op == MIG_OP_FULL_COPY) {
 					mig_copy_block(src, ipa_base,
 						       e2 & MM_STAGE2_PA_MASK);
@@ -172,6 +179,11 @@ static int mig_walk(struct task_struct *src, int op)
 						l3[i3] = e3 & ~MM_STAGE2_ACCESS;
 						touched = 1;
 					}
+				} else if (op == MIG_OP_SET_AF) {
+					if (!(e3 & MM_STAGE2_ACCESS)) {
+						l3[i3] = e3 | MM_STAGE2_ACCESS;
+						touched = 1;
+					}
 				} else if (op == MIG_OP_FULL_COPY) {
 					mig_copy_page(src, ipa,
 						      e3 & MM_STAGE2_PA_MASK);
@@ -196,6 +208,92 @@ static int mig_walk(struct task_struct *src, int op)
 	}
 
 	return dirty;
+}
+
+/*
+ * Phase 35: 处理目标 VM 中本轮迁移新建的页面。
+ *
+ * commit=0：释放带 MM_STAGE2_MIGRATION_NEW 标志的数据页，并自底向上
+ *           回收因此变空的 L3/L2 表页；保留目标根页表及基线映射。
+ * commit=1：仅清除临时标志，把页面正式提交给目标 VM。
+ */
+static int mig_finish_target_pages(int commit)
+{
+	uint64_t *l1, *l2, *l3;
+	int i1, i2, i3;
+	int pages = 0;
+
+	if (!mig_dst || !mig_dst->mm.first_table)
+		return -1;
+
+	l1 = (uint64_t *)TO_VADDR(mig_dst->mm.first_table);
+	for (i1 = 0; i1 < PTRS_PER_TABLE; i1++) {
+		paddr_t l2_pa;
+		int l2_empty = 1;
+		int l2_changed = 0;
+
+		if ((l1[i1] & 0x3) != 0x3)
+			continue;
+		l2_pa = l1[i1] & MM_STAGE2_PA_MASK;
+		l2 = (uint64_t *)TO_VADDR(l2_pa);
+
+		for (i2 = 0; i2 < PTRS_PER_TABLE; i2++) {
+			paddr_t l3_pa;
+			int l3_empty = 1;
+			int l3_changed = 0;
+
+			if ((l2[i2] & 0x3) != 0x3) {
+				if (l2[i2])
+					l2_empty = 0;
+				continue;
+			}
+
+			l3_pa = l2[i2] & MM_STAGE2_PA_MASK;
+			l3 = (uint64_t *)TO_VADDR(l3_pa);
+			for (i3 = 0; i3 < PTRS_PER_TABLE; i3++) {
+				uint64_t e3 = l3[i3];
+
+				if ((e3 & 0x3) != 0x3)
+					continue;
+				if (!(e3 & MM_STAGE2_MIGRATION_NEW)) {
+					l3_empty = 0;
+					continue;
+				}
+
+				if (commit) {
+					l3[i3] = e3 & ~MM_STAGE2_MIGRATION_NEW;
+					l3_empty = 0;
+				} else {
+					deallocate_page((void *)TO_VADDR(
+						e3 & MM_STAGE2_PA_MASK));
+					l3[i3] = 0;
+					mig_dst->mm.user_pages_count--;
+					pages++;
+					l3_changed = 1;
+				}
+			}
+
+			if (!commit && l3_empty && l3_changed) {
+				deallocate_page((void *)TO_VADDR(l3_pa));
+				l2[i2] = 0;
+				mig_dst->mm.kernel_pages_count--;
+				l2_changed = 1;
+			} else {
+				l2_empty = 0;
+			}
+		}
+
+		if (!commit && l2_empty && l2_changed) {
+			deallocate_page((void *)TO_VADDR(l2_pa));
+			l1[i1] = 0;
+			mig_dst->mm.kernel_pages_count--;
+		}
+	}
+
+	asm volatile("tlbi vmalle1" ::: "memory");
+	asm volatile("dsb ish" ::: "memory");
+	asm volatile("isb" ::: "memory");
+	return pages;
 }
 
 enum migration_state migration_get_state(void)
@@ -230,6 +328,7 @@ int migration_start(struct task_struct *src)
 	 * vCPU 都写脏页；FINISH 阶段才在 VM 级冻结窗口内做 stop-and-copy
 	 * + 双 vCPU 状态转移。因此这里不再拒绝多 vCPU 源。
 	 */
+	mig_src = src;
 	mig_state = MIGRATION_PRECOPY;
 
 	mig_walk(src, MIG_OP_CLEAR_AF);
@@ -241,11 +340,32 @@ int migration_start(struct task_struct *src)
 /* 迁移阶段二：迭代预拷贝，返回本轮拷贝的脏页数 */
 int migration_precopy(struct task_struct *src)
 {
-	if (!src || mig_state != MIGRATION_PRECOPY || !mig_dst ||
-	    src->state != TASK_RUNNING || mig_dst->state != TASK_WAITING)
+	if (!src || src != mig_src || mig_state != MIGRATION_PRECOPY ||
+	    !mig_dst || src->state != TASK_RUNNING ||
+	    mig_dst->state != TASK_WAITING)
 		return -1;
 
 	return mig_walk(src, MIG_OP_COLLECT_DIRTY);
+}
+
+/* Phase 35: 取消尚未进入 FINISH 的迁移并回滚目标增量页。 */
+int migration_cancel(struct task_struct *src)
+{
+	int released;
+
+	if (!src || mig_state != MIGRATION_PRECOPY || src != mig_src ||
+	    src->state != TASK_RUNNING || !mig_dst ||
+	    mig_dst->state != TASK_WAITING)
+		return -1;
+
+	released = mig_finish_target_pages(0);
+	if (released < 0)
+		return -1;
+
+	mig_walk(src, MIG_OP_SET_AF);
+	mig_src = NULL;
+	mig_state = MIGRATION_IDLE;
+	return released;
 }
 
 /*
@@ -326,8 +446,9 @@ int migration_finish(struct task_struct *src)
 	int dirty;
 	struct task_struct *vcpu1;
 
-	if (!src || mig_state != MIGRATION_PRECOPY || !mig_dst ||
-	    src->state != TASK_RUNNING || mig_dst->state != TASK_WAITING)
+	if (!src || src != mig_src || mig_state != MIGRATION_PRECOPY ||
+	    !mig_dst || src->state != TASK_RUNNING ||
+	    mig_dst->state != TASK_WAITING)
 		return -1;
 
 	/* 1. 冻结整 VM（vCPU1 在 CPU1 忙等，vCPU0 捕获自身快照） */
@@ -379,6 +500,9 @@ int migration_finish(struct task_struct *src)
 	memcpy(&mig_saved_regs, task_pt_regs(src), sizeof(struct pt_regs));
 	mig_saved_regs.regs[0] = (unsigned long)dirty;
 
+	/* Phase 35: 目标预拷贝页正式提交，清除临时回滚标记。 */
+	(void)mig_finish_target_pages(1);
+
 	/* 10. 释放 vCPU1：它以 VM3 身份从冻结点恢复执行 */
 	smp_vm_txn_commit();
 
@@ -402,6 +526,7 @@ int migration_finish(struct task_struct *src)
 	mig_dst->state = TASK_RUNNING;
 	mig_dst->priority = src->priority;
 	mig_dst->counter = 1000;
+	mig_src = NULL;
 	mig_state = MIGRATION_COMPLETED;
 
 	schedule();

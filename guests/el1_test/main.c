@@ -3339,6 +3339,7 @@ static int test_phase25_migration(void)
 
         if (hvc_call(HVC_MIGRATE_STATUS, 0) != 0 ||
             hvc_call(HVC_MIGRATE_PRECOPY, 0) != -1 ||
+            hvc_call(HVC_MIGRATE_CANCEL, 0) != -1 ||
             hvc_call(HVC_MIGRATE_STATUS, 0) != 0) {
             guest_puts("  FAIL: IDLE 状态下 PRECOPY 应拒绝且状态不变\n");
             return 0;
@@ -3608,6 +3609,57 @@ p32_replayed:
             p[j] = pattern;
     }
     guest_puts("  [2] 写入初始内容（每页一个独特模式）\n");
+
+    /* Test 23: START/PRECOPY 后取消，回收目标增量页并允许重试。 */
+    guest_puts("\n--- Test 23: Phase 35 Migration Cancel/Rollback ---\n");
+    {
+        volatile u64 *hold_counter =
+            (volatile u64 *)(SMP_TEST_ADDR + P31_HOLD_COUNTER_OFF);
+        u64 src_user_before, src_kernel_before;
+        u64 src_user_after, src_kernel_after;
+        u64 hold_before, hold_after;
+        int cancel_pages;
+
+        src_user_before = hvc_call_ret2(HVC_MEM_STATS, 0,
+                                        &src_kernel_before);
+        hold_before = *hold_counter;
+        if (hvc_call(HVC_MIGRATE_START, 0) != 0 ||
+            hvc_call(HVC_MIGRATE_PRECOPY, 0) < 0) {
+            guest_puts("  FAIL: cancel 测试 START/PRECOPY 失败\n");
+            passed = 0;
+            goto done25;
+        }
+        cancel_pages = (int)hvc_call(HVC_MIGRATE_CANCEL, 0);
+        src_user_after = hvc_call_ret2(HVC_MEM_STATS, 0,
+                                       &src_kernel_after);
+        if (hvc_call(HVC_MIGRATE_CANCEL, 0) != -1) {
+            guest_puts("  FAIL: 重复 CANCEL 应被拒绝\n");
+            passed = 0;
+            goto done25;
+        }
+        for (volatile int d = 0; d < 8000000; d++)
+            asm volatile("nop");
+        hold_after = *hold_counter;
+
+        if (cancel_pages <= 0 || src_user_before != src_user_after ||
+            src_kernel_before != src_kernel_after || hold_after <= hold_before ||
+            hvc_call(HVC_MIGRATE_STATUS, 0) != 0) {
+            guest_puts("  FAIL: cancel 未回收目标增量页或状态未复位\n");
+            passed = 0;
+            goto done25;
+        }
+        guest_puts("  PASS: CANCEL 回滚目标新增页=");
+        puts_dec(cancel_pages);
+        guest_puts("，源内存/AF 状态恢复且可重试\n");
+    }
+
+    /* 取消后重新写入模式，正式迁移必须能复用同一目标 VM。 */
+    for (i = 0; i < PHASE25_TOTAL_PAGES; i++) {
+        volatile unsigned char *p = base + i * PHASE25_PAGE_SIZE;
+        unsigned char pattern = (unsigned char)(0x50 + i);
+        for (int j = 0; j < PHASE25_PAGE_SIZE; j++)
+            p[j] = pattern;
+    }
 
     /* 3. START：清 AF（开启脏页跟踪）+ 全量拷贝 */
     ret = (int)hvc_call(HVC_MIGRATE_START, 0);

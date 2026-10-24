@@ -393,6 +393,12 @@ void handle_hvc64(unsigned long hvc_nr)
 	case HVC_MIGRATE_FINISH:
 		regs->regs[0] = migration_finish(current);
 		break;
+	case HVC_MIGRATE_CANCEL:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? migration_cancel(current) : -1;
+		break;
 	case HVC_MIGRATE_STATUS:
 		regs->regs[0] = migration_get_state();
 		break;
