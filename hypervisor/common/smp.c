@@ -689,6 +689,14 @@ int smp_vm_txn_status(void)
     return __atomic_load_n(&vm_txn_state, __ATOMIC_ACQUIRE);
 }
 
+/* Phase 33: 返回当前被冻结的 vCPU1（迁移代码消费其 freeze_context） */
+struct task_struct *smp_vm_txn_target_task(void)
+{
+    if (__atomic_load_n(&vm_txn_state, __ATOMIC_ACQUIRE) != VM_TXN_FROZEN)
+        return NULL;
+    return vm_txn_target_task;
+}
+
 
 /*
  * 向指定物理核发送核间中断

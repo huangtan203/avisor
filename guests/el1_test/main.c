@@ -3344,9 +3344,12 @@ static int test_phase25_migration(void)
             return 0;
         }
         guest_puts("  PASS: IDLE 下非法 PRECOPY 被拒绝，状态保持不变\n");
-        ret = (int)hvc_call(HVC_MIGRATE_START, 0);
-        if (ret == -1 && hvc_call(HVC_MIGRATE_STATUS, 0) == 3) {
-            guest_puts("  PASS: 双 vCPU START 被拒绝，状态为 REJECTED\n");
+
+        /*
+         * Phase 33: 双 vCPU 迁移已支持——START 不再因多 vCPU 而拒绝。
+         * 以下 Test 19/20（单 vCPU / VM 级事务冻结）与迁移正交，
+         * 先独立执行；结束后落到后段的双 vCPU 迁移流程。
+         */
 
             /*
              * Phase 31: 事务式冻结测试。
@@ -3579,11 +3582,8 @@ p32_replayed:
                 return 0;
             }
             guest_puts("  PASS: 无 VM 事务时决策被拒绝，状态回 NONE\n");
-            return 1;
         }
-        guest_puts("  FAIL: 双 vCPU 拒绝状态不正确\n");
-        return 0;
-    }
+        /* Test 19/20 结束：落到后段的双 vCPU 迁移流程（Phase 33） */
 
     /* 1. 分配迁移测试内存（8 页） */
     base = (volatile unsigned char *)PHASE25_BASE_IPA;
@@ -3674,8 +3674,41 @@ p32_replayed:
     if (passed)
         guest_puts("  [8] 迁移后内存内容正确\n");
 
+    /*
+     * Test 21: 双 vCPU 迁移验证。
+     *
+     * 迁移 FINISH 在 VM 级冻结窗口内把 VM2 的 vCPU1 就地改造为 VM3
+     * vCPU1（vmid 2→3，mm/board_data 挂到 VM3），commit 后它从冻结点
+     * 恢复、继续 WFI 观测循环递增 hold_counter。此处从 vCPU0（已迁移
+     * 到 VM3）视角读共享页里的 hold_counter，确认 vCPU1 也迁移成功且
+     * 仍在推进（计数严格单调递增）。
+     */
+    guest_puts("\n--- Test 21: Phase 33 Dual-vCPU Migration ---\n");
+    {
+        volatile u64 *hold_counter =
+            (volatile u64 *)(SMP_TEST_ADDR + P31_HOLD_COUNTER_OFF);
+        u64 c0 = *hold_counter;
+        for (volatile int d = 0; d < 8000000; d++)
+            asm volatile("nop");
+        u64 c1 = *hold_counter;
+        if (c1 <= c0) {
+            guest_puts("  FAIL: 迁移后 vCPU1 未继续推进 (");
+            puts_dec(c0);
+            guest_puts(" -> ");
+            puts_dec(c1);
+            guest_puts(")\n");
+            passed = 0;
+        } else {
+            guest_puts("  PASS: vCPU1 已迁移到 VM3 且继续推进 (");
+            puts_dec(c0);
+            guest_puts(" -> ");
+            puts_dec(c1);
+            guest_puts(")\n");
+        }
+    }
+
     if (passed)
-        guest_puts("  PASSED: Live Migration 成功（VM2 -> VM3）\n");
+        guest_puts("  PASSED: 双 vCPU Live Migration 成功（VM2 -> VM3）\n");
     else
         guest_puts("  FAILED\n");
 

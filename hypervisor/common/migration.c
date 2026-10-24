@@ -22,6 +22,7 @@
 #include "common/migration.h"
 #include "common/utils.h"
 #include "common/task.h"
+#include "common/smp.h"
 #include "arch/aarch64/mmu.h"
 
 #ifdef PLATFORM_VIRT
@@ -212,18 +213,14 @@ int migration_start(struct task_struct *src)
 		return -1;
 	}
 
-#ifdef PLATFORM_VIRT
-	for (int cpu = 0; cpu < MAX_CPUS; cpu++)
-		for (int i = 0; i < cpu_state[cpu].nr_tasks; i++) {
-			struct task_struct *vcpu = cpu_state[cpu].task[i];
-			if (vcpu && vcpu != src && vcpu->pid != 0 &&
-			    vcpu->vmid == src->vmid && vcpu->state != TASK_ZOMBIE) {
-				mig_state = MIGRATION_REJECTED;
-				return -1;
-			}
-		}
-#endif
-
+	/*
+	 * Phase 33: 双 vCPU 迁移。
+	 *
+	 * Phase 25 只支持单 vCPU 源（多 vCPU 直接 REJECTED）；Phase 33
+	 * 起源 VM 可为双 vCPU：START/PRECOPY 阶段源 VM 仍在执行，两个
+	 * vCPU 都写脏页；FINISH 阶段才在 VM 级冻结窗口内做 stop-and-copy
+	 * + 双 vCPU 状态转移。因此这里不再拒绝多 vCPU 源。
+	 */
 	mig_state = MIGRATION_PRECOPY;
 
 	mig_walk(src, MIG_OP_CLEAR_AF);
@@ -245,31 +242,57 @@ int migration_precopy(struct task_struct *src)
 /*
  * 迁移阶段三：stop-and-copy + 状态转移 + 调度到目标 VM。
  *
+ * Phase 33：双 vCPU 全迁移。本函数在 VM2 vCPU0 的 HVC handler 内被
+ * 调用（协调核，CPU0）。与 Phase 25 单 vCPU 版不同，这里借助
+ * Phase 32 的 VM 级事务冻结窗口保证"整 VM 静止"后再做 stop-and-copy：
+ *
+ *   1. smp_vm_txn_begin()  冻结 vCPU1（CPU1 上 SGI#5 忙等）并捕获
+ *                           vCPU0 自身快照 → 整 VM 静止
+ *   2. 最后一轮脏页拷贝（两 vCPU 都不再写脏页）
+ *   3. 就地改造 vCPU1：vmid 2→3、mm/board_data 挂到 VM3、重新注册
+ *   4. 转移 vCPU0 状态到 VM3 vCPU0（沿用 Phase 25 单核逻辑）
+ *   5. smp_vm_txn_commit() 释放 vCPU1：它从冻结点恢复，以 VM3 身份
+ *                          继续执行（vm_entering_work 检测 vmid 变化
+ *                          自动切 VTTBR + 失效 TLB）
+ *   6. vCPU0 自身 schedule() 切到 VM3 vCPU0
+ *
  * 返回值（脏页数）通过 mig_saved_regs.regs[0] 传给恢复后的目标 VM，
- * 本函数本身不会返回（schedule() 切走后源 VM 进入 ZOMBIE）。
+ * 本函数不会返回（schedule() 切走后源 VM 进入 ZOMBIE）。
  */
 int migration_finish(struct task_struct *src)
 {
 	int dirty;
+	struct task_struct *vcpu1;
 
 	if (!src || mig_state != MIGRATION_PRECOPY || !mig_dst ||
 	    src->state != TASK_RUNNING || mig_dst->state != TASK_WAITING)
 		return -1;
 
-	/* 1. 最后一轮脏页拷贝 */
+	/* 1. 冻结整 VM（vCPU1 在 CPU1 忙等，vCPU0 捕获自身快照） */
+	if (smp_vm_txn_begin() != 0)
+		return -1;
+
+	/* 2. 最后一轮脏页拷贝：此刻两 vCPU 都静止，拷贝收敛 */
 	dirty = mig_walk(src, MIG_OP_COLLECT_DIRTY);
 
-	/* 2. 捕获 ERET 现场（HVC 返回后 pc 已指向 HVC+4，无需手动推进） */
-	memcpy(&mig_saved_regs, task_pt_regs(src), sizeof(struct pt_regs));
-	/* 把脏页数写进目标 VM 恢复后的 x0（handle_hvc64 写 x0 发生在本函数之后） */
-	mig_saved_regs.regs[0] = (unsigned long)dirty;
+	/* 3. 就地改造 vCPU1（冻结中的 VM2 vCPU1 → VM3 vCPU1） */
+	vcpu1 = smp_vm_txn_target_task();
+	if (vcpu1) {
+		vcpu1->vmid = mig_dst->vmid;
+		vcpu1->mm = mig_dst->mm;
+		vcpu1->board_data = mig_dst->board_data;
+		(void)strncpy(vcpu1->name, "vm3-cpu1", 36);
+#ifdef PLATFORM_VIRT
+		virt_register_vcpu(vcpu1, (int)mig_dst->vmid, vcpu1->vcpu_id);
+#endif
+	}
 
-	/* 3. 转移 vCPU 系统寄存器（含 SP_EL1/ELR_EL1/SPSR/TTBR 等 EL1 全量状态） */
+	/* 4. 转移 vCPU0 系统寄存器（含 SP_EL1/ELR_EL1/SPSR/TTBR 等 EL1 全量） */
 	memcpy(&mig_dst->cpu_sysregs, &src->cpu_sysregs,
 	       sizeof(struct cpu_sysregs));
 
 #ifdef PLATFORM_VIRT
-	/* 4. 新鲜捕获源 VM 的 vGIC + vtimer 状态（timer 不在 save_sysregs 里，
+	/* 5. 新鲜捕获源 VM 的 vGIC + vtimer 状态（timer 不在 save_sysregs 里，
 	 *    运行期真实状态在 tsk->virt，必须在此重新读取硬件） */
 	vgic_save_state(&src->virt);
 	src->virt.cntv_cval = READ_SYSREG64(CNTV_CVAL_EL0);
@@ -280,17 +303,24 @@ int migration_finish(struct task_struct *src)
 			src->virt.vtimer_pending = 1;
 	}
 
-	/* 5. 转移板级 vGIC MMIO 状态（GICD/GICR trap-and-emulate 建模） */
+	/* 6. 转移板级 vGIC MMIO 状态（GICD/GICR trap-and-emulate 建模） */
 	virt_copy_vgic_state(mig_dst, src);
 #endif
 
-	/* 6. 转移 per-vCPU 虚拟化状态（gic_vmcr/gic_lr/cntv/vtimer_pending） */
+	/* 7. 转移 per-vCPU 虚拟化状态（gic_vmcr/gic_lr/cntv/vtimer_pending） */
 	memcpy(&mig_dst->virt, &src->virt, sizeof(struct vm_virt_state));
 
-	/* 7. 转移虚拟计数器偏移（保证迁移后 Guest 的 CNTVCT 连续） */
+	/* 8. 转移虚拟计数器偏移（保证迁移后 Guest 的 CNTVCT 连续） */
 	mig_dst->mm.cntvoff = src->mm.cntvoff;
 
-	/* 8. 停止源 VM，唤醒目标 VM 并立即调度过去 */
+	/* 9. 捕获 vCPU0 的 ERET 现场（HVC 返回后 pc 已指向 HVC+4） */
+	memcpy(&mig_saved_regs, task_pt_regs(src), sizeof(struct pt_regs));
+	mig_saved_regs.regs[0] = (unsigned long)dirty;
+
+	/* 10. 释放 vCPU1：它以 VM3 身份从冻结点恢复执行 */
+	smp_vm_txn_commit();
+
+	/* 11. 停止源 vCPU0，唤醒目标 VM3 vCPU0 并立即调度过去 */
 	src->state = TASK_ZOMBIE;
 	mig_dst->state = TASK_RUNNING;
 	mig_dst->priority = src->priority;

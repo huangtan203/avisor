@@ -58,3 +58,13 @@ int smp_vm_txn_begin(void);
 int smp_vm_txn_commit(void);
 int smp_vm_txn_rollback(void);
 int smp_vm_txn_status(void);
+
+/* Phase 33: 事务式迁移支持
+ *
+ * 迁移 FINISH 阶段在 VM 级冻结窗口内消费冻结中的 vCPU1：
+ *   - smp_vm_txn_target_task()：返回当前被冻结的 vCPU1（vCPU1 在
+ *     SGI#5 handler 内忙等，其 freeze_context 是完整现场快照）。
+ *     迁移代码拿到它后，可就地改造其身份（vmid/mm/board_data）为
+ *     目标 VM，随后 commit 释放时它从冻结点以新身份继续执行。
+ */
+struct task_struct *smp_vm_txn_target_task(void);
