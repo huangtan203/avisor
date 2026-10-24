@@ -38,6 +38,7 @@
 #include "common/mm.h"
 #include "common/ksm.h"
 #include "common/migration.h"
+#include "common/platform.h"
 #include "common/printf.h"
 #include "common/sched.h"
 #include "common/smp.h"
@@ -140,6 +141,7 @@ void hypervisor_main()
 {
     /* 1. 初始化串口 - 必须最先做，否则 printf 没法输出 */
     uart_init();
+    platform_early_probe();
 
     printf("\n");
     printf("========================================\n");

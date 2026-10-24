@@ -54,10 +54,14 @@
 .section ".text.boot"
 .globl _start
 
-/* C 语言中定义的 SMP 启动标志 */
+/* C 语言中定义的 SMP 启动标志和 DTB 传递槽位 */
 .extern smp_boot_flag
+.extern platform_dtb_address
 
 _start:
+    /* 保留真实硬件启动约定：x0 可能携带 DTB 地址；QEMU -kernel
+     * 不传 DTB 时该值通常无效，platform_early_probe 会回退到固定布局。 */
+    mov x20, x0
     mrs x0, mpidr_el1
     /* Check processor id */
     and x0, x0, #0xFF
@@ -208,6 +212,10 @@ el3:
     eret
 
 el2_entry:
+    /* 保存启动固件传入的 DTB 地址；QEMU 无 DTB 时通常为 0。 */
+    adr x0, platform_dtb_address
+    str x20, [x0]
+
     /* 设置 TPIDR_EL2 = 0（主核物理 CPU ID），供 smp_processor_id() 使用。
      * 必须在任何调用 smp_processor_id() 的代码之前设置。 */
     mov x0, #0
