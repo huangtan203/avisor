@@ -18,6 +18,7 @@
 
 struct platform_info platform_current;
 unsigned long platform_dtb_address;
+unsigned long platform_dtb_address_alt;
 
 static unsigned int be32(const void *ptr)
 {
@@ -30,6 +31,16 @@ static unsigned int be32(const void *ptr)
 static unsigned long align4(unsigned long value)
 {
 	return (value + 3) & ~3UL;
+}
+
+static unsigned long read_cells(const unsigned char *value, unsigned int cells)
+{
+	unsigned int i;
+	unsigned long result = 0;
+
+	for (i = 0; i < cells; i++)
+		result = (result << 32) | be32(value + i * 4);
+	return result;
 }
 
 static int text_has(const char *data, unsigned int len, const char *needle)
@@ -72,7 +83,8 @@ static int fdt_parse(unsigned long dtb)
 	int depth = -1;
 	int memory_node = 0;
 	int cpu_node = 0;
-
+	int uart_node = 0;
+	int gic_node = 0;
 
 	if (!dtb || be32(base) != FDT_MAGIC)
 		return -1;
@@ -104,6 +116,8 @@ static int fdt_parse(unsigned long dtb)
 			depth++;
 			memory_node = text_has(name, len, "memory");
 			cpu_node = depth >= 1 && text_has(name, len, "cpu");
+			uart_node = text_has(name, len, "pl011");
+			gic_node = text_has(name, len, "intc") || text_has(name, len, "gic");
 			continue;
 		}
 		if (token == FDT_END_NODE) {
@@ -144,9 +158,19 @@ static int fdt_parse(unsigned long dtb)
 					platform_current.name = "QEMU virt";
 				}
 			}
-			if (depth >= 1 && cpu_node && !strcmp(prop, FDT_DEVICE_TYPE) &&
+			if (depth == 0 && !strcmp(prop, "#address-cells") && len == 4)
+				address_cells = be32(value);
+			if (depth == 0 && !strcmp(prop, "#size-cells") && len == 4)
+				size_cells = be32(value);
+			if (depth >= 2 && cpu_node && !strcmp(prop, FDT_DEVICE_TYPE) &&
 			    text_has((const char *)value, len, "cpu"))
 				platform_current.cpu_count++;
+			if (depth >= 1 && uart_node && !strcmp(prop, FDT_REG) &&
+			    len >= (address_cells + size_cells) * 4)
+				platform_current.uart_base = read_cells(value, address_cells);
+			if (depth >= 1 && gic_node && !strcmp(prop, FDT_REG) &&
+			    len >= (address_cells + size_cells) * 4)
+				platform_current.gicd_base = read_cells(value, address_cells);
 			if (depth == 1 && memory_node && !strcmp(prop, FDT_REG) &&
 			    len >= (address_cells + size_cells) * 4) {
 				unsigned int i;
@@ -181,13 +205,18 @@ void platform_early_probe(void)
 	platform_current.kind = PLATFORM_KIND_QEMU_VIRT;
 	platform_current.name = "QEMU virt (fixed-layout fallback)";
 	platform_current.dtb = platform_dtb_address;
+	if (!platform_current.dtb || be32((const void *)platform_current.dtb) != FDT_MAGIC)
+		platform_current.dtb = platform_dtb_address_alt;
 	platform_current.cpu_count = MAX_CPUS;
 	platform_current.memory_base = VIRT_DRAM_BASE;
 	platform_current.memory_size = PHYS_MEMORY_SIZE;
 	platform_current.uart_base = VIRT_UART_BASE;
 	platform_current.gicd_base = VIRT_GICD_BASE;
 	platform_current.gicr_base = VIRT_GICR_BASE;
-	platform_current.dtb_valid = fdt_parse(platform_dtb_address) == 0;
+	platform_current.cpu_count = 0;
+	platform_current.dtb_valid = fdt_parse(platform_current.dtb) == 0;
+	if (platform_current.dtb_valid && !platform_current.cpu_count)
+		platform_current.cpu_count = MAX_CPUS;
 	if (!platform_current.dtb_valid) {
 		platform_current.cpu_count = MAX_CPUS;
 		platform_current.memory_base = VIRT_DRAM_BASE;

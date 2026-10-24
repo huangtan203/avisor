@@ -24,6 +24,7 @@ struct platform_info {
 
 extern struct platform_info platform_current;
 extern unsigned long platform_dtb_address;
+extern unsigned long platform_dtb_address_alt;
 
 void platform_early_probe(void);
 const char *platform_kind_name(enum platform_kind kind);
