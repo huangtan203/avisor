@@ -113,6 +113,7 @@ typedef int bool;
 #define HVC_MIGRATE_CANCEL 68
 #define HVC_MIGRATE_FAIL_FINISH 69
 #define HVC_MIGRATE_ABORT_STATS  70
+#define HVC_TASK_STACK_STATS     71 /* 返回当前 task 最小剩余栈空间和 guard 状态 */
 
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60

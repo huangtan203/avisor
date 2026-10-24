@@ -54,19 +54,15 @@ void task_stack_init(struct task_struct *tsk)
 
 void task_stack_check(struct task_struct *tsk)
 {
-	unsigned long *guard;
 	unsigned long sp;
 	unsigned long guard_end;
 
 	if (!tsk || tsk->pid == 0)
 		return;
 
-	guard = (unsigned long *)((unsigned long)tsk + sizeof(*tsk));
-	for (unsigned long i = 0; i < TASK_STACK_GUARD_SIZE / sizeof(*guard); i++) {
-		if (guard[i] != TASK_STACK_CANARY)
-			PANIC("EL2 task stack overflow: vmid=%lu vcpu=%d pid=%ld",
-			      tsk->vmid, tsk->vcpu_id, tsk->pid);
-	}
+	if (!task_stack_guard_valid(tsk))
+		PANIC("EL2 task stack overflow: vmid=%lu vcpu=%d pid=%ld",
+		      tsk->vmid, tsk->vcpu_id, tsk->pid);
 
 	asm volatile("mov %0, sp" : "=r"(sp));
 	guard_end = task_stack_guard_end(tsk);
@@ -85,6 +81,19 @@ unsigned long task_stack_min_free(struct task_struct *tsk)
 	if (!tsk || tsk->pid == 0 || !tsk->stack_low_water)
 		return 0;
 	return tsk->stack_low_water - task_stack_guard_end(tsk);
+}
+
+int task_stack_guard_valid(struct task_struct *tsk)
+{
+	unsigned long *guard;
+
+	if (!tsk || tsk->pid == 0)
+		return 0;
+	guard = (unsigned long *)((unsigned long)tsk + sizeof(*tsk));
+	for (unsigned long i = 0; i < TASK_STACK_GUARD_SIZE / sizeof(*guard); i++)
+		if (guard[i] != TASK_STACK_CANARY)
+			return 0;
+	return 1;
 }
 
 struct pt_regs *task_pt_regs(struct task_struct *tsk)

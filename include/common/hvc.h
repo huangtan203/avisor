@@ -89,3 +89,4 @@
 #define HVC_MIGRATE_CANCEL 68 /* 取消 PRECOPY 并回滚目标增量页，返回释放页数/-1 */
 #define HVC_MIGRATE_FAIL_FINISH 69 /* 注入一次 FINISH 准备阶段失败 */
 #define HVC_MIGRATE_ABORT_STATS  70 /* 返回 FINISH abort 次数 */
+#define HVC_TASK_STACK_STATS     71 /* 返回当前 task 最小剩余栈空间和 guard 状态 */

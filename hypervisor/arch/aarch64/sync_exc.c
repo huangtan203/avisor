@@ -493,6 +493,10 @@ void handle_hvc64(unsigned long hvc_nr)
 	case HVC_MIGRATE_ABORT_STATS:
 		regs->regs[0] = migration_finish_abort_stats();
 		break;
+	case HVC_TASK_STACK_STATS:
+		regs->regs[0] = task_stack_min_free(current);
+		regs->regs[1] = task_stack_guard_valid(current);
+		break;
 	case HVC_MIGRATE_RECLAIM_STATS: {
 		int pages, shm, ksm, done;
 		migration_reclaim_stats(&pages, &shm, &ksm, &done);

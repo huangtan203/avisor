@@ -3275,6 +3275,25 @@ done24_cleanup:
  * 默认双 vCPU VM2 验证非法阶段调用和整 VM 迁移拒绝边界；
  * 下方单 vCPU 迁移原型代码保留供专用拓扑回归使用。
  */
+static void test_phase40_stack_telemetry(void)
+{
+    u64 free_bytes;
+    u64 guard_ok;
+
+    guest_puts("\n--- Test 25: Phase 40 EL2 task stack telemetry ---\n");
+    free_bytes = hvc_call_ret2(HVC_TASK_STACK_STATS, 0, &guard_ok);
+    guest_puts("  最小剩余栈空间=");
+    puts_dec((int)free_bytes);
+    guest_puts(" bytes, guard=");
+    puts_dec((int)guard_ok);
+    guest_puts("\n");
+    if (!guard_ok || free_bytes < 256) {
+        guest_puts("  FAIL: EL2 task 栈遥测不满足安全阈值\n");
+        return;
+    }
+    guest_puts("  PASS: EL2 task 栈 canary 与最低余量正常\n");
+}
+
 static int test_phase25_migration(void)
 {
     int passed = 1;
@@ -4216,6 +4235,9 @@ void guest_main(void)
 
     /* 测试 17: Phase 24 KSM 内存去重（主核单线程） */
     test_phase24_ksm();
+
+    /* Phase 40: 在迁移前查询 VM2 vCPU0 的 EL2 task 栈遥测。 */
+    if (vmid == 2) test_phase40_stack_telemetry();
 
     /* 测试 18: Phase 25 Live Migration（仅 VM2 发起，迁移到 VM3） */
     if (vmid == 2) test_phase25_migration();
