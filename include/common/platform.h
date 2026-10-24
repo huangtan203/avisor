@@ -20,6 +20,12 @@ struct platform_info {
 	unsigned long gicd_base;
 	unsigned long gicr_base;
 	int dtb_valid;
+	int memory_config_valid;
+	int mmio_config_valid;
+	int memory_discovered;
+	int uart_discovered;
+	int gic_discovered;
+	int gicv3_discovered;
 };
 
 extern struct platform_info platform_current;
@@ -32,3 +38,5 @@ unsigned long platform_uart_base(void);
 unsigned long platform_gicd_base(void);
 unsigned long platform_gicr_base(int cpu_id);
 int platform_runtime_config_valid(void);
+int platform_memory_config_valid(void);
+int platform_mmio_config_valid(void);

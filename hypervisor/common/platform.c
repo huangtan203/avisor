@@ -150,6 +150,9 @@ static int fdt_parse(unsigned long dtb)
 			if (!prop)
 				return -1;
 
+			if (gic_node && !strcmp(prop, FDT_COMPATIBLE) &&
+			    text_has((const char *)value, len, "arm,gic-v3"))
+				platform_current.gicv3_discovered = 1;
 			if (depth == 0 && !strcmp(prop, FDT_COMPATIBLE)) {
 				if (text_has((const char *)value, len, "nvidia,tegra234") ||
 				    text_has((const char *)value, len, "jetson-agx-orin")) {
@@ -169,11 +172,19 @@ static int fdt_parse(unsigned long dtb)
 			    text_has((const char *)value, len, "cpu"))
 				platform_current.cpu_count++;
 			if (depth >= 1 && uart_node && !strcmp(prop, FDT_REG) &&
-			    len >= (address_cells + size_cells) * 4)
+			    len >= (address_cells + size_cells) * 4) {
 				platform_current.uart_base = read_cells(value, address_cells);
+				platform_current.uart_discovered = 1;
+			}
 			if (depth >= 1 && gic_node && !strcmp(prop, FDT_REG) &&
-			    len >= (address_cells + size_cells) * 4)
+			    len >= (address_cells + size_cells) * 4) {
+				unsigned int tuple_cells = address_cells + size_cells;
 				platform_current.gicd_base = read_cells(value, address_cells);
+				if (len >= tuple_cells * 8)
+					platform_current.gicr_base =
+						read_cells(value + tuple_cells * 4, address_cells);
+				platform_current.gic_discovered = 1;
+			}
 			if (depth == 1 && memory_node && !strcmp(prop, FDT_REG) &&
 			    len >= (address_cells + size_cells) * 4) {
 				unsigned int i;
@@ -184,6 +195,7 @@ static int fdt_parse(unsigned long dtb)
 					size = (size << 32) | be32(value + (address_cells + i) * 4);
 				platform_current.memory_base = address;
 				platform_current.memory_size = size;
+				platform_current.memory_discovered = 1;
 			}
 			cursor = align4(cursor + len);
 			continue;
@@ -210,7 +222,18 @@ unsigned long platform_gicr_base(int cpu_id)
 
 int platform_runtime_config_valid(void)
 {
-	return platform_current.dtb_valid && platform_current.kind == PLATFORM_KIND_QEMU_VIRT;
+	return platform_current.dtb_valid && platform_current.kind == PLATFORM_KIND_QEMU_VIRT &&
+	       platform_current.memory_config_valid && platform_current.mmio_config_valid;
+}
+
+int platform_memory_config_valid(void)
+{
+	return platform_current.memory_config_valid;
+}
+
+int platform_mmio_config_valid(void)
+{
+	return platform_current.mmio_config_valid;
 }
 
 const char *platform_kind_name(enum platform_kind kind)
@@ -236,15 +259,34 @@ void platform_early_probe(void)
 	platform_current.uart_base = VIRT_UART_BASE;
 	platform_current.gicd_base = VIRT_GICD_BASE;
 	platform_current.gicr_base = VIRT_GICR_BASE;
+	platform_current.memory_config_valid = 0;
+	platform_current.mmio_config_valid = 0;
 	platform_current.cpu_count = 0;
 	platform_current.dtb_valid = fdt_parse(platform_current.dtb) == 0;
 	if (platform_current.dtb_valid && !platform_current.cpu_count)
 		platform_current.cpu_count = MAX_CPUS;
 	if (platform_current.dtb_valid && platform_current.kind == PLATFORM_KIND_QEMU_VIRT) {
-		virt_uart_base = VA_START + platform_current.uart_base;
-		virt_gicd_base = VA_START + platform_current.gicd_base;
-		virt_gicr_base = VA_START + platform_current.gicr_base;
+		platform_current.memory_config_valid =
+			platform_current.memory_discovered &&
+			platform_current.memory_base == VIRT_DRAM_BASE &&
+			platform_current.memory_size == PHYS_MEMORY_SIZE;
+		platform_current.mmio_config_valid =
+			platform_current.uart_discovered &&
+			platform_current.gic_discovered &&
+			platform_current.gicv3_discovered &&
+			platform_current.uart_base >= VIRT_MMIO_BASE &&
+			platform_current.uart_base < VIRT_MMIO_BASE + VIRT_MMIO_SIZE &&
+			platform_current.gicd_base >= VIRT_MMIO_BASE &&
+			platform_current.gicd_base < VIRT_MMIO_BASE + VIRT_MMIO_SIZE &&
+			platform_current.gicr_base >= VIRT_MMIO_BASE &&
+			platform_current.gicr_base < VIRT_MMIO_BASE + VIRT_MMIO_SIZE;
+		if (platform_current.memory_config_valid && platform_current.mmio_config_valid) {
+			virt_uart_base = VA_START + platform_current.uart_base;
+			virt_gicd_base = VA_START + platform_current.gicd_base;
+			virt_gicr_base = VA_START + platform_current.gicr_base;
+		}
 	}
+
 	if (!platform_current.dtb_valid) {
 		platform_current.cpu_count = MAX_CPUS;
 		platform_current.memory_base = VIRT_DRAM_BASE;
@@ -264,6 +306,10 @@ void platform_early_probe(void)
 	       (void *)platform_current.uart_base,
 	       (void *)platform_current.gicd_base,
 	       (void *)platform_current.gicr_base);
+	printf("[platform] memory-config=%s mmio-config=%s runtime=%s\n",
+	       platform_current.memory_config_valid ? "valid" : "fallback",
+	       platform_current.mmio_config_valid ? "valid" : "fallback",
+	       platform_runtime_config_valid() ? "enabled" : "fixed-layout");
 	if (platform_current.kind == PLATFORM_KIND_AGX_ORIN)
 		printf("[platform] AGX Orin recognized: hardware drivers not enabled\n");
 }
