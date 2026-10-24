@@ -170,6 +170,14 @@ int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 		deallocate_page(p);
 		return -1;
 	}
+	p->console.in_fifo = NULL;
+	p->console.out_fifo = NULL;
+	init_task_console(p);
+	if (!p->console.in_fifo || !p->console.out_fifo) {
+		destroy_task_aux(p);
+		deallocate_page(p);
+		return -1;
+	}
 
 	struct pt_regs *childregs = task_pt_regs(p);
 
@@ -214,8 +222,6 @@ int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 	cpu_state[cpu].task[pid] = p;
 	p->pid = pid;  /* pid 是 per-CPU 的，多核间可能重复 */
 
-	init_task_console(p);
-
 	return pid;
 }
 
@@ -223,6 +229,20 @@ void init_task_console(struct task_struct *tsk)
 {
 	tsk->console.in_fifo = create_fifo();
 	tsk->console.out_fifo = create_fifo();
+}
+
+void destroy_task_aux(struct task_struct *tsk)
+{
+	if (!tsk)
+		return;
+
+	destroy_fifo(tsk->console.in_fifo);
+	destroy_fifo(tsk->console.out_fifo);
+	tsk->console.in_fifo = NULL;
+	tsk->console.out_fifo = NULL;
+	if (tsk->freeze_context)
+		deallocate_page(tsk->freeze_context);
+	tsk->freeze_context = NULL;
 }
 
 void flush_task_console(struct task_struct *tsk)

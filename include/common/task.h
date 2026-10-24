@@ -41,6 +41,7 @@ int task_stack_guard_valid(struct task_struct *);
 int create_task(loader_func_t, void *);
 int create_task_on_cpu(int cpu, loader_func_t, void *);
 void init_task_console(struct task_struct *);
+void destroy_task_aux(struct task_struct *);
 int is_uart_forwarded_task(struct task_struct *);
 void flush_task_console(struct task_struct *);
 void increment_current_pc(int);

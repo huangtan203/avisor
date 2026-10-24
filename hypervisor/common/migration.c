@@ -589,7 +589,8 @@ int migration_finish(struct task_struct *src)
 	migration_reclaim_src(src);
 #endif
 
-	/* 11. 停止源 vCPU0，唤醒目标 VM3 vCPU0 并立即调度过去 */
+	/* 11. 停止源 vCPU0，释放其 task 辅助页后再切换到目标。 */
+	destroy_task_aux(src);
 	src->state = TASK_ZOMBIE;
 	mig_dst->state = TASK_RUNNING;
 	mig_dst->priority = src->priority;

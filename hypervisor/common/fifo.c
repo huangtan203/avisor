@@ -34,11 +34,19 @@ int is_full_fifo(struct fifo *fifo)
 struct fifo *create_fifo()
 {
 	struct fifo *fifo = (struct fifo *)allocate_page();
+	if (!fifo)
+		return NULL;
 	fifo->head = 0;
 	fifo->tail = 0;
 	fifo->used = 0;
 
 	return fifo;
+}
+
+void destroy_fifo(struct fifo *fifo)
+{
+	if (fifo)
+		deallocate_page(fifo);
 }
 
 void clear_fifo(struct fifo *fifo)
