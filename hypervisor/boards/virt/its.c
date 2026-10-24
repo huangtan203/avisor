@@ -17,18 +17,19 @@
 #include "boards/virt/base.h"
 #include "boards/virt/gicv3.h"
 #include "common/mm.h"
+#include "common/platform.h"
 #include "common/debug.h"
 #include "common/utils.h"
 
 /* ---------- GITS 寄存器（VA = PA 等值映射，位于 MMIO 区域内） ---------- */
 
-#define GITS_CTLR          (VIRT_GITS_BASE + 0x0000)  /* 控制：bit0=Enabled */
-#define GITS_TYPER         (VIRT_GITS_BASE + 0x0008)  /* 能力（RO） */
-#define GITS_CBASER        (VIRT_GITS_BASE + 0x0080)  /* 命令队列基址 */
-#define GITS_CWRITER       (VIRT_GITS_BASE + 0x0088)  /* 命令队列写指针 */
-#define GITS_CREADR        (VIRT_GITS_BASE + 0x0090)  /* 命令队列读指针 */
-#define GITS_BASER(n)      (VIRT_GITS_BASE + 0x0100 + (n) * 8) /* 表基址 n=0..7 */
-#define GITS_TRANSLATER    (VIRT_GITS_BASE + 0x10040) /* MSI doorbell（WO） */
+#define GITS_CTLR          (GITS_BASE + 0x0000)  /* 控制：bit0=Enabled */
+#define GITS_TYPER         (GITS_BASE + 0x0008)  /* 能力（RO） */
+#define GITS_CBASER        (GITS_BASE + 0x0080)  /* 命令队列基址 */
+#define GITS_CWRITER       (GITS_BASE + 0x0088)  /* 命令队列写指针 */
+#define GITS_CREADR        (GITS_BASE + 0x0090)  /* 命令队列读指针 */
+#define GITS_BASER(n)      (GITS_BASE + 0x0100 + (n) * 8) /* 表基址 n=0..7 */
+#define GITS_TRANSLATER    (GITS_BASE + 0x10040) /* MSI doorbell（WO） */
 
 /* Redistributor RD_base 帧内的 LPI 寄存器偏移 */
 #define GICR_CTLR_OFF       0x0000   /* bit0 = EnableLPIs */
@@ -121,7 +122,7 @@ static void its_send_cmd(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3)
  */
 uint64_t its_get_msi_address(void)
 {
-    return GITS_TRANSLATER;
+    return platform_gits_base() + 0x10040;
 }
 
 /* MSI 消息数据 = EventID（QEMU msi_send_message 把它 32 位写入 doorbell） */

@@ -15,11 +15,21 @@
 #define FDT_MODEL "model"
 #define FDT_DEVICE_TYPE "device_type"
 #define FDT_REG "reg"
+#define FDT_INTERRUPTS "interrupts"
+#define FDT_REDIST_STRIDE "redistributor-stride"
+
+#define GIC_PPI_TYPE 1U
+#define GIC_PPI_BASE 16U
+#define TIMER_VIRT_INDEX 2U
+#define TIMER_HYP_INDEX 3U
+#define TIMER_IRQ_CELLS 3U
+#define GITS_TRANSLATER_END 0x10044UL
 
 struct platform_info platform_current;
 unsigned long virt_uart_base = VA_START + VIRT_UART_BASE;
 unsigned long virt_gicd_base = VA_START + VIRT_GICD_BASE;
 unsigned long virt_gicr_base = VA_START + VIRT_GICR_BASE;
+unsigned long virt_gits_base = VA_START + VIRT_GITS_BASE;
 unsigned long platform_dtb_address;
 unsigned long platform_dtb_address_alt;
 
@@ -46,6 +56,13 @@ static unsigned long read_cells(const unsigned char *value, unsigned int cells)
 	return result;
 }
 
+static int range_within(unsigned long base, unsigned long size,
+			unsigned long window_base, unsigned long window_size)
+{
+	return size && base >= window_base && base - window_base < window_size &&
+	       size <= window_size - (base - window_base);
+}
+
 static int text_has(const char *data, unsigned int len, const char *needle)
 {
 	unsigned int i;
@@ -63,6 +80,24 @@ static int text_has(const char *data, unsigned int len, const char *needle)
 			;
 		if (j == n)
 			return 1;
+	}
+	return 0;
+}
+
+static int compatible_has(const unsigned char *data, unsigned int len,
+			  const char *needle)
+{
+	unsigned int pos = 0;
+
+	while (pos < len) {
+		unsigned int end = pos;
+
+		while (end < len && data[end])
+			end++;
+		if (end - pos == strlen(needle) &&
+		    !memcmp(data + pos, needle, end - pos))
+			return 1;
+		pos = end + 1;
 	}
 	return 0;
 }
@@ -88,6 +123,8 @@ static int fdt_parse(unsigned long dtb)
 	int cpu_node = 0;
 	int uart_node = 0;
 	int gic_node = 0;
+	int its_node = 0;
+	int timer_node = 0;
 
 	if (!dtb || be32(base) != FDT_MAGIC)
 		return -1;
@@ -120,13 +157,19 @@ static int fdt_parse(unsigned long dtb)
 			memory_node = text_has(name, len, "memory");
 			cpu_node = depth >= 1 && text_has(name, len, "cpu");
 			uart_node = text_has(name, len, "pl011");
-			gic_node = text_has(name, len, "intc") || text_has(name, len, "gic");
+			gic_node = text_has(name, len, "intc");
+			its_node = text_has(name, len, "its");
+			timer_node = depth == 1 && text_has(name, len, "timer");
 			continue;
 		}
 		if (token == FDT_END_NODE) {
 			depth--;
 			memory_node = 0;
 			cpu_node = 0;
+			uart_node = 0;
+			gic_node = 0;
+			its_node = 0;
+			timer_node = 0;
 			continue;
 		}
 		if (token == FDT_NOP)
@@ -151,8 +194,14 @@ static int fdt_parse(unsigned long dtb)
 				return -1;
 
 			if (gic_node && !strcmp(prop, FDT_COMPATIBLE) &&
-			    text_has((const char *)value, len, "arm,gic-v3"))
+			    compatible_has(value, len, "arm,gic-v3"))
 				platform_current.gicv3_discovered = 1;
+			if (its_node && !strcmp(prop, FDT_COMPATIBLE) &&
+			    compatible_has(value, len, "arm,gic-v3-its"))
+				platform_current.gits_compatible = 1;
+			if (timer_node && !strcmp(prop, FDT_COMPATIBLE) &&
+			    compatible_has(value, len, "arm,armv8-timer"))
+				platform_current.timer_discovered = 1;
 			if (depth == 0 && !strcmp(prop, FDT_COMPATIBLE)) {
 				if (text_has((const char *)value, len, "nvidia,tegra234") ||
 				    text_has((const char *)value, len, "jetson-agx-orin")) {
@@ -179,12 +228,46 @@ static int fdt_parse(unsigned long dtb)
 			if (depth >= 1 && gic_node && !strcmp(prop, FDT_REG) &&
 			    len >= (address_cells + size_cells) * 4) {
 				unsigned int tuple_cells = address_cells + size_cells;
+				unsigned int tuples = len / (tuple_cells * 4);
+
 				platform_current.gicd_base = read_cells(value, address_cells);
-				if (len >= tuple_cells * 8)
+				platform_current.gicd_size =
+					read_cells(value + address_cells * 4, size_cells);
+				if (tuples > 1) {
 					platform_current.gicr_base =
 						read_cells(value + tuple_cells * 4, address_cells);
+					platform_current.gicr_size =
+						read_cells(value + (tuple_cells + address_cells) * 4,
+							   size_cells);
+					platform_current.gicr_discovered = 1;
+				}
 				platform_current.gic_discovered = 1;
 			}
+			if (gic_node && !strcmp(prop, FDT_REDIST_STRIDE) &&
+			    len >= 4)
+				platform_current.gicr_stride = read_cells(value, 1);
+			if (its_node && !strcmp(prop, FDT_REG) &&
+			    len >= (address_cells + size_cells) * 4) {
+				platform_current.gits_base = read_cells(value, address_cells);
+				platform_current.gits_size =
+					read_cells(value + address_cells * 4, size_cells);
+				platform_current.gits_discovered = 1;
+			}
+			if (timer_node && !strcmp(prop, FDT_INTERRUPTS) &&
+			    len >= 4 * TIMER_IRQ_CELLS * 4) {
+				unsigned int virt_offset = TIMER_VIRT_INDEX * TIMER_IRQ_CELLS * 4;
+				unsigned int hyp_offset = TIMER_HYP_INDEX * TIMER_IRQ_CELLS * 4;
+
+				if (be32(value + virt_offset) == GIC_PPI_TYPE &&
+				    be32(value + hyp_offset) == GIC_PPI_TYPE) {
+					platform_current.timer_virt_ppi =
+						GIC_PPI_BASE + be32(value + virt_offset + 4);
+					platform_current.timer_hyp_ppi =
+						GIC_PPI_BASE + be32(value + hyp_offset + 4);
+					platform_current.timer_interrupts_discovered = 1;
+				}
+			}
+
 			if (depth == 1 && memory_node && !strcmp(prop, FDT_REG) &&
 			    len >= (address_cells + size_cells) * 4) {
 				unsigned int i;
@@ -217,7 +300,23 @@ unsigned long platform_gicd_base(void)
 
 unsigned long platform_gicr_base(int cpu_id)
 {
-	return platform_current.gicr_base + (unsigned long)cpu_id * VIRT_GICR_STRIDE;
+	return platform_current.gicr_base +
+	       (unsigned long)cpu_id * platform_current.gicr_stride;
+}
+
+unsigned long platform_gits_base(void)
+{
+	return platform_current.gits_base;
+}
+
+unsigned int platform_timer_hyp_ppi(void)
+{
+	return platform_current.timer_hyp_ppi;
+}
+
+unsigned int platform_timer_virt_ppi(void)
+{
+	return platform_current.timer_virt_ppi;
 }
 
 int platform_runtime_config_valid(void)
@@ -258,7 +357,14 @@ void platform_early_probe(void)
 	platform_current.memory_size = PHYS_MEMORY_SIZE;
 	platform_current.uart_base = VIRT_UART_BASE;
 	platform_current.gicd_base = VIRT_GICD_BASE;
+	platform_current.gicd_size = 0x10000UL;
 	platform_current.gicr_base = VIRT_GICR_BASE;
+	platform_current.gicr_size = MAX_CPUS * VIRT_GICR_STRIDE;
+	platform_current.gicr_stride = VIRT_GICR_STRIDE;
+	platform_current.gits_base = VIRT_GITS_BASE;
+	platform_current.gits_size = VIRT_GITS_SIZE;
+	platform_current.timer_hyp_ppi = 26;
+	platform_current.timer_virt_ppi = 27;
 	platform_current.memory_config_valid = 0;
 	platform_current.mmio_config_valid = 0;
 	platform_current.cpu_count = 0;
@@ -274,26 +380,50 @@ void platform_early_probe(void)
 			platform_current.uart_discovered &&
 			platform_current.gic_discovered &&
 			platform_current.gicv3_discovered &&
-			platform_current.uart_base >= VIRT_MMIO_BASE &&
-			platform_current.uart_base < VIRT_MMIO_BASE + VIRT_MMIO_SIZE &&
-			platform_current.gicd_base >= VIRT_MMIO_BASE &&
-			platform_current.gicd_base < VIRT_MMIO_BASE + VIRT_MMIO_SIZE &&
-			platform_current.gicr_base >= VIRT_MMIO_BASE &&
-			platform_current.gicr_base < VIRT_MMIO_BASE + VIRT_MMIO_SIZE;
+			platform_current.gicr_discovered &&
+			platform_current.gits_discovered &&
+			platform_current.gits_compatible &&
+			platform_current.timer_discovered &&
+			platform_current.timer_interrupts_discovered &&
+			platform_current.gicr_stride >= 0x20000UL &&
+			platform_current.gicr_size >=
+				platform_current.cpu_count * platform_current.gicr_stride &&
+			platform_current.gits_size >= GITS_TRANSLATER_END &&
+			platform_current.timer_hyp_ppi == 26 &&
+			platform_current.timer_virt_ppi == 27 &&
+			range_within(platform_current.uart_base, 1, VIRT_MMIO_BASE,
+				     VIRT_MMIO_SIZE) &&
+			range_within(platform_current.gicd_base,
+				     platform_current.gicd_size, VIRT_MMIO_BASE,
+				     VIRT_MMIO_SIZE) &&
+			range_within(platform_current.gicr_base,
+				     platform_current.gicr_size, VIRT_MMIO_BASE,
+				     VIRT_MMIO_SIZE) &&
+			range_within(platform_current.gits_base,
+				     platform_current.gits_size, VIRT_MMIO_BASE,
+				     VIRT_MMIO_SIZE);
 		if (platform_current.memory_config_valid && platform_current.mmio_config_valid) {
 			virt_uart_base = VA_START + platform_current.uart_base;
 			virt_gicd_base = VA_START + platform_current.gicd_base;
 			virt_gicr_base = VA_START + platform_current.gicr_base;
+			virt_gits_base = VA_START + platform_current.gits_base;
 		}
 	}
 
-	if (!platform_current.dtb_valid) {
-		platform_current.cpu_count = MAX_CPUS;
+	if (!platform_runtime_config_valid()) {
+		platform_current.cpu_count = platform_current.cpu_count ?: MAX_CPUS;
 		platform_current.memory_base = VIRT_DRAM_BASE;
 		platform_current.memory_size = PHYS_MEMORY_SIZE;
 		platform_current.uart_base = VIRT_UART_BASE;
 		platform_current.gicd_base = VIRT_GICD_BASE;
+		platform_current.gicd_size = 0x10000UL;
 		platform_current.gicr_base = VIRT_GICR_BASE;
+		platform_current.gicr_size = MAX_CPUS * VIRT_GICR_STRIDE;
+		platform_current.gicr_stride = VIRT_GICR_STRIDE;
+		platform_current.gits_base = VIRT_GITS_BASE;
+		platform_current.gits_size = VIRT_GITS_SIZE;
+		platform_current.timer_hyp_ppi = 26;
+		platform_current.timer_virt_ppi = 27;
 	}
 
 	printf("[platform] %s, dtb=%p (%s)\n", platform_current.name,
@@ -306,6 +436,13 @@ void platform_early_probe(void)
 	       (void *)platform_current.uart_base,
 	       (void *)platform_current.gicd_base,
 	       (void *)platform_current.gicr_base);
+	printf("[platform] gicr-size=%p stride=%p its=%p+%p timer-ppi=%u/%u\n",
+	       (void *)platform_current.gicr_size,
+	       (void *)platform_current.gicr_stride,
+	       (void *)platform_current.gits_base,
+	       (void *)platform_current.gits_size,
+	       platform_current.timer_hyp_ppi,
+	       platform_current.timer_virt_ppi);
 	printf("[platform] memory-config=%s mmio-config=%s runtime=%s\n",
 	       platform_current.memory_config_valid ? "valid" : "fallback",
 	       platform_current.mmio_config_valid ? "valid" : "fallback",

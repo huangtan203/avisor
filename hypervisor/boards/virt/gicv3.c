@@ -26,6 +26,7 @@
 #include "boards/virt/gicv3.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
+#include "common/platform.h"
 #include "common/sched.h"
 #include "common/utils.h"
 
@@ -42,7 +43,7 @@
  */
 uint64_t gic_get_redist_base(int cpu_id)
 {
-    return GICR_BASE + cpu_id * VIRT_GICR_STRIDE;
+    return VA_START + platform_gicr_base(cpu_id);
 }
 
 /*

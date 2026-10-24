@@ -107,9 +107,14 @@
 extern unsigned long virt_uart_base;
 extern unsigned long virt_gicd_base;
 extern unsigned long virt_gicr_base;
+extern unsigned long virt_gits_base;
 
 #define UART_BASE          (virt_uart_base)
 #define GICD_BASE          (virt_gicd_base)
 #define GICR_BASE          (virt_gicr_base)
 #endif
+#ifdef __ASSEMBLER__
 #define GITS_BASE          (VA_START + VIRT_GITS_BASE)
+#else
+#define GITS_BASE          (virt_gits_base)
+#endif

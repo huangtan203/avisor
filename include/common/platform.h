@@ -18,7 +18,14 @@ struct platform_info {
 	unsigned long memory_size;
 	unsigned long uart_base;
 	unsigned long gicd_base;
+	unsigned long gicd_size;
 	unsigned long gicr_base;
+	unsigned long gicr_size;
+	unsigned long gicr_stride;
+	unsigned long gits_base;
+	unsigned long gits_size;
+	unsigned int timer_hyp_ppi;
+	unsigned int timer_virt_ppi;
 	int dtb_valid;
 	int memory_config_valid;
 	int mmio_config_valid;
@@ -26,6 +33,11 @@ struct platform_info {
 	int uart_discovered;
 	int gic_discovered;
 	int gicv3_discovered;
+	int gicr_discovered;
+	int gits_discovered;
+	int gits_compatible;
+	int timer_discovered;
+	int timer_interrupts_discovered;
 };
 
 extern struct platform_info platform_current;
@@ -37,6 +49,9 @@ const char *platform_kind_name(enum platform_kind kind);
 unsigned long platform_uart_base(void);
 unsigned long platform_gicd_base(void);
 unsigned long platform_gicr_base(int cpu_id);
+unsigned long platform_gits_base(void);
+unsigned int platform_timer_hyp_ppi(void);
+unsigned int platform_timer_virt_ppi(void);
 int platform_runtime_config_valid(void);
 int platform_memory_config_valid(void);
 int platform_mmio_config_valid(void);
