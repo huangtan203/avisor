@@ -92,13 +92,24 @@ int ksm_scan_vm(struct task_struct *task, int max_scan_pages);
  */
 int ksm_is_shared_page(paddr_t pa);
 
-/*
- * CoW 分离：将共享页分离为私有可写页
+/* CoW 分离：将共享页分离为私有可写页
  *   task: 目标 VM
  *   ipa: 中间物理地址（Stage-2 映射地址）
  *   返回 0 成功，-1 失败
  */
 int ksm_cow_break(struct task_struct *task, vaddr_t ipa);
+
+/*
+ * Phase 34: 释放指定 VM 对 KSM 共享页的全部引用（源 VM 回收用）。
+ *
+ * 遍历 VM 的 Stage-2 页表，对每个带 MM_STAGE2_KSM_SHARED 标志的映射：
+ *   - 递减对应 ksm_page 的引用计数
+ *   - refcount 归 0 时释放共享物理页 + ksm_page 结构体
+ *   - 清零 L3 entry
+ *
+ * 返回处理的共享映射数，-1 失败。
+ */
+int ksm_drop_vm(struct task_struct *task);
 
 /* 获取 KSM 统计信息 */
 void ksm_get_stats(struct ksm_stats *stats);

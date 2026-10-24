@@ -23,12 +23,15 @@
 #include "common/utils.h"
 #include "common/task.h"
 #include "common/smp.h"
+#include "common/ksm.h"
+#include "common/debug.h"
 #include "arch/aarch64/mmu.h"
 
 #ifdef PLATFORM_VIRT
 #include "arch/aarch64/sysregs.h"
 #include "boards/virt/vgic.h"
 #include "boards/virt/virt_board.h"
+#include "boards/virt/shmem.h"
 #endif
 
 /* 迁移目标 VM（main_virt.c 创建 dormant VM3 后通过 migration_set_dest 注册） */
@@ -37,6 +40,12 @@ static enum migration_state mig_state = MIGRATION_IDLE;
 
 /* FINISH 时捕获的源 VM pt_regs（ERET 现场），目标 VM 首次调度时恢复 */
 static struct pt_regs mig_saved_regs;
+
+/* Phase 34: 源 VM 回收统计 */
+static int mig_reclaim_pages;
+static int mig_reclaim_shm;
+static int mig_reclaim_ksm;
+static int mig_reclaim_vm_done;
 
 /* 迁移遍历操作 */
 enum {
@@ -240,6 +249,59 @@ int migration_precopy(struct task_struct *src)
 }
 
 /*
+ * Phase 34: 回收源 VM 的全部资源。
+ *
+ * 在 FINISH 转移状态后调用，释放 VM2 独占资源：
+ *   1. shm_detach_vm   —— 清除跨 VM 共享内存 attach（不释放物理页）
+ *   2. ksm_drop_vm     —— 释放 KSM 共享页引用（refcount 归 0 才释放页）
+ *   3. virt_destroy_vm —— 注销 ivshmem peer + 释放 board_data 页
+ *   4. destroy_vm_pages—— 释放普通页 + 页表页 + first_table
+ *
+ * 顺序关键：先清共享资源引用（避免 destroy_vm_pages 误释放共享页），
+ * 再销毁设备模型与页表。
+ */
+static void migration_reclaim_src(struct task_struct *src)
+{
+	if (!src)
+		return;
+
+	mig_reclaim_pages = -1;
+	mig_reclaim_shm = 0;
+	mig_reclaim_ksm = 0;
+	mig_reclaim_vm_done = 0;
+
+#ifdef PLATFORM_VIRT
+	mig_reclaim_shm = shm_detach_vm(src);
+	mig_reclaim_ksm = ksm_drop_vm(src);
+	virt_destroy_vm(src);
+	mig_reclaim_pages = destroy_vm_pages(src);
+	mig_reclaim_vm_done = (mig_reclaim_shm >= 0 &&
+				mig_reclaim_ksm >= 0 &&
+				mig_reclaim_pages >= 0);
+#else
+	mig_reclaim_pages = destroy_vm_pages(src);
+	mig_reclaim_vm_done = (mig_reclaim_pages >= 0);
+#endif
+
+	INFO("migration: source VM reclaimed (pages=%d shm=%d ksm=%d done=%d)",
+	     mig_reclaim_pages, mig_reclaim_shm, mig_reclaim_ksm,
+	     mig_reclaim_vm_done);
+}
+
+/* Phase 34: 查询源 VM 回收统计 */
+void migration_reclaim_stats(int *pages, int *shm, int *ksm, int *done)
+{
+	if (pages)
+		*pages = mig_reclaim_pages;
+	if (shm)
+		*shm = mig_reclaim_shm;
+	if (ksm)
+		*ksm = mig_reclaim_ksm;
+	if (done)
+		*done = mig_reclaim_vm_done;
+}
+
+/*
  * 迁移阶段三：stop-and-copy + 状态转移 + 调度到目标 VM。
  *
  * Phase 33：双 vCPU 全迁移。本函数在 VM2 vCPU0 的 HVC handler 内被
@@ -319,6 +381,21 @@ int migration_finish(struct task_struct *src)
 
 	/* 10. 释放 vCPU1：它以 VM3 身份从冻结点恢复执行 */
 	smp_vm_txn_commit();
+
+#ifdef PLATFORM_VIRT
+	/* 10b. Phase 34: 回收源 VM2 资源。
+	 *
+	 * vCPU1 已就地改造为 VM3 vCPU1（mm/board_data 指向 VM3），
+	 * 不再引用 VM2 的任何资源；此处清理 VM2 独占资源：
+	 *   - vm_vcpus 查找表（[1][0] = src，[1][1] = vCPU1 残留槽）
+	 *   - 设备模型 + ivshmem peer + 跨 VM shm + KSM 共享引用
+	 *   - Stage-2 页表与普通用户页
+	 * 共享物理页（ivshmem shmem / shm）不会被误释放。
+	 */
+	virt_unregister_vcpu(2, 0);
+	virt_unregister_vcpu(2, 1);
+	migration_reclaim_src(src);
+#endif
 
 	/* 11. 停止源 vCPU0，唤醒目标 VM3 vCPU0 并立即调度过去 */
 	src->state = TASK_ZOMBIE;

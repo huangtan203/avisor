@@ -106,6 +106,9 @@ typedef int bool;
 #define HVC_VM_TXN_ROLLBACK 65 /* 回滚：整 VM 回卷到冻结点 */
 #define HVC_VM_TXN_STATUS   66 /* 查询 VM 级事务状态：0=无 1=冻结 2=回放 */
 
+/* Phase 34: 迁移后源 VM 回收统计 */
+#define HVC_MIGRATE_RECLAIM_STATS 67
+
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60
 

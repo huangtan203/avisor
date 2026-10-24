@@ -441,6 +441,91 @@ void ksm_get_stats(struct ksm_stats *stats)
 		memcpy(stats, &ksm_global_stats, sizeof(*stats));
 }
 
+/*
+ * Phase 34: 释放指定 VM 对 KSM 共享页的全部引用。
+ *
+ * 遍历 VM 的 Stage-2 页表，对每个带 MM_STAGE2_KSM_SHARED 标志的
+ * 映射递减对应 ksm_page 的引用计数；refcount 归 0 时释放共享物理页
+ * 与 ksm_page 结构体。最后清零 L3 entry。
+ *
+ * 返回处理的共享映射数，-1 失败。
+ */
+int ksm_drop_vm(struct task_struct *task)
+{
+	paddr_t l1_table, l2_table_pa, l3_table_pa;
+	uint64_t *l1, *l2, *l3;
+	int i1, i2, i3;
+	int dropped = 0;
+	int failed = 0;
+
+	if (!task || !task->mm.first_table)
+		return -1;
+
+	l1_table = task->mm.first_table;
+	l1 = (uint64_t *)TO_VADDR(l1_table);
+
+	for (i1 = 0; i1 < PTRS_PER_TABLE; i1++) {
+		uint64_t e1 = l1[i1];
+		if ((e1 & 0x3) != 3)
+			continue;
+
+		l2_table_pa = e1 & MM_STAGE2_PA_MASK;
+		l2 = (uint64_t *)TO_VADDR(l2_table_pa);
+
+		for (i2 = 0; i2 < PTRS_PER_TABLE; i2++) {
+			uint64_t e2 = l2[i2];
+			if ((e2 & 0x3) != 3)
+				continue;
+
+			l3_table_pa = e2 & MM_STAGE2_PA_MASK;
+			l3 = (uint64_t *)TO_VADDR(l3_table_pa);
+
+			for (i3 = 0; i3 < PTRS_PER_TABLE; i3++) {
+				uint64_t e3 = l3[i3];
+				paddr_t shared_pa;
+				struct ksm_page *kp;
+				uint32_t hash;
+
+				if ((e3 & 0x3) != 0x3)
+					continue;
+				if (!(e3 & MM_STAGE2_KSM_SHARED))
+					continue;
+
+				shared_pa = e3 & MM_STAGE2_PA_MASK;
+				hash = ksm_page_hash((void *)TO_VADDR(shared_pa));
+				kp = ksm_hash_lookup(hash,
+						     (void *)TO_VADDR(shared_pa));
+				if (!kp) {
+					failed = 1;
+					continue;
+				}
+
+				/* pages_sharing 只统计规范页之外的额外映射。 */
+				if (kp->refcount > 1)
+					ksm_global_stats.pages_sharing--;
+				kp->refcount--;
+				if (kp->refcount == 0) {
+					ksm_hash_remove(kp);
+					ksm_global_stats.pages_shared--;
+					deallocate_page((void *)TO_VADDR(shared_pa));
+					ksm_page_free(kp);
+				}
+
+				l3[i3] = 0;
+				dropped++;
+			}
+		}
+	}
+
+	if (dropped > 0) {
+		asm volatile("tlbi vmalle1" ::: "memory");
+		asm volatile("dsb ish" ::: "memory");
+		asm volatile("isb" ::: "memory");
+	}
+
+	return failed ? -1 : dropped;
+}
+
 /* 初始化 KSM */
 void ksm_init(void)
 {

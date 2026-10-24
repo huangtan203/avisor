@@ -477,6 +477,16 @@ void handle_hvc64(unsigned long hvc_nr)
 			 smp_processor_id() == 0)
 				? smp_vm_txn_status() : 0;
 		break;
+	/* Phase 34: 查询迁移后源 VM 回收统计 */
+	case HVC_MIGRATE_RECLAIM_STATS: {
+		int pages, shm, ksm, done;
+		migration_reclaim_stats(&pages, &shm, &ksm, &done);
+		regs->regs[0] = pages;
+		regs->regs[1] = shm;
+		regs->regs[2] = ksm;
+		regs->regs[3] = done;
+		break;
+	}
 #endif
 	default:
 		WARN("HVC #%d", hvc_nr);

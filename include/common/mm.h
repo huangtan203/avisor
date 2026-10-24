@@ -112,6 +112,20 @@ int reclaim_pages(struct task_struct *task, int nr_pages);
 int get_reclaim_stats(struct task_struct *task, int *reclaim_count,
 		      int *reclaim_fail_count);
 
+/*
+ * Phase 34: 销毁 VM 的全部 Stage-2 映射与物理页。
+ *
+ * 遍历 L1->L2->L3 全表，释放：
+ *   - 普通用户页（4KB / 2MB 大页）
+ *   - L2/L3 页表页
+ *   - first_table 根页
+ *
+ * 共享内存（ivshmem shmem / 跨 VM shm / KSM 共享页）不在此释放，
+ * 由各自的 detach/drop 接口在回收编排中先行处理。
+ * 返回释放的总页数（普通用户页 + 页表页，4KB 计），-1 失败。
+ */
+int destroy_vm_pages(struct task_struct *task);
+
 void *allocate_page(void);
 void deallocate_page(void *);
 void *allocate_task_page(struct task_struct *task, vaddr_t va);

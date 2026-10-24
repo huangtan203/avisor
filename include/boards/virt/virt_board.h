@@ -39,6 +39,9 @@ void virt_board_set_ivshmem_peer(struct task_struct *tsk, int peer_id);
 /* 注册 vCPU 到板级查找表（创建 vCPU 时调用） */
 void virt_register_vcpu(struct task_struct *tsk, int vmid, int vcpu_id);
 
+/* Phase 34: 从板级查找表注销 vCPU（源 VM 回收用） */
+void virt_unregister_vcpu(int vmid, int vcpu_id);
+
 /* 根据 vmid + vcpu_id 查找 vCPU（返回 NULL 表示不存在） */
 struct task_struct *virt_find_vcpu(int vmid, int vcpu_id);
 
@@ -64,3 +67,11 @@ uint8_t virt_vgic_vintid_priority(struct task_struct *vm, uint32_t vintid);
  * 注意 vgic_rdist 为 44 字节（非 8 的倍数），不能用 memcpy 整块拷贝，
  * 内部对 vgicr 逐字段拷贝；vgic_dist（1280 字节）用 memcpy。 */
 void virt_copy_vgic_state(struct task_struct *dst, struct task_struct *src);
+
+/*
+ * Phase 34: 销毁 VM 的设备模型（源 VM 回收用）。
+ *
+ * 注销 ivshmem peer（含 unmap 共享内存映射），释放 board_data
+ * （virt_vm_devices）物理页。调用后 tsk->board_data 置 NULL。
+ */
+void virt_destroy_vm(struct task_struct *tsk);

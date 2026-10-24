@@ -49,6 +49,7 @@ void ivshmem_init(struct ivshmem_dev *dev,
     dev->peer_id = peer_id;
     dev->shmem_pa = shmem_pa;
     dev->shmem_size = shmem_size;
+    dev->shmem_ipa = shmem_ipa;
 
     /* 注册到全局 peer 数组 */
     if (peer_id >= 0 && peer_id < IVSHMEM_MAX_PEERS)
@@ -89,6 +90,39 @@ void ivshmem_set_peer_id(struct ivshmem_dev *dev, int new_peer_id)
 
     INFO("ivshmem: peer reparented %d -> %d (vm=%p)",
          old_peer_id, new_peer_id, (void *)dev->vm);
+}
+
+/*
+ * Phase 34: 注销 ivshmem 设备。
+ *
+ * 从全局 peer 数组移除，并 unmap 共享内存到该 VM 的 Stage-2 映射。
+ * 注意：不释放共享物理页——共享内存页由 virt_board 的
+ * ivshmem_shmem_pa 全局持有，多个 VM 共享同一块物理内存。
+ */
+void ivshmem_unregister(struct ivshmem_dev *dev)
+{
+    if (!dev)
+        return;
+
+    int peer_id = dev->peer_id;
+    if (peer_id >= 0 && peer_id < IVSHMEM_MAX_PEERS &&
+        ivshmem_peers[peer_id] == dev) {
+        ivshmem_peers[peer_id] = NULL;
+    }
+
+    /* unmap 共享内存映射（不释放物理页） */
+    if (dev->vm && dev->shmem_size > 0) {
+        for (size_t offset = 0; offset < dev->shmem_size;
+             offset += PAGE_SIZE) {
+            unmap_stage2_page(dev->vm,
+                              dev->shmem_ipa + offset, 0);
+        }
+    }
+
+    dev->vm = NULL;
+    dev->peer_id = -1;
+
+    INFO("ivshmem: peer %d unregistered", peer_id);
 }
 
 /*

@@ -38,6 +38,7 @@ struct ivshmem_dev {
     int peer_id;               /* 本端 peer ID (0 或 1) */
     uint64_t shmem_pa;         /* 共享内存物理地址 */
     size_t   shmem_size;       /* 共享内存大小 */
+    uint64_t shmem_ipa;        /* 共享内存在 guest IPA 中的地址 */
 };
 
 /* 全局 ivshmem 设备数组（两个 VM 各一个） */
@@ -66,6 +67,14 @@ void ivshmem_init(struct ivshmem_dev *dev,
  * 重新设置 peer_id（vmid 修正后调用）
  */
 void ivshmem_set_peer_id(struct ivshmem_dev *dev, int new_peer_id);
+
+/*
+ * Phase 34: 注销 ivshmem 设备（源 VM 回收用）。
+ *
+ * 从全局 peer 数组移除，并 unmap 共享内存到该 VM 的 Stage-2 映射
+ * （不释放共享物理页，共享页由 ivshmem 全局持有）。
+ */
+void ivshmem_unregister(struct ivshmem_dev *dev);
 
 /*
  * MMIO 读操作

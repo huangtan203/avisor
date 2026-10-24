@@ -3707,6 +3707,42 @@ p32_replayed:
         }
     }
 
+    /*
+     * Test 22: Phase 34 迁移后源 VM 回收。
+     *
+     * FINISH 在状态转移完成后已回收源 VM2 资源（设备模型、ivshmem
+     * peer、跨 VM shm 引用、KSM 共享引用、Stage-2 页表与普通页）。
+     * 此时已迁移到 VM3，从 VM3 视角查询全局回收统计，确认回收已
+     * 完成且释放了页数 > 0（至少源 VM 的内核镜像 + 页表被回收）。
+     */
+    guest_puts("\n--- Test 22: Phase 34 Source VM Reclaim ---\n");
+    {
+        u64 r_pages, r_shm, r_ksm, r_done;
+        r_pages = hvc_call_ret4(HVC_MIGRATE_RECLAIM_STATS, 0,
+                                &r_shm, &r_ksm, &r_done);
+        guest_puts("  reclaim: pages=");
+        puts_dec(r_pages);
+        guest_puts(" shm=");
+        puts_dec(r_shm);
+        guest_puts(" ksm=");
+        puts_dec(r_ksm);
+        guest_puts(" done=");
+        puts_dec(r_done);
+        guest_puts("\n");
+
+        if (r_done != 1) {
+            guest_puts("  FAIL: 源 VM 回收未完成 (done != 1)\n");
+            passed = 0;
+        } else if (r_pages == 0) {
+            guest_puts("  FAIL: 源 VM 回收页数为 0\n");
+            passed = 0;
+        } else {
+            guest_puts("  PASS: 源 VM2 资源已回收 (");
+            puts_dec(r_pages);
+            guest_puts(" 页)\n");
+        }
+    }
+
     if (passed)
         guest_puts("  PASSED: 双 vCPU Live Migration 成功（VM2 -> VM3）\n");
     else

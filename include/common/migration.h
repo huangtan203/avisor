@@ -42,3 +42,6 @@ int migration_finish(struct task_struct *src);
 
 /* 目标 VM 的 resume loader：恢复迁移过来的 pt_regs */
 int migration_resume_loader(void *arg, struct pt_regs *regs);
+
+/* Phase 34: 查询源 VM 回收统计 */
+void migration_reclaim_stats(int *pages, int *shm, int *ksm, int *done);

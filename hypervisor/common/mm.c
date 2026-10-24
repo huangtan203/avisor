@@ -1488,3 +1488,110 @@ int hyp_mem_unmap(paddr_t ipa)
 	     current->vmid, (unsigned long)(ipa & PAGE_MASK));
 	return 0;
 }
+
+/*
+ * Phase 34: 销毁 VM 的全部 Stage-2 映射与物理页。
+ *
+ * 遍历 L1->L2->L3 全表，自底向上释放：
+ *   - 普通用户页（4KB 小页 + 2MB 大页）
+ *   - L2/L3 页表页
+ *   - first_table 根页
+ *
+ * 跳过（不释放物理页）：
+ *   - 带 MM_STAGE2_KSM_SHARED 标志的共享页（由 ksm_drop_vm 先行处理）
+ *   - device memory 映射（MAIR 非 Normal，PCI 直通用）
+ *
+ * 调用方必须保证在调用本函数前已 unmap 掉共享内存映射
+ * （ivshmem shmem / 跨 VM shm），否则共享物理页会被误释放。
+ *
+ * 返回释放的普通页数（4KB 计），-1 失败。
+ */
+int destroy_vm_pages(struct task_struct *task)
+{
+	paddr_t l1_table, l2_table_pa, l3_table_pa;
+	uint64_t *l1, *l2, *l3;
+	uint64_t e1, e2, e3;
+	int i1, i2, i3;
+	int freed = 0;
+
+	if (!task || !task->mm.first_table)
+		return -1;
+
+	l1_table = task->mm.first_table;
+	l1 = (uint64_t *)TO_VADDR(l1_table);
+
+	for (i1 = 0; i1 < PTRS_PER_TABLE; i1++) {
+		e1 = l1[i1];
+		if ((e1 & 0x3) != 0x3)
+			continue;
+
+		l2_table_pa = e1 & MM_STAGE2_PA_MASK;
+		l2 = (uint64_t *)TO_VADDR(l2_table_pa);
+
+		for (i2 = 0; i2 < PTRS_PER_TABLE; i2++) {
+			e2 = l2[i2];
+
+			if ((e2 & 0x3) == MM_TYPE_BLOCK) {
+				/* 2MB 大页：释放 512 个 4KB 物理页 */
+				paddr_t block_pa = e2 & MM_STAGE2_PA_MASK;
+				free_block_pages(block_pa,
+						 1 << (LV2_SHIFT - PAGE_SHIFT));
+				freed += 1 << (LV2_SHIFT - PAGE_SHIFT);
+				l2[i2] = 0;
+				continue;
+			}
+
+			if ((e2 & 0x3) != 0x3)
+				continue;
+
+			l3_table_pa = e2 & MM_STAGE2_PA_MASK;
+			l3 = (uint64_t *)TO_VADDR(l3_table_pa);
+
+			for (i3 = 0; i3 < PTRS_PER_TABLE; i3++) {
+				e3 = l3[i3];
+				if ((e3 & 0x3) != 0x3)
+					continue;
+
+				/* KSM 共享页由 ksm_drop_vm 处理，这里仅清映射 */
+				if (e3 & MM_STAGE2_KSM_SHARED) {
+					l3[i3] = 0;
+					continue;
+				}
+
+				/* device memory 只清映射，不释放物理页 */
+				if ((e3 & (0x7 << 2)) != MM_STAGE2_MEMATTR) {
+					l3[i3] = 0;
+					continue;
+				}
+
+				deallocate_page(TO_VADDR(e3 & MM_STAGE2_PA_MASK));
+				freed++;
+				l3[i3] = 0;
+			}
+
+			/* 回收 L3 表页 */
+			deallocate_page(TO_VADDR(l3_table_pa));
+			l2[i2] = 0;
+			freed++;
+		}
+
+		/* 回收 L2 表页 */
+		deallocate_page(TO_VADDR(l2_table_pa));
+		l1[i1] = 0;
+		freed++;
+	}
+
+	/* 回收 first_table 根页 */
+	deallocate_page(TO_VADDR(l1_table));
+	freed++;
+	task->mm.first_table = 0;
+	task->mm.user_pages_count = 0;
+	task->mm.kernel_pages_count = 0;
+	task->mm.huge_pages_count = 0;
+
+	asm volatile("tlbi vmalle1" ::: "memory");
+	asm volatile("dsb ish" ::: "memory");
+	asm volatile("isb" ::: "memory");
+
+	return freed;
+}

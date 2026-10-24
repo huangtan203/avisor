@@ -275,3 +275,44 @@ int shm_notify(int shmid)
          shmid, current->vmid, notified);
     return 0;
 }
+
+/*
+ * Phase 34: 清除指定 VM 对全部共享内存区的 attach。
+ *
+ * 回收源 VM 前调用：把该 VM 在每个 shm 区的 attach 记录清除并
+ * unmap Stage-2 映射（不释放共享物理页，物理页由 shm 子系统全局
+ * 持有，refcount 归 0 也不销毁——沿用 shm_detach 的持久化语义）。
+ */
+int shm_detach_vm(struct task_struct *vm)
+{
+    int detached = 0;
+
+    if (!vm)
+        return -1;
+
+    for (int i = 0; i < SHM_MAX_COUNT; i++) {
+        struct shm_entry *shm = &shm_table[i];
+        if (!shm->used)
+            continue;
+
+        for (int j = 0; j < SHM_MAX_ATTACH; j++) {
+            if (shm->attach[j].vm != vm)
+                continue;
+
+            paddr_t ipa = shm->attach[j].ipa;
+            unmap_stage2_page(vm, ipa, 0);
+
+            shm->attach[j].vm = NULL;
+            shm->attach[j].ipa = 0;
+            shm->refcount--;
+            detached++;
+        }
+    }
+
+    if (detached > 0) {
+        INFO("shmem: vm%lu detached from %d shm(s)",
+             vm->vmid, detached);
+    }
+
+    return detached;
+}

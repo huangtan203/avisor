@@ -83,3 +83,6 @@
 #define HVC_VM_TXN_COMMIT   64 /* 提交：vCPU1 恢复现场继续，vCPU0 从 COMMIT 边界继续 */
 #define HVC_VM_TXN_ROLLBACK 65 /* 回滚：vCPU1 从冻结点重执行，vCPU0 现场回卷到 BEGIN 的 HVC */
 #define HVC_VM_TXN_STATUS   66 /* 查询 VM 级事务状态：0=无 1=冻结 2=回放 */
+
+/* Phase 34: 迁移后源 VM 回收统计 hypercall */
+#define HVC_MIGRATE_RECLAIM_STATS 67 /* 查询源 VM 回收统计：返回 x0=释放页数 x1=shm detach 数 x2=KSM 释放映射数 x3=是否完成 */

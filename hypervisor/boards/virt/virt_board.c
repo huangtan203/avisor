@@ -577,6 +577,32 @@ void virt_copy_vgic_state(struct task_struct *dst, struct task_struct *src)
         dd->vgicr.priority[i] = sd->vgicr.priority[i];
 }
 
+/*
+ * Phase 34: 销毁 VM 的设备模型。
+ *
+ * 注销 ivshmem peer（含 unmap 共享内存映射），释放 board_data
+ * （virt_vm_devices）物理页。调用后 tsk->board_data 置 NULL。
+ *
+ * 注意：迁移后源 VM 的 vCPU1 已就地改造为 VM3 vCPU1，其 board_data
+ * 指向 VM3 的设备模型，因此调用方必须以仍持有源 VM 设备模型的
+ * vCPU（如源 vCPU0）为参数。
+ */
+void virt_destroy_vm(struct task_struct *tsk)
+{
+    struct virt_vm_devices *devs =
+        (struct virt_vm_devices *)tsk->board_data;
+
+    if (!devs)
+        return;
+
+    ivshmem_unregister(&devs->ivshmem);
+
+    deallocate_page(devs);
+    tsk->board_data = NULL;
+
+    INFO("virt_destroy_vm: vm%lu device model released", tsk->vmid);
+}
+
 /* ---------- 世界切换 ---------- */
 
 static void virt_leaving_vm(struct task_struct *tsk)
@@ -667,6 +693,15 @@ void virt_register_vcpu(struct task_struct *tsk, int vmid, int vcpu_id)
         return;
 
     vm_vcpus[vmid - 1][vcpu_id] = tsk;
+}
+
+void virt_unregister_vcpu(int vmid, int vcpu_id)
+{
+    if (vmid < 1 || vmid > MAX_VMS_PER_BOARD ||
+        vcpu_id < 0 || vcpu_id >= MAX_VCPUS_PER_VM)
+        return;
+
+    vm_vcpus[vmid - 1][vcpu_id] = NULL;
 }
 
 struct task_struct *virt_find_vcpu(int vmid, int vcpu_id)
