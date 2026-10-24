@@ -155,11 +155,29 @@ int create_task(loader_func_t loader, void *arg)
 
 /* 全局 VMID 分配器（同一 VM 的多个 vCPU 共享一个 vmid） */
 static unsigned long next_vmid = 1;
+static int task_reaped_count[MAX_CPUS];
+static int task_reused_count[MAX_CPUS];
 
 /* 在指定 CPU 上创建任务（用于 SMP 场景） */
 int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 {
 	struct task_struct *p;
+	int pid;
+
+	if (cpu < 0 || cpu >= MAX_CPUS)
+		return -1;
+
+	pid = -1;
+	for (int i = 1; i < cpu_state[cpu].nr_tasks; i++) {
+		if (!cpu_state[cpu].task[i]) {
+			pid = i;
+			break;
+		}
+	}
+	if (pid < 0 && cpu_state[cpu].nr_tasks < NR_TASKS)
+		pid = cpu_state[cpu].nr_tasks;
+	if (pid < 0)
+		return -1;
 
 	p = (struct task_struct *)allocate_page();
 	if (!p)
@@ -217,9 +235,10 @@ int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 	p->cpu_context.sp = (unsigned long)childregs;
 	task_stack_init(p);
 
-	/* 添加到指定 CPU 的任务表 */
-	int pid = cpu_state[cpu].nr_tasks++;
+	/* 添加到指定 CPU 的任务表；优先复用已回收的空槽位。 */
 	cpu_state[cpu].task[pid] = p;
+	if (pid == cpu_state[cpu].nr_tasks)
+		cpu_state[cpu].nr_tasks++;
 	p->pid = pid;  /* pid 是 per-CPU 的，多核间可能重复 */
 
 	return pid;
@@ -243,6 +262,66 @@ void destroy_task_aux(struct task_struct *tsk)
 	if (tsk->freeze_context)
 		deallocate_page(tsk->freeze_context);
 	tsk->freeze_context = NULL;
+}
+
+static int remove_task_slot(struct task_struct *tsk)
+{
+	int cpu = smp_processor_id();
+
+	for (int i = 1; i < cpu_state[cpu].nr_tasks; i++) {
+		if (cpu_state[cpu].task[i] != tsk)
+			continue;
+
+		/* 先摘除槽位，之后其他扫描者不会再取得即将释放的指针。 */
+		cpu_state[cpu].task[i] = NULL;
+		while (cpu_state[cpu].nr_tasks > 1 &&
+		       !cpu_state[cpu].task[cpu_state[cpu].nr_tasks - 1])
+			cpu_state[cpu].nr_tasks--;
+		destroy_task_aux(tsk);
+		deallocate_page(tsk);
+		task_reaped_count[cpu]++;
+		return 1;
+	}
+
+	return 0;
+}
+
+void task_reap_after_switch(struct task_struct *prev)
+{
+	if (prev && prev->state == TASK_ZOMBIE && prev != current)
+		remove_task_slot(prev);
+}
+
+int reap_zombie_tasks(int cpu)
+{
+	int reaped = 0;
+
+	if (cpu != smp_processor_id())
+		return 0;
+
+	for (int i = 1; i < cpu_state[cpu].nr_tasks; i++) {
+		struct task_struct *tsk = cpu_state[cpu].task[i];
+
+		if (tsk && tsk->state == TASK_ZOMBIE && tsk != current)
+			reaped += remove_task_slot(tsk);
+	}
+
+	return reaped;
+}
+
+void task_reap_stats(int cpu, int *high_water, int *holes, int *reaped,
+                     int *reused)
+{
+	int hole_count = 0;
+
+	for (int i = 1; i < cpu_state[cpu].nr_tasks; i++)
+		if (!cpu_state[cpu].task[i])
+			hole_count++;
+
+	*high_water = cpu_state[cpu].nr_tasks;
+	*holes = hole_count;
+	*reaped = task_reaped_count[cpu];
+	*reused = task_reused_count[cpu];
 }
 
 void flush_task_console(struct task_struct *tsk)

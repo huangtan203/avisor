@@ -30,4 +30,7 @@ cpu_switch_to:
 	ldp x29, x9, [x8], #16
 	ldr x30, [x8]
 	mov sp, x9
+	stp x30, xzr, [sp, #-16]!
+	bl task_reap_after_switch
+	ldp x30, xzr, [sp], #16
 	ret

@@ -241,7 +241,7 @@ _Static_assert(sizeof(struct task_struct) + TASK_STACK_GUARD_SIZE +
 struct cpu_sched_state {
     struct task_struct *curr;  /* 当前运行的任务（避免和 current 宏名冲突） */
     struct task_struct *task[NR_TASKS];
-    int nr_tasks;
+    int nr_tasks;        /* task[] 有效扫描上界；区间内允许存在 NULL 空槽 */
     int rr_start;       /* 轮转调度起点 */
     struct task_struct init_task;  /* 本核的 idle 任务 */
 };

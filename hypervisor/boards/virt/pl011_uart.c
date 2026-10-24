@@ -122,7 +122,7 @@ void handle_uart_irq(void)
                 printf("\nSwitched to console: %d\n",
                        uart_forwarded_task);
                 tsk = CPU_TASK_TABLE[uart_forwarded_task];
-                if (tsk->state == TASK_RUNNING)
+                if (tsk && tsk->state == TASK_RUNNING)
                     flush_task_console(tsk);
             } else if (received == 'l') {
                 show_task_list();
@@ -134,7 +134,7 @@ void handle_uart_irq(void)
         } else {
 enqueue_char:
             tsk = CPU_TASK_TABLE[uart_forwarded_task];
-            if (tsk->state == TASK_RUNNING)
+            if (tsk && tsk->state == TASK_RUNNING)
                 enqueue_fifo(tsk->console.in_fifo, received);
         }
     }

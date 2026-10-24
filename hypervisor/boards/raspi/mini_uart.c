@@ -60,13 +60,13 @@ void handle_uart_irq(void)
 			is_escaped = 0;
 			if (isdigit(received)) {
 				tsk_id = received - '0';
-				if (tsk_id > nr_tasks - 1)
+				if (tsk_id > nr_tasks - 1 || !task[tsk_id])
 					goto clear_int;
 				uart_forwarded_task = tsk_id;
 				printf("\nSwitched to console: %d\n",
 				       uart_forwarded_task);
 				tsk = task[uart_forwarded_task];
-				if (tsk->state == TASK_RUNNING)
+				if (tsk && tsk->state == TASK_RUNNING)
 					flush_task_console(tsk);
 			} else if (received == 'l') {
 				show_task_list();
@@ -78,7 +78,7 @@ void handle_uart_irq(void)
 		} else {
 enqueue_char:
 			tsk = task[uart_forwarded_task];
-			if (tsk->state == TASK_RUNNING)
+			if (tsk && tsk->state == TASK_RUNNING)
 				enqueue_fifo(tsk->console.in_fifo, received);
 		}
 	}

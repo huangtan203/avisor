@@ -497,6 +497,16 @@ void handle_hvc64(unsigned long hvc_nr)
 		regs->regs[0] = task_stack_min_free(current);
 		regs->regs[1] = task_stack_guard_valid(current);
 		break;
+	case HVC_TASK_REAP_STATS: {
+		int high_water, holes, reaped, reused;
+		task_reap_stats(smp_processor_id(), &high_water, &holes,
+				&reaped, &reused);
+		regs->regs[0] = high_water;
+		regs->regs[1] = holes;
+		regs->regs[2] = reaped;
+		regs->regs[3] = reused;
+		break;
+	}
 	case HVC_MIGRATE_RECLAIM_STATS: {
 		int pages, shm, ksm, done;
 		migration_reclaim_stats(&pages, &shm, &ksm, &done);

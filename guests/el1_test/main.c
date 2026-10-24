@@ -3294,6 +3294,29 @@ static void test_phase40_stack_telemetry(void)
     guest_puts("  PASS: EL2 task 栈 canary 与最低余量正常\n");
 }
 
+static void test_phase42_task_reap(void)
+{
+    u64 holes, reaped, reused;
+    u64 high_water = hvc_call_ret4(HVC_TASK_REAP_STATS, 0,
+                                   &holes, &reaped, &reused);
+
+    guest_puts("\n--- Test 26: Phase 42 zombie task reap and slot reuse ---\n");
+    guest_puts("  high-water=");
+    puts_dec((int)high_water);
+    guest_puts(" holes=");
+    puts_dec((int)holes);
+    guest_puts(" reaped=");
+    puts_dec((int)reaped);
+    guest_puts(" reused=");
+    puts_dec((int)reused);
+    guest_puts("\n");
+    if (reaped == 0) {
+        guest_puts("  FAIL: zombie task 未在切栈后回收\n");
+        return;
+    }
+    guest_puts("  PASS: zombie task 已在切栈后回收，空槽可供后续创建复用\n");
+}
+
 static int test_phase25_migration(void)
 {
     int passed = 1;
@@ -4240,7 +4263,10 @@ void guest_main(void)
     if (vmid == 2) test_phase40_stack_telemetry();
 
     /* 测试 18: Phase 25 Live Migration（仅 VM2 发起，迁移到 VM3） */
-    if (vmid == 2) test_phase25_migration();
+    if (vmid == 2) {
+        test_phase25_migration();
+        test_phase42_task_reap();
+    }
 
     guest_puts("\nguest: all tests done, entering main loop\n");
 

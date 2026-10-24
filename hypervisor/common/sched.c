@@ -295,6 +295,9 @@ void show_task_list(void)
 
 	for (int i = 0; i < cpu_state[cpu].nr_tasks; i++) {
 		struct task_struct *tsk = cpu_state[cpu].task[i];
+
+		if (!tsk)
+			continue;
 		printf("%3d %12s %8s %7d %8x %7d %7d %7d %7d %7d\n", tsk->pid,
 		       tsk->name ? tsk->name : "", task_state_str[tsk->state],
 		       tsk->mm.user_pages_count, task_pt_regs(tsk)->pc,
