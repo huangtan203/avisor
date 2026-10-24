@@ -58,6 +58,7 @@
 .extern smp_boot_flag
 .extern platform_dtb_address
 .extern platform_dtb_address_alt
+.extern platform_cpu_mpidr
 
 _start:
     /* 兼容两种启动约定：部分固件把 DTB 放在 x0，AArch64 Linux/QEMU
@@ -112,9 +113,9 @@ secondary_el2:
     msr sctlr_el2, x0
     isb
 
-    /* 计算 CPU ID */
-    mrs x0, mpidr_el1
-    and x0, x0, #0xFF
+    /* 保存完整物理 MPIDR，再取 Aff0 作为当前逻辑 CPU ID。 */
+    mrs x20, mpidr_el1
+    and x0, x20, #0xFF
 
     /* 设置 TPIDR_EL2 = 物理 CPU ID，供 smp_processor_id() 使用
      * 注意：这里在开启 MMU 之前读 MPIDR_EL1，此时 HCR_EL2.VM 可能
@@ -142,8 +143,11 @@ secondary_wait:
     cmp w0, w19
     b.ne secondary_wait
 
-    /* 收到启动信号，开启 MMU，跳到次核 C 入口 */
-    /* 先设置页表基址（和主核共享同一份页表） */
+    /* 收到启动信号后，BSS 已清零，可以发布本核完整物理 MPIDR。 */
+    ldr x0, =platform_cpu_mpidr
+    str x20, [x0, x19, lsl #3]
+
+    /* 开启 MMU，跳到次核 C 入口。先设置共享页表基址。 */
     adrp x0, pg_dir
     msr ttbr0_el2, x0
     ldr x0, =(TCR_VALUE)
@@ -214,7 +218,10 @@ el3:
     eret
 
 el2_entry:
-    /* 设置 TPIDR_EL2 = 0（主核物理 CPU ID），供 smp_processor_id() 使用。
+    /* 保存主核完整物理 MPIDR；BSS 清零后再写入全局数组。 */
+    mrs x19, mpidr_el1
+
+    /* 设置 TPIDR_EL2 = 0（主核逻辑 CPU ID），供 smp_processor_id() 使用。
      * 必须在任何调用 smp_processor_id() 的代码之前设置。 */
     mov x0, #0
     msr tpidr_el2, x0
@@ -230,6 +237,10 @@ el2_entry:
     str x20, [x0]
     adr x0, platform_dtb_address_alt
     str x21, [x0]
+
+    /* 保存主核完整物理 affinity，供 GICR_TYPER 匹配。 */
+    adr x0, platform_cpu_mpidr
+    str x19, [x0]
 
     /* 创建页表 */
     bl __create_page_tables

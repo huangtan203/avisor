@@ -30,20 +30,53 @@
 #include "common/sched.h"
 #include "common/utils.h"
 
-/*
- * 获取指定 CPU 的 Redistributor 基地址
- *
- * QEMU virt 的 GICv3 Redistributor 布局：
- *   CPU0: GICR_BASE + 0 * GICR_STRIDE
- *   CPU1: GICR_BASE + 1 * GICR_STRIDE
- *   ...
- * 每个 Redistributor 有两个 64KB 帧：
- *   - RD_base (控制/配置)
- *   - SGI_base (SGI+PPI 寄存器)
- */
+#define GICR_TYPER_LAST       (1ULL << 4)
+#define GICR_TYPER_AFF_SHIFT  32
+
+static uint64_t gicr_cpu_base[MAX_CPUS];
+static unsigned char gicr_cpu_found[MAX_CPUS];
+
+static uint32_t mpidr_affinity(uint64_t mpidr)
+{
+    return (uint32_t)(mpidr & 0x00FFFFFFUL) |
+           (uint32_t)((mpidr >> 8) & 0xFF000000UL);
+}
+
+static uint64_t gic_find_redist_base(int cpu_id)
+{
+    uint32_t target_aff;
+    unsigned long offset;
+
+    if (cpu_id < 0 || cpu_id >= MAX_CPUS)
+        PANIC("GICv3: invalid CPU%d Redistributor lookup", cpu_id);
+    if (gicr_cpu_found[cpu_id])
+        return gicr_cpu_base[cpu_id];
+
+    target_aff = mpidr_affinity(platform_cpu_mpidr[cpu_id]);
+    for (offset = 0; offset + 0x20000UL <= platform_current.gicr_size;
+         offset += platform_current.gicr_stride) {
+        uint64_t base = VA_START + platform_current.gicr_base + offset;
+        uint64_t typer = get64(base + GICR_TYPER);
+
+        if ((uint32_t)(typer >> GICR_TYPER_AFF_SHIFT) == target_aff) {
+            gicr_cpu_base[cpu_id] = base;
+            gicr_cpu_found[cpu_id] = 1;
+            INFO("GICv3: CPU%d MPIDR=0x%lx Redistributor=0x%lx",
+                 cpu_id, platform_cpu_mpidr[cpu_id], base);
+            return base;
+        }
+        if (typer & GICR_TYPER_LAST)
+            break;
+    }
+
+    PANIC("GICv3: no Redistributor for CPU%d MPIDR=0x%lx",
+          cpu_id, platform_cpu_mpidr[cpu_id]);
+    return 0;
+}
+
 uint64_t gic_get_redist_base(int cpu_id)
 {
-    return VA_START + platform_gicr_base(cpu_id);
+    return gic_find_redist_base(cpu_id);
 }
 
 /*
@@ -407,10 +440,26 @@ void gic_eoi_irq(unsigned int irq)
  */
 void gic_send_sgi(unsigned int cpu_id, unsigned int sgi_id)
 {
+    uint64_t mpidr;
+    uint64_t aff0, aff1, aff2, aff3;
     uint64_t sgi_val;
 
-    sgi_val = ((uint64_t)(sgi_id & 0xF) << 24)   /* INTID [27:24] */
-            | (1ULL << (cpu_id & 0xF));            /* TargetList: bit cpu_id */
+    if (cpu_id >= MAX_CPUS)
+        return;
+
+    mpidr = platform_cpu_mpidr[cpu_id];
+    aff0 = mpidr & 0xFF;
+    aff1 = (mpidr >> 8) & 0xFF;
+    aff2 = (mpidr >> 16) & 0xFF;
+    aff3 = (mpidr >> 32) & 0xFF;
+    if (aff0 >= 16) {
+        WARN("GICv3: SGI target CPU%u Aff0=%lu requires RSS", cpu_id, aff0);
+        return;
+    }
+
+    sgi_val = (aff3 << 48) | (aff2 << 32) |
+              ((uint64_t)(sgi_id & 0xF) << 24) | (aff1 << 16) |
+              (1ULL << aff0);
 
     asm volatile("dsb ishst" ::: "memory");
     icc_sgi1r_write(sgi_val);
@@ -434,15 +483,17 @@ void gic_send_sgi(unsigned int cpu_id, unsigned int sgi_id)
  */
 void gic_set_spi_target(unsigned int irq, unsigned int cpu_id)
 {
-    if (irq < 32)
+    uint64_t router;
+    uint64_t mpidr;
+    uint64_t affinity;
+
+    if (irq < 32 || cpu_id >= MAX_CPUS)
         return;
 
-    uint64_t router = GICD_IROUTER(irq);
-
-    uint32_t aff = (cpu_id & 0xFF);  /* Aff0；QEMU virt 只用 aff0 */
-
-    put32(router, aff);
-    put32(router + 4, 0);  /* Aff3:Aff2:Aff1 高位清零 */
+    router = GICD_IROUTER(irq);
+    mpidr = platform_cpu_mpidr[cpu_id];
+    affinity = (mpidr & 0xFFFFFFUL) | ((mpidr >> 8) & 0xFF000000UL);
+    put64(router, affinity);
 
     asm volatile("dsb sy" ::: "memory");
 }

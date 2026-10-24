@@ -32,6 +32,7 @@ unsigned long virt_gicr_base = VA_START + VIRT_GICR_BASE;
 unsigned long virt_gits_base = VA_START + VIRT_GITS_BASE;
 unsigned long platform_dtb_address;
 unsigned long platform_dtb_address_alt;
+unsigned long platform_cpu_mpidr[MAX_CPUS];
 
 static unsigned int be32(const void *ptr)
 {
