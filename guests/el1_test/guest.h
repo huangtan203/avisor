@@ -111,6 +111,8 @@ typedef int bool;
 
 /* Phase 35: 取消 PRECOPY 并回滚目标增量页 */
 #define HVC_MIGRATE_CANCEL 68
+#define HVC_MIGRATE_FAIL_FINISH 69
+#define HVC_MIGRATE_ABORT_STATS  70
 
 /* 共享内存 notify 使用的虚拟中断号 */
 #define SHM_NOTIFY_VIRQ     60

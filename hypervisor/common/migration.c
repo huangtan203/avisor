@@ -47,8 +47,17 @@ static int mig_reclaim_pages;
 static int mig_reclaim_shm;
 static int mig_reclaim_ksm;
 static int mig_reclaim_vm_done;
+/* Phase 36: 一次性注入 FINISH 准备阶段失败。 */
+static int mig_fail_finish_once;
+static int mig_finish_abort_count;
+static unsigned long mig_saved_vcpu1_vmid;
+static struct mm_struct mig_saved_vcpu1_mm;
+static void *mig_saved_vcpu1_board_data;
+static char mig_saved_vcpu1_name[36];
 
 /* 迁移遍历操作 */
+static int mig_finish_target_pages(int commit);
+
 enum {
 	MIG_OP_CLEAR_AF,     /* 清除全部 AF 位（开启脏页跟踪） */
 	MIG_OP_SET_AF,       /* 恢复全部 AF 位（关闭本轮脏页跟踪） */
@@ -62,7 +71,7 @@ enum {
  * 多轮预拷贝不泄漏的关键：先判断目标 VM 该 ipa 是否已映射。
  * 已映射则复用原物理页 memcpy（覆盖旧内容），否则新分配一页并建映射。
  */
-static void mig_copy_page(struct task_struct *src, vaddr_t ipa, paddr_t src_pa)
+static int mig_copy_page(struct task_struct *src, vaddr_t ipa, paddr_t src_pa)
 {
 	paddr_t dst_pa;
 
@@ -72,24 +81,28 @@ static void mig_copy_page(struct task_struct *src, vaddr_t ipa, paddr_t src_pa)
 		/* 目标已映射：复用（覆盖内容），避免预拷贝每轮泄漏一页 */
 		memcpy((void *)TO_VADDR(dst_pa), (void *)TO_VADDR(src_pa),
 		       PAGE_SIZE);
+		return 0;
 	} else {
 		void *dst_va = allocate_page();
 		if (!dst_va)
-			return;
+			return -1;
 		memcpy(dst_va, (void *)TO_VADDR(src_pa), PAGE_SIZE);
 		map_stage2_page(mig_dst, ipa, TO_PADDR(dst_va),
 				MMU_STAGE2_PAGE_FLAGS | MM_STAGE2_MIGRATION_NEW);
+		return 0;
 	}
 }
 
 /* 拷贝一个 2MB block（拆成 512 个 4KB 页，目标统一用 4KB 小页） */
-static void mig_copy_block(struct task_struct *src, vaddr_t ipa, paddr_t src_pa)
+static int mig_copy_block(struct task_struct *src, vaddr_t ipa, paddr_t src_pa)
 {
 	int npages = 1 << (LV2_SHIFT - PAGE_SHIFT);
 
 	for (int i = 0; i < npages; i++)
-		mig_copy_page(src, ipa + i * PAGE_SIZE,
-			      src_pa + i * PAGE_SIZE);
+		if (mig_copy_page(src, ipa + i * PAGE_SIZE,
+				  src_pa + i * PAGE_SIZE) < 0)
+			return -1;
+	return 0;
 }
 
 /*
@@ -102,6 +115,7 @@ static int mig_walk(struct task_struct *src, int op)
 	int i1, i2, i3;
 	int dirty = 0;
 	int touched = 0;  /* 是否清过 AF 位（决定是否需要 TLB flush） */
+	int failed = 0;
 
 	if (!src || !src->mm.first_table)
 		return 0;
@@ -139,12 +153,14 @@ static int mig_walk(struct task_struct *src, int op)
 						touched = 1;
 					}
 				} else if (op == MIG_OP_FULL_COPY) {
-					mig_copy_block(src, ipa_base,
-						       e2 & MM_STAGE2_PA_MASK);
+					if (mig_copy_block(src, ipa_base,
+						       e2 & MM_STAGE2_PA_MASK) < 0)
+						failed = 1;
 				} else { /* COLLECT_DIRTY */
 					if (e2 & MM_STAGE2_ACCESS) {
-						mig_copy_block(src, ipa_base,
-							       e2 & MM_STAGE2_PA_MASK);
+						if (mig_copy_block(src, ipa_base,
+								e2 & MM_STAGE2_PA_MASK) < 0)
+							failed = 1;
 						l2[i2] = e2 & ~MM_STAGE2_ACCESS;
 						dirty += (1 << (LV2_SHIFT -
 								PAGE_SHIFT));
@@ -185,12 +201,14 @@ static int mig_walk(struct task_struct *src, int op)
 						touched = 1;
 					}
 				} else if (op == MIG_OP_FULL_COPY) {
-					mig_copy_page(src, ipa,
-						      e3 & MM_STAGE2_PA_MASK);
+					if (mig_copy_page(src, ipa,
+						      e3 & MM_STAGE2_PA_MASK) < 0)
+						failed = 1;
 				} else { /* COLLECT_DIRTY */
 					if (e3 & MM_STAGE2_ACCESS) {
-						mig_copy_page(src, ipa,
-							      e3 & MM_STAGE2_PA_MASK);
+						if (mig_copy_page(src, ipa,
+							      e3 & MM_STAGE2_PA_MASK) < 0)
+							failed = 1;
 						l3[i3] = e3 & ~MM_STAGE2_ACCESS;
 						dirty++;
 						touched = 1;
@@ -207,7 +225,7 @@ static int mig_walk(struct task_struct *src, int op)
 		asm volatile("isb" ::: "memory");
 	}
 
-	return dirty;
+	return failed ? -1 : dirty;
 }
 
 /*
@@ -332,7 +350,13 @@ int migration_start(struct task_struct *src)
 	mig_state = MIGRATION_PRECOPY;
 
 	mig_walk(src, MIG_OP_CLEAR_AF);
-	mig_walk(src, MIG_OP_FULL_COPY);
+	if (mig_walk(src, MIG_OP_FULL_COPY) < 0) {
+		(void)mig_finish_target_pages(0);
+		mig_walk(src, MIG_OP_SET_AF);
+		mig_src = NULL;
+		mig_state = MIGRATION_REJECTED;
+		return -1;
+	}
 
 	return 0;
 }
@@ -349,6 +373,16 @@ int migration_precopy(struct task_struct *src)
 }
 
 /* Phase 35: 取消尚未进入 FINISH 的迁移并回滚目标增量页。 */
+int migration_fail_finish_once(struct task_struct *src)
+{
+	if (!src || src != mig_src || mig_state != MIGRATION_PRECOPY ||
+	    src->state != TASK_RUNNING || !mig_dst ||
+	    mig_dst->state != TASK_WAITING)
+		return -1;
+	mig_fail_finish_once = 1;
+	return 0;
+}
+
 int migration_cancel(struct task_struct *src)
 {
 	int released;
@@ -409,6 +443,11 @@ static void migration_reclaim_src(struct task_struct *src)
 }
 
 /* Phase 34: 查询源 VM 回收统计 */
+int migration_finish_abort_stats(void)
+{
+	return mig_finish_abort_count;
+}
+
 void migration_reclaim_stats(int *pages, int *shm, int *ksm, int *done)
 {
 	if (pages)
@@ -457,17 +496,46 @@ int migration_finish(struct task_struct *src)
 
 	/* 2. 最后一轮脏页拷贝：此刻两 vCPU 都静止，拷贝收敛 */
 	dirty = mig_walk(src, MIG_OP_COLLECT_DIRTY);
-
-	/* 3. 就地改造 vCPU1（冻结中的 VM2 vCPU1 → VM3 vCPU1） */
 	vcpu1 = smp_vm_txn_target_task();
-	if (vcpu1) {
-		vcpu1->vmid = mig_dst->vmid;
-		vcpu1->mm = mig_dst->mm;
-		vcpu1->board_data = mig_dst->board_data;
-		(void)strncpy(vcpu1->name, "vm3-cpu1", 36);
+	if (!vcpu1) {
+		mig_walk(src, MIG_OP_SET_AF);
+		smp_vm_txn_commit();
+		return -1;
+	}
+
+	mig_saved_vcpu1_vmid = vcpu1->vmid;
+	memcpy(&mig_saved_vcpu1_mm, &vcpu1->mm, sizeof(vcpu1->mm));
+	mig_saved_vcpu1_board_data = vcpu1->board_data;
+	memcpy(mig_saved_vcpu1_name, vcpu1->name,
+	       sizeof(mig_saved_vcpu1_name));
+
+	/* 3. 准备切换 vCPU1 身份，但尚未提交事务。 */
+	vcpu1->vmid = mig_dst->vmid;
+	vcpu1->mm = mig_dst->mm;
+	vcpu1->board_data = mig_dst->board_data;
+	(void)strncpy(vcpu1->name, "vm3-cpu1", 36);
 #ifdef PLATFORM_VIRT
-		virt_register_vcpu(vcpu1, (int)mig_dst->vmid, vcpu1->vcpu_id);
+	virt_register_vcpu(vcpu1, (int)mig_dst->vmid, vcpu1->vcpu_id);
 #endif
+
+	if (dirty < 0 || mig_fail_finish_once) {
+		mig_fail_finish_once = 0;
+		memcpy(&vcpu1->mm, &mig_saved_vcpu1_mm, sizeof(vcpu1->mm));
+		vcpu1->vmid = mig_saved_vcpu1_vmid;
+		vcpu1->board_data = mig_saved_vcpu1_board_data;
+		memcpy(vcpu1->name, mig_saved_vcpu1_name,
+		       sizeof(mig_saved_vcpu1_name));
+		mig_finish_target_pages(0);
+		mig_walk(src, MIG_OP_SET_AF);
+#ifdef PLATFORM_VIRT
+		virt_unregister_vcpu((int)mig_dst->vmid, vcpu1->vcpu_id);
+		virt_register_vcpu(vcpu1, (int)src->vmid, vcpu1->vcpu_id);
+#endif
+		smp_vm_txn_commit();
+		mig_src = NULL;
+		mig_state = MIGRATION_IDLE;
+		mig_finish_abort_count++;
+		return -1;
 	}
 
 	/* 4. 转移 vCPU0 系统寄存器（含 SP_EL1/ELR_EL1/SPSR/TTBR 等 EL1 全量） */

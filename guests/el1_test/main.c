@@ -3653,6 +3653,30 @@ p32_replayed:
         guest_puts("，源内存/AF 状态恢复且可重试\n");
     }
 
+    /* Test 24: FINISH 准备阶段失败后回滚，并允许重试。 */
+    guest_puts("\n--- Test 24: Phase 36 FINISH Abort/Rollback ---\n");
+    {
+        u64 abort_before = hvc_call(HVC_MIGRATE_ABORT_STATS, 0);
+        int finish_ret;
+
+        if (hvc_call(HVC_MIGRATE_START, 0) != 0 ||
+            hvc_call(HVC_MIGRATE_PRECOPY, 0) < 0 ||
+            hvc_call(HVC_MIGRATE_FAIL_FINISH, 0) != 0) {
+            guest_puts("  FAIL: FINISH abort 注入准备失败\n");
+            passed = 0;
+            goto done25;
+        }
+        finish_ret = (int)hvc_call(HVC_MIGRATE_FINISH, 0);
+        if (finish_ret != -1 ||
+            hvc_call(HVC_MIGRATE_ABORT_STATS, 0) != abort_before + 1 ||
+            hvc_call(HVC_MIGRATE_STATUS, 0) != 0) {
+            guest_puts("  FAIL: FINISH abort 未回滚到 IDLE\n");
+            passed = 0;
+            goto done25;
+        }
+        guest_puts("  PASS: FINISH 失败已回滚源/目标状态，可重试\n");
+    }
+
     /* 取消后重新写入模式，正式迁移必须能复用同一目标 VM。 */
     for (i = 0; i < PHASE25_TOTAL_PAGES; i++) {
         volatile unsigned char *p = base + i * PHASE25_PAGE_SIZE;
