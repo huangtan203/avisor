@@ -36,6 +36,7 @@ static volatile int freeze_target_cpu = -1;
 static volatile unsigned long freeze_ack_generation[MAX_CPUS];
 static volatile unsigned long freeze_progress_count[MAX_CPUS];
 static struct task_struct *freeze_target_task;
+static void smp_handle_freeze_request(void);
 
 /*
  * Phase 31: 事务式冻结状态。
@@ -123,7 +124,7 @@ static void smp_freeze_lock_release(void)
 int smp_freeze_begin(int target_cpu)
 {
     unsigned long generation;
-    unsigned long timeout = 10000000;
+    unsigned long timeout = 100000000;
 
     if (target_cpu < 0 || target_cpu >= MAX_CPUS || target_cpu == smp_processor_id() ||
         !smp_online[target_cpu])
@@ -145,16 +146,15 @@ int smp_freeze_begin(int target_cpu)
             return -1;
         }
     }
-    freeze_active = 1;
+    generation = ++freeze_generation;
     smp_freeze_lock_release();
 
-    generation = ++freeze_generation;
     struct task_struct *target = NULL;
     for (int i = 0; i < cpu_state[target_cpu].nr_tasks; i++) {
         struct task_struct *task = cpu_state[target_cpu].task[i];
         if (task && task->pid != 0 && task->vmid == current->vmid &&
             task->vcpu_id == 1 && task->phys_cpu == target_cpu &&
-            task->state == TASK_RUNNING) {
+            task->state != TASK_ZOMBIE) {
             target = task;
             break;
         }
@@ -171,12 +171,13 @@ int smp_freeze_begin(int target_cpu)
     __atomic_store_n(&release_generation, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&freeze_ack_generation[target_cpu], 0, __ATOMIC_RELAXED);
     __atomic_store_n(&release_ack_generation[target_cpu], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&freeze_active, 1, __ATOMIC_RELEASE);
     smp_send_ipi(target_cpu, SGI_VM_FREEZE);
 
     while (timeout--) {
         if (__atomic_load_n(&freeze_ack_generation[target_cpu], __ATOMIC_ACQUIRE) == generation)
             return 0;
-        if ((timeout & 0xffff) == 0)
+        if ((timeout & 0x3ff) == 0)
             smp_send_ipi(target_cpu, SGI_VM_FREEZE);
         asm volatile("yield" ::: "memory");
     }
@@ -251,14 +252,14 @@ int smp_freeze_snapshot_status(int cpu, unsigned long *generation)
 
     if (cpu < 0 || cpu >= MAX_CPUS || cpu != freeze_target_cpu ||
         !__atomic_load_n(&freeze_active, __ATOMIC_ACQUIRE) || !target ||
-        !target->freeze_context.active ||
-        target->freeze_context.generation != active_generation ||
+        !target->freeze_context || !target->freeze_context->active ||
+        target->freeze_context->generation != active_generation ||
         __atomic_load_n(&freeze_ack_generation[cpu], __ATOMIC_ACQUIRE) !=
             active_generation)
         return 0;
 
     if (generation)
-        *generation = target->freeze_context.generation;
+        *generation = target->freeze_context->generation;
     return 1;
 }
 
@@ -706,6 +707,78 @@ void smp_send_ipi(int cpu, int sgi_id)
     gic_send_sgi(cpu, sgi_id);
 }
 
+static void smp_capture_freeze_context(struct task_struct *target,
+                                       unsigned long generation)
+{
+    struct pt_regs *regs = task_pt_regs(target);
+
+    memcpy(&target->freeze_context->cpu_sysregs, &target->cpu_sysregs,
+           sizeof(target->cpu_sysregs));
+    memcpy(&target->freeze_context->virt, &target->virt,
+           sizeof(target->virt));
+    if (current == target) {
+        vgic_save_state(&target->freeze_context->virt);
+        target->freeze_context->virt.cntv_ctl = READ_SYSREG64(CNTV_CTL_EL0);
+        target->freeze_context->virt.cntv_cval = READ_SYSREG64(CNTV_CVAL_EL0);
+    }
+    target->freeze_context->virt.vtimer_pending =
+        !!(target->freeze_context->virt.cntv_ctl & TIMER_CTL_ISTATUS);
+
+    for (int i = 0; i < 31; i++)
+        target->freeze_context->regs[i] = regs->regs[i];
+    target->freeze_context->sp = regs->sp;
+    target->freeze_context->pc = regs->pc;
+    target->freeze_context->pstate = regs->pstate;
+    target->freeze_context->generation = generation;
+    target->freeze_context->active = 1;
+}
+
+static void smp_handle_freeze_request(void)
+{
+    int cpu = smp_processor_id();
+    unsigned long generation;
+    struct task_struct *target;
+    struct pt_regs *regs;
+
+    if (!__atomic_load_n(&freeze_active, __ATOMIC_ACQUIRE))
+        return;
+
+    generation = __atomic_load_n(&freeze_generation, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&freeze_ack_generation[cpu], __ATOMIC_ACQUIRE) ==
+        generation)
+        return;
+
+    target = freeze_target_task;
+    if (cpu != __atomic_load_n(&freeze_target_cpu, __ATOMIC_RELAXED) ||
+        !target || current != target || target->vmid != 2 ||
+        target->state != TASK_RUNNING)
+        return;
+
+    smp_capture_freeze_context(target, generation);
+    asm volatile("dmb ish" ::: "memory");
+
+    freeze_progress_count[cpu]++;
+    __atomic_store_n(&freeze_ack_generation[cpu], generation,
+                     __ATOMIC_RELEASE);
+    while (__atomic_load_n(&release_generation, __ATOMIC_ACQUIRE) != generation)
+        asm volatile("yield" ::: "memory");
+
+    asm volatile("dmb ish" ::: "memory");
+    if (target->freeze_context->generation != generation ||
+        !target->freeze_context->active)
+        return;
+
+    regs = task_pt_regs(target);
+    for (int i = 0; i < 31; i++)
+        regs->regs[i] = target->freeze_context->regs[i];
+    regs->sp = target->freeze_context->sp;
+    regs->pc = target->freeze_context->pc;
+    regs->pstate = target->freeze_context->pstate;
+    target->freeze_context->active = 0;
+    __atomic_store_n(&release_ack_generation[cpu], generation,
+                     __ATOMIC_RELEASE);
+}
+
 /*
  * 处理当前核收到的 SGI
  *
@@ -735,60 +808,9 @@ void smp_ipi_handle(int sgi_id)
             gic_send_sgi(0, SGI_IPI_TEST);
         break;
 
-    case SGI_VM_FREEZE: {
-        unsigned long generation = __atomic_load_n(&freeze_generation,
-                                                   __ATOMIC_ACQUIRE);
-        struct task_struct *target = freeze_target_task;
-        struct pt_regs *regs;
-
-        if (!__atomic_load_n(&freeze_active, __ATOMIC_ACQUIRE) ||
-            cpu != __atomic_load_n(&freeze_target_cpu, __ATOMIC_RELAXED) ||
-            !target || current != target || target->phys_cpu != cpu ||
-            target->vcpu_id != 1 || target->vmid != 2 ||
-            target->state != TASK_RUNNING)
-            break;
-
-        memcpy(&target->freeze_context.cpu_sysregs, &target->cpu_sysregs,
-               sizeof(target->cpu_sysregs));
-        memcpy(&target->freeze_context.virt, &target->virt,
-               sizeof(target->virt));
-        vgic_save_state(&target->freeze_context.virt);
-        target->freeze_context.virt.cntv_ctl = READ_SYSREG64(CNTV_CTL_EL0);
-        target->freeze_context.virt.cntv_cval = READ_SYSREG64(CNTV_CVAL_EL0);
-        target->freeze_context.virt.vtimer_pending =
-            !!(target->freeze_context.virt.cntv_ctl & TIMER_CTL_ISTATUS);
-
-        regs = task_pt_regs(target);
-        for (int i = 0; i < 31; i++)
-            target->freeze_context.regs[i] = regs->regs[i];
-        target->freeze_context.sp = regs->sp;
-        target->freeze_context.pc = regs->pc;
-        target->freeze_context.pstate = regs->pstate;
-        target->freeze_context.generation = generation;
-        target->freeze_context.active = 1;
-        asm volatile("dmb ish" ::: "memory");
-
-        freeze_progress_count[cpu]++;
-        __atomic_store_n(&freeze_ack_generation[cpu], generation,
-                         __ATOMIC_RELEASE);
-        while (__atomic_load_n(&release_generation, __ATOMIC_ACQUIRE) != generation)
-            asm volatile("yield" ::: "memory");
-
-        asm volatile("dmb ish" ::: "memory");
-        if (target->freeze_context.generation != generation ||
-            !target->freeze_context.active)
-            break;
-
-        regs = task_pt_regs(target);
-        for (int i = 0; i < 31; i++)
-            regs->regs[i] = target->freeze_context.regs[i];
-        regs->sp = target->freeze_context.sp;
-        regs->pc = target->freeze_context.pc;
-        regs->pstate = target->freeze_context.pstate;
-        target->freeze_context.active = 0;
-        __atomic_store_n(&release_ack_generation[cpu], generation, __ATOMIC_RELEASE);
+    case SGI_VM_FREEZE:
+        smp_handle_freeze_request();
         break;
-    }
 
     case SGI_VM_TXN_FREEZE: {
         /*
@@ -808,8 +830,7 @@ void smp_ipi_handle(int sgi_id)
 
         if (__atomic_load_n(&txn_state, __ATOMIC_ACQUIRE) != TXN_FROZEN ||
             cpu != __atomic_load_n(&txn_target_cpu, __ATOMIC_RELAXED) ||
-            !target || current != target || target->phys_cpu != cpu ||
-            target->vcpu_id != 1 || target->vmid != 2 ||
+            !target || current != target || target->vmid != 2 ||
             target->state != TASK_RUNNING)
             break;
 
@@ -817,24 +838,7 @@ void smp_ipi_handle(int sgi_id)
         if (__atomic_load_n(&txn_decision, __ATOMIC_ACQUIRE) != 0)
             break;
 
-        memcpy(&target->freeze_context.cpu_sysregs, &target->cpu_sysregs,
-               sizeof(target->cpu_sysregs));
-        memcpy(&target->freeze_context.virt, &target->virt,
-               sizeof(target->virt));
-        vgic_save_state(&target->freeze_context.virt);
-        target->freeze_context.virt.cntv_ctl = READ_SYSREG64(CNTV_CTL_EL0);
-        target->freeze_context.virt.cntv_cval = READ_SYSREG64(CNTV_CVAL_EL0);
-        target->freeze_context.virt.vtimer_pending =
-            !!(target->freeze_context.virt.cntv_ctl & TIMER_CTL_ISTATUS);
-
-        regs = task_pt_regs(target);
-        for (int i = 0; i < 31; i++)
-            target->freeze_context.regs[i] = regs->regs[i];
-        target->freeze_context.sp = regs->sp;
-        target->freeze_context.pc = regs->pc;
-        target->freeze_context.pstate = regs->pstate;
-        target->freeze_context.generation = 1; /* 事务固定 generation */
-        target->freeze_context.active = 1;
+        smp_capture_freeze_context(target, 1);
         asm volatile("dmb ish" ::: "memory");
 
         freeze_progress_count[cpu]++;
@@ -847,8 +851,8 @@ void smp_ipi_handle(int sgi_id)
 
         /* generation/active 校验失败（如新的瞬时冻结覆盖了快照）：不恢复现场 */
         asm volatile("dmb ish" ::: "memory");
-        if (target->freeze_context.generation != 1 ||
-            !target->freeze_context.active) {
+        if (target->freeze_context->generation != 1 ||
+            !target->freeze_context->active) {
             __atomic_store_n(&release_ack_generation[cpu], 1,
                              __ATOMIC_RELEASE);
             break;
@@ -859,11 +863,11 @@ void smp_ipi_handle(int sgi_id)
          * rollback = 从冻结点重新执行（guest 侧观察重执行副作用） */
         regs = task_pt_regs(target);
         for (int i = 0; i < 31; i++)
-            regs->regs[i] = target->freeze_context.regs[i];
-        regs->sp = target->freeze_context.sp;
-        regs->pc = target->freeze_context.pc;
-        regs->pstate = target->freeze_context.pstate;
-        target->freeze_context.active = 0;
+            regs->regs[i] = target->freeze_context->regs[i];
+        regs->sp = target->freeze_context->sp;
+        regs->pc = target->freeze_context->pc;
+        regs->pstate = target->freeze_context->pstate;
+        target->freeze_context->active = 0;
         (void)decision;
         __atomic_store_n(&release_ack_generation[cpu], 1, __ATOMIC_RELEASE);
         break;
@@ -883,8 +887,7 @@ void smp_ipi_handle(int sgi_id)
 
         if (__atomic_load_n(&vm_txn_state, __ATOMIC_ACQUIRE) != VM_TXN_FROZEN ||
             cpu != __atomic_load_n(&vm_txn_target_cpu, __ATOMIC_RELAXED) ||
-            !target || current != target || target->phys_cpu != cpu ||
-            target->vcpu_id != 1 || target->vmid != 2 ||
+            !target || current != target || target->vmid != 2 ||
             target->state != TASK_RUNNING)
             break;
 
@@ -892,24 +895,24 @@ void smp_ipi_handle(int sgi_id)
         if (__atomic_load_n(&vm_txn_decision, __ATOMIC_ACQUIRE) != 0)
             break;
 
-        memcpy(&target->freeze_context.cpu_sysregs, &target->cpu_sysregs,
+        memcpy(&target->freeze_context->cpu_sysregs, &target->cpu_sysregs,
                sizeof(target->cpu_sysregs));
-        memcpy(&target->freeze_context.virt, &target->virt,
+        memcpy(&target->freeze_context->virt, &target->virt,
                sizeof(target->virt));
-        vgic_save_state(&target->freeze_context.virt);
-        target->freeze_context.virt.cntv_ctl = READ_SYSREG64(CNTV_CTL_EL0);
-        target->freeze_context.virt.cntv_cval = READ_SYSREG64(CNTV_CVAL_EL0);
-        target->freeze_context.virt.vtimer_pending =
-            !!(target->freeze_context.virt.cntv_ctl & TIMER_CTL_ISTATUS);
+        vgic_save_state(&target->freeze_context->virt);
+        target->freeze_context->virt.cntv_ctl = READ_SYSREG64(CNTV_CTL_EL0);
+        target->freeze_context->virt.cntv_cval = READ_SYSREG64(CNTV_CVAL_EL0);
+        target->freeze_context->virt.vtimer_pending =
+            !!(target->freeze_context->virt.cntv_ctl & TIMER_CTL_ISTATUS);
 
         regs = task_pt_regs(target);
         for (int i = 0; i < 31; i++)
-            target->freeze_context.regs[i] = regs->regs[i];
-        target->freeze_context.sp = regs->sp;
-        target->freeze_context.pc = regs->pc;
-        target->freeze_context.pstate = regs->pstate;
-        target->freeze_context.generation = 1;
-        target->freeze_context.active = 1;
+            target->freeze_context->regs[i] = regs->regs[i];
+        target->freeze_context->sp = regs->sp;
+        target->freeze_context->pc = regs->pc;
+        target->freeze_context->pstate = regs->pstate;
+        target->freeze_context->generation = 1;
+        target->freeze_context->active = 1;
         asm volatile("dmb ish" ::: "memory");
 
         freeze_progress_count[cpu]++;
@@ -921,8 +924,8 @@ void smp_ipi_handle(int sgi_id)
             asm volatile("yield" ::: "memory");
 
         asm volatile("dmb ish" ::: "memory");
-        if (target->freeze_context.generation != 1 ||
-            !target->freeze_context.active) {
+        if (target->freeze_context->generation != 1 ||
+            !target->freeze_context->active) {
             __atomic_store_n(&release_ack_generation[cpu], 1,
                              __ATOMIC_RELEASE);
             break;
@@ -933,11 +936,11 @@ void smp_ipi_handle(int sgi_id)
          * 协调核负责两者的语义区分（vCPU0 回卷与否）。 */
         regs = task_pt_regs(target);
         for (int i = 0; i < 31; i++)
-            regs->regs[i] = target->freeze_context.regs[i];
-        regs->sp = target->freeze_context.sp;
-        regs->pc = target->freeze_context.pc;
-        regs->pstate = target->freeze_context.pstate;
-        target->freeze_context.active = 0;
+            regs->regs[i] = target->freeze_context->regs[i];
+        regs->sp = target->freeze_context->sp;
+        regs->pc = target->freeze_context->pc;
+        regs->pstate = target->freeze_context->pstate;
+        target->freeze_context->active = 0;
         (void)decision;
         __atomic_store_n(&release_ack_generation[cpu], 1, __ATOMIC_RELEASE);
         break;

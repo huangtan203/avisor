@@ -399,12 +399,18 @@ void handle_hvc64(unsigned long hvc_nr)
 			 smp_processor_id() == 0)
 				? migration_cancel(current) : -1;
 		break;
+	case HVC_MIGRATE_FAIL_FINISH:
+		regs->regs[0] =
+			(current->vmid == 2 && current->vcpu_id == 0 &&
+			 smp_processor_id() == 0)
+				? migration_fail_finish_once(current) : -1;
+		break;
 	case HVC_MIGRATE_STATUS:
 		regs->regs[0] = migration_get_state();
 		break;
 	case HVC_SMP_FREEZE_BEGIN:
 		regs->regs[0] = (current->vmid == 2 && current->vcpu_id == 0 &&
-				 smp_processor_id() == 0)
+			 smp_processor_id() == 0)
 				? smp_freeze_begin(1) : -1;
 		break;
 	case HVC_SMP_FREEZE_RELEASE:
@@ -484,6 +490,9 @@ void handle_hvc64(unsigned long hvc_nr)
 				? smp_vm_txn_status() : 0;
 		break;
 	/* Phase 34: 查询迁移后源 VM 回收统计 */
+	case HVC_MIGRATE_ABORT_STATS:
+		regs->regs[0] = migration_finish_abort_stats();
+		break;
 	case HVC_MIGRATE_RECLAIM_STATS: {
 		int pages, shm, ksm, done;
 		migration_reclaim_stats(&pages, &shm, &ksm, &done);

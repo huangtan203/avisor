@@ -247,6 +247,7 @@ void hypervisor_main()
             cpu0_tasks[pid]->vmid = 1;
             cpu0_tasks[pid]->vcpu_id = 0;
             cpu0_tasks[pid]->phys_cpu = 0;
+            cpu0_tasks[pid]->cpu_sysregs.mpidr_el1 = 0;
             /* 给 Guest 更高调度优先级 */
             cpu0_tasks[pid]->priority = 10;
             cpu0_tasks[pid]->counter = 10;
@@ -290,6 +291,7 @@ void hypervisor_main()
             cpu0_tasks[pid]->vmid = 2;
             cpu0_tasks[pid]->vcpu_id = 0;
             cpu0_tasks[pid]->phys_cpu = 0;
+            cpu0_tasks[pid]->cpu_sysregs.mpidr_el1 = 0;
             cpu0_tasks[pid]->priority = 10;
             cpu0_tasks[pid]->counter = 10;
             (void)strncpy(cpu0_tasks[pid]->name, "vm2-cpu0", 36);
@@ -337,6 +339,7 @@ void hypervisor_main()
             cpu0_tasks[pid]->vmid = 3;
             cpu0_tasks[pid]->vcpu_id = 0;
             cpu0_tasks[pid]->phys_cpu = 0;
+            cpu0_tasks[pid]->cpu_sysregs.mpidr_el1 = 0;
             cpu0_tasks[pid]->priority = 10;
             cpu0_tasks[pid]->counter = 10;
             cpu0_tasks[pid]->state = TASK_WAITING;  /* dormant，直到迁移 FINISH 唤醒 */
