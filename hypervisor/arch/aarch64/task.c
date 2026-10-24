@@ -36,6 +36,57 @@
 
 int uart_forwarded_task = 0;
 
+#define TASK_STACK_CANARY 0x535441434b475244UL
+
+static unsigned long task_stack_guard_end(struct task_struct *tsk)
+{
+	return (unsigned long)tsk + sizeof(*tsk) + TASK_STACK_GUARD_SIZE;
+}
+
+void task_stack_init(struct task_struct *tsk)
+{
+	unsigned long *guard = (unsigned long *)((unsigned long)tsk + sizeof(*tsk));
+
+	for (unsigned long i = 0; i < TASK_STACK_GUARD_SIZE / sizeof(*guard); i++)
+		guard[i] = TASK_STACK_CANARY;
+	tsk->stack_low_water = (unsigned long)task_pt_regs(tsk);
+}
+
+void task_stack_check(struct task_struct *tsk)
+{
+	unsigned long *guard;
+	unsigned long sp;
+	unsigned long guard_end;
+
+	if (!tsk || tsk->pid == 0)
+		return;
+
+	guard = (unsigned long *)((unsigned long)tsk + sizeof(*tsk));
+	for (unsigned long i = 0; i < TASK_STACK_GUARD_SIZE / sizeof(*guard); i++) {
+		if (guard[i] != TASK_STACK_CANARY)
+			PANIC("EL2 task stack overflow: vmid=%lu vcpu=%d pid=%ld",
+			      tsk->vmid, tsk->vcpu_id, tsk->pid);
+	}
+
+	asm volatile("mov %0, sp" : "=r"(sp));
+	guard_end = task_stack_guard_end(tsk);
+	if (tsk == current) {
+		if (sp <= guard_end || sp - guard_end < TASK_STACK_MIN_FREE)
+			PANIC("EL2 task stack exhausted: vmid=%lu vcpu=%d free=%lu",
+			      tsk->vmid, tsk->vcpu_id,
+			      sp > guard_end ? sp - guard_end : 0);
+		if (sp < tsk->stack_low_water)
+			tsk->stack_low_water = sp;
+	}
+}
+
+unsigned long task_stack_min_free(struct task_struct *tsk)
+{
+	if (!tsk || tsk->pid == 0 || !tsk->stack_low_water)
+		return 0;
+	return tsk->stack_low_water - task_stack_guard_end(tsk);
+}
+
 struct pt_regs *task_pt_regs(struct task_struct *tsk)
 {
 	unsigned long p =
@@ -102,10 +153,16 @@ int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 	struct task_struct *p;
 
 	p = (struct task_struct *)allocate_page();
-	struct pt_regs *childregs = task_pt_regs(p);
-
 	if (!p)
 		return -1;
+
+	p->freeze_context = (struct freeze_context *)allocate_page();
+	if (!p->freeze_context) {
+		deallocate_page(p);
+		return -1;
+	}
+
+	struct pt_regs *childregs = task_pt_regs(p);
 
 	p->cpu_context.x19 = (unsigned long)prepare_task;
 	p->cpu_context.x20 = (unsigned long)loader;
@@ -141,6 +198,7 @@ int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 
 	p->cpu_context.pc = (unsigned long)switch_from_kthread;
 	p->cpu_context.sp = (unsigned long)childregs;
+	task_stack_init(p);
 
 	/* 添加到指定 CPU 的任务表 */
 	int pid = cpu_state[cpu].nr_tasks++;

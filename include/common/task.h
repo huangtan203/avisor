@@ -34,6 +34,9 @@ struct pt_regs {
 typedef int (*loader_func_t)(void *, struct pt_regs *regs);
 
 struct pt_regs *task_pt_regs(struct task_struct *);
+void task_stack_init(struct task_struct *);
+void task_stack_check(struct task_struct *);
+unsigned long task_stack_min_free(struct task_struct *);
 int create_task(loader_func_t, void *);
 int create_task_on_cpu(int cpu, loader_func_t, void *);
 void init_task_console(struct task_struct *);

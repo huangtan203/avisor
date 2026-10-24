@@ -14,6 +14,9 @@
 #ifndef __ASSEMBLER__
 #include "arch/aarch64/sysregs.h"
 #define THREAD_SIZE 4096
+#define TASK_STACK_GUARD_SIZE 64
+#define TASK_STACK_MIN_RESERVE 2048
+#define TASK_STACK_MIN_FREE 256
 
 #define NR_TASKS 64
 
@@ -204,7 +207,7 @@ struct freeze_context {
 
 struct task_struct {
 	struct cpu_context cpu_context;
-	struct freeze_context freeze_context;
+	struct freeze_context *freeze_context;
 	long state;
 	long counter;
 	long priority;
@@ -220,9 +223,14 @@ struct task_struct {
 	struct task_stat stat;
 	struct task_console console;
 	struct vm_virt_state virt; /* per-VM 虚拟化状态（Phase 3） */
+	unsigned long stack_low_water;
     int vcpu_id;    /* 虚拟 CPU ID（SMP VM 的第几个 vCPU） */
     int phys_cpu;   /* 绑定的物理 CPU ID */
 };
+
+_Static_assert(sizeof(struct task_struct) + TASK_STACK_GUARD_SIZE +
+	       TASK_STACK_MIN_RESERVE + 272 <= THREAD_SIZE,
+	       "task_struct leaves insufficient EL2 stack space");
 
 /* per-CPU 调度器状态
  * 每个物理核有自己的 current / task 表 / nr_tasks / rr_start
@@ -353,12 +361,13 @@ extern void sched_wait(void);
 
 #define INIT_TASK                                                              \
 	{                                                                      \
-		/* cpu_context */ { 0 }, /* freeze_context */ { 0 },          \
+		/* cpu_context */ { 0 }, /* freeze_context */ 0,              \
 		/* state etc */ 0, 0, 1, 0, 0,                                \
 			/* vmid */ 0, /* flags */ 0, "", 0, 0,                 \
 			/* mm */ { 0 }, /* cpu_sysregs */ { 0 },               \
 			/* stat */ { 0 }, /* console */ { 0 },                 \
-			/* virt */ { 0 }, /* vcpu_id */ 0, /* phys_cpu */ 0,   \
+			/* virt */ { 0 }, /* stack_low_water */ 0,             \
+			/* vcpu_id */ 0, /* phys_cpu */ 0,                     \
 	}
 
 #endif

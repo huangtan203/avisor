@@ -177,10 +177,12 @@ void set_cpu_virtual_interrupt(struct task_struct *tsk)
 
 void switch_to(struct task_struct *next)
 {
+	task_stack_check(current);
 	if (current == next)
 		return;
 
 	struct task_struct *prev = current;
+	task_stack_check(next);
 
 	/*
 	 * 世界切换：保存 prev VM 的虚拟化状态（GIC 虚拟接口、虚拟定时器等）。
@@ -257,6 +259,8 @@ void vm_entering_work()
 {
 	if (!current || current->pid == 0)
 		return;
+
+	task_stack_check(current);
 
 	if (is_uart_forwarded_task(current))
 		flush_task_console(current);
