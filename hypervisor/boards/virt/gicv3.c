@@ -411,6 +411,7 @@ void gic_send_sgi(unsigned int cpu_id, unsigned int sgi_id)
     sgi_val = ((uint64_t)(sgi_id & 0xF) << 24)   /* INTID [27:24] */
             | (1ULL << (cpu_id & 0xF));            /* TargetList: bit cpu_id */
 
+    asm volatile("dsb ishst" ::: "memory");
     icc_sgi1r_write(sgi_val);
     asm volatile("isb" ::: "memory");
 }
