@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "common/platform.h"
+#include "arch/aarch64/mmu.h"
 #include "boards/virt/base.h"
 #include "common/printf.h"
 #include "common/utils.h"
@@ -24,6 +25,10 @@
 #define TIMER_HYP_INDEX 3U
 #define TIMER_IRQ_CELLS 3U
 #define GITS_TRANSLATER_END 0x10044UL
+#define PLATFORM_STAGE1_LIMIT (1UL << PUD_SHIFT)
+#define PLATFORM_PUD_MMIO_INDEX 0
+#define PLATFORM_PUD_PAGE_OFFSET PAGE_SIZE
+#define PLATFORM_SHADOW_PMD_OFFSET (4 * PAGE_SIZE)
 
 struct platform_info platform_current;
 unsigned long virt_uart_base = VA_START + VIRT_UART_BASE;
@@ -86,6 +91,26 @@ static int range_within(unsigned long base, unsigned long size,
 static int range_valid(unsigned long base, unsigned long size)
 {
 	return size && size <= ~0UL - base;
+}
+
+static int stage1_range_mappable(unsigned long base, unsigned long size)
+{
+	return range_valid(base, size) && base + size <= PLATFORM_STAGE1_LIMIT;
+}
+
+static void map_device_sections(uint64_t *pmd, unsigned long base,
+				unsigned long size)
+{
+	unsigned long start = align_down(base, SECTION_SIZE);
+	unsigned long end = align_up(base + size, SECTION_SIZE);
+
+	while (start < end) {
+		unsigned long index = (start >> SECTION_SHIFT) &
+				      (PTRS_PER_TABLE - 1);
+
+		pmd[index] = start | MMU_DEVICE_FLAGS;
+		start += SECTION_SIZE;
+	}
 }
 
 static int ranges_overlap(unsigned long base1, unsigned long size1,
@@ -460,6 +485,8 @@ static int fdt_parse(unsigned long dtb)
 			if (depth >= 1 && uart_node && !strcmp(prop, FDT_REG) &&
 			    len >= (address_cells + size_cells) * 4) {
 				platform_current.uart_base = read_cells(value, address_cells);
+				platform_current.uart_size =
+					read_cells(value + address_cells * 4, size_cells);
 				platform_current.uart_discovered = 1;
 			}
 			if (depth >= 1 && gic_node && !strcmp(prop, FDT_REG) &&
@@ -572,6 +599,53 @@ int platform_mmio_config_valid(void)
 	return platform_current.mmio_config_valid;
 }
 
+int platform_apply_runtime_mappings(void)
+{
+	uint64_t *pud = (uint64_t *)((unsigned long)&pg_dir +
+				     PLATFORM_PUD_PAGE_OFFSET);
+	uint64_t *shadow = (uint64_t *)((unsigned long)&pg_dir +
+					PLATFORM_SHADOW_PMD_OFFSET);
+
+	platform_current.runtime_mapping_valid = 0;
+	if (!platform_runtime_config_valid() ||
+	    !stage1_range_mappable(platform_current.uart_base,
+				      platform_current.uart_size) ||
+	    !stage1_range_mappable(platform_current.gicd_base,
+				      platform_current.gicd_size) ||
+	    !stage1_range_mappable(platform_current.gicr_base,
+				      platform_current.gicr_size) ||
+	    !stage1_range_mappable(platform_current.gits_base,
+				      platform_current.gits_size))
+		return -1;
+
+	memzero(shadow, PAGE_SIZE);
+	map_device_sections(shadow, platform_current.uart_base,
+			    platform_current.uart_size);
+	map_device_sections(shadow, platform_current.gicd_base,
+			    platform_current.gicd_size);
+	map_device_sections(shadow, platform_current.gicr_base,
+			    platform_current.gicr_size);
+	map_device_sections(shadow, platform_current.gits_base,
+			    platform_current.gits_size);
+
+	/* QEMU PCI 仍由固定布局提供，直到 PCI host bridge 也由 DTB 解析。 */
+	map_device_sections(shadow, VIRT_PCIE_MMIO_BASE, SECTION_SIZE);
+	map_device_sections(shadow, VIRT_PCIE_ECAM_BASE, VIRT_PCIE_ECAM_SIZE);
+
+	/* 按 Arm break-before-make 顺序替换有效的 Stage-1 table descriptor。 */
+	pud[PLATFORM_PUD_MMIO_INDEX] = 0;
+	asm volatile("dsb ishst\n"
+		     "tlbi alle2\n"
+		     "dsb ish\n"
+		     "isb" ::: "memory");
+	pud[PLATFORM_PUD_MMIO_INDEX] =
+		TO_PADDR((unsigned long)shadow) | MM_TYPE_PAGE_TABLE;
+	asm volatile("dsb ishst\n"
+		     "isb" ::: "memory");
+	platform_current.runtime_mapping_valid = 1;
+	return 0;
+}
+
 const char *platform_kind_name(enum platform_kind kind)
 {
 	if (kind == PLATFORM_KIND_QEMU_VIRT)
@@ -593,6 +667,7 @@ void platform_early_probe(void)
 	platform_current.memory_base = VIRT_DRAM_BASE;
 	platform_current.memory_size = PHYS_MEMORY_SIZE;
 	platform_current.uart_base = VIRT_UART_BASE;
+	platform_current.uart_size = 0x1000UL;
 	platform_current.gicd_base = VIRT_GICD_BASE;
 	platform_current.gicd_size = 0x10000UL;
 	platform_current.gicr_base = VIRT_GICR_BASE;
@@ -630,7 +705,10 @@ void platform_early_probe(void)
 			platform_current.gits_size >= GITS_TRANSLATER_END &&
 			platform_current.timer_hyp_ppi == 26 &&
 			platform_current.timer_virt_ppi == 27 &&
-			range_within(platform_current.uart_base, 1, VIRT_MMIO_BASE,
+			stage1_range_mappable(platform_current.uart_base,
+					      platform_current.uart_size) &&
+			range_within(platform_current.uart_base,
+				     platform_current.uart_size, VIRT_MMIO_BASE,
 				     VIRT_MMIO_SIZE) &&
 			range_within(platform_current.gicd_base,
 				     platform_current.gicd_size, VIRT_MMIO_BASE,
@@ -654,6 +732,7 @@ void platform_early_probe(void)
 		platform_current.memory_base = VIRT_DRAM_BASE;
 		platform_current.memory_size = PHYS_MEMORY_SIZE;
 		platform_current.uart_base = VIRT_UART_BASE;
+		platform_current.uart_size = 0x1000UL;
 		platform_current.gicd_base = VIRT_GICD_BASE;
 		platform_current.gicd_size = 0x10000UL;
 		platform_current.gicr_base = VIRT_GICR_BASE;

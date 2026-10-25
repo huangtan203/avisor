@@ -33,6 +33,7 @@ struct platform_info {
 	unsigned long memory_base;
 	unsigned long memory_size;
 	unsigned long uart_base;
+	unsigned long uart_size;
 	unsigned long gicd_base;
 	unsigned long gicd_size;
 	unsigned long gicr_base;
@@ -74,6 +75,7 @@ struct platform_info {
 	int gits_compatible;
 	int timer_discovered;
 	int timer_interrupts_discovered;
+	int runtime_mapping_valid;
 };
 
 extern struct platform_info platform_current;
@@ -92,3 +94,4 @@ unsigned int platform_timer_virt_ppi(void);
 int platform_runtime_config_valid(void);
 int platform_memory_config_valid(void);
 int platform_mmio_config_valid(void);
+int platform_apply_runtime_mappings(void);

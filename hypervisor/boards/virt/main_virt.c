@@ -143,6 +143,10 @@ void hypervisor_main()
     uart_init();
     /* 2. 探测平台并覆盖有效 DTB 提供的运行时基址。 */
     platform_early_probe();
+    if (platform_apply_runtime_mappings() == 0)
+        printf("[platform] stage1-map=dtb sections=validated\n");
+    else
+        printf("[platform] stage1-map=fixed-layout\n");
     virt_page_pool_init();
     uart_init();
 
