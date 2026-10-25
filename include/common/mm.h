@@ -28,7 +28,9 @@
 #define LV1_SHIFT (PAGE_SHIFT + 2 * TABLE_SHIFT)
 #define LV2_SHIFT (PAGE_SHIFT + TABLE_SHIFT)
 
-#define PG_DIR_SIZE (5 * PAGE_SIZE)
+/* Phase 57: bootstrap tables, shadow PGD and a bounded runtime table pool. */
+#define PG_DIR_TABLE_PAGES 128
+#define PG_DIR_SIZE (PG_DIR_TABLE_PAGES * PAGE_SIZE)
 
 /*
  * ========== 平台相关的内存布局定义 ==========

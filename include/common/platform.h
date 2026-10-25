@@ -11,6 +11,7 @@ enum platform_kind {
 
 #define PLATFORM_MAX_RESERVED_RANGES 16
 #define PLATFORM_MAX_MEMORY_RANGES 24
+#define PLATFORM_MAX_MEMORY_BANKS 8
 
 enum platform_memory_range_type {
 	PLATFORM_MEMORY_IMAGE = 0,
@@ -32,6 +33,9 @@ struct platform_info {
 	unsigned long cpu_count;
 	unsigned long memory_base;
 	unsigned long memory_size;
+	struct platform_reserved_range memory_banks[PLATFORM_MAX_MEMORY_BANKS];
+	unsigned int memory_bank_count;
+	unsigned int memory_bank_overflow;
 	unsigned long uart_base;
 	unsigned long uart_size;
 	unsigned long gicd_base;
@@ -75,6 +79,7 @@ struct platform_info {
 	int gits_compatible;
 	int timer_discovered;
 	int timer_interrupts_discovered;
+	unsigned int runtime_table_count;
 	int runtime_mapping_valid;
 };
 

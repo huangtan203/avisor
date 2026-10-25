@@ -349,12 +349,11 @@ el2_entry:
  *   注意：等值映射（VA = PA），这样开启 MMU 前后地址不变，
  *   代码可以平滑过渡，不会出现"跳转后地址突变"的问题。
  *
- * 页表布局（pg_dir 开始，共 5 页）：
- *   页 0: PGD (Level 0)
- *   页 1: PUD (Level 1) — DRAM 和 MMIO 共享 PUD 表
- *   页 2: PMD_DRAM (Level 2) — PUD[1] 指向，DRAM 的块映射
- *   页 3: PMD_MMIO (Level 2) — PUD[0] 指向，MMIO 的块映射
- *   页 4: 预留
+ * 页表布局（pg_dir 开始，共 128 页）：
+ *   页 0: bootstrap PGD，页 1: bootstrap PUD
+ *   页 2..3: bootstrap DRAM/MMIO PMD
+ *   页 4: runtime shadow PGD
+ *   页 5..127: 按需分配的 runtime PUD/PMD table pool
  */
 __create_page_tables:
     /* 保存返回地址 */
@@ -362,7 +361,7 @@ __create_page_tables:
 
     /* 清零页表区域 */
     adrp x0, pg_dir
-    mov x1, #PG_DIR_SIZE
+    ldr x1, =PG_DIR_SIZE
     bl memzero
 
     /* ---- 计算各级页表的地址 ---- */

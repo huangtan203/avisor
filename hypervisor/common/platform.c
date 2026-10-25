@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "common/platform.h"
 #include "arch/aarch64/mmu.h"
+#include "common/mm.h"
 #include "boards/virt/base.h"
 #include "common/printf.h"
 #include "common/utils.h"
@@ -25,10 +26,10 @@
 #define TIMER_HYP_INDEX 3U
 #define TIMER_IRQ_CELLS 3U
 #define GITS_TRANSLATER_END 0x10044UL
-#define PLATFORM_STAGE1_LIMIT (1UL << PUD_SHIFT)
-#define PLATFORM_PUD_MMIO_INDEX 0
-#define PLATFORM_PUD_PAGE_OFFSET PAGE_SIZE
-#define PLATFORM_SHADOW_PMD_OFFSET (4 * PAGE_SIZE)
+#define PLATFORM_STAGE1_LIMIT (1UL << 48)
+#define PLATFORM_RUNTIME_SHADOW_PGD_PAGE 4
+#define PLATFORM_RUNTIME_TABLE_FIRST_PAGE 5
+#define PLATFORM_RUNTIME_TABLE_LAST_PAGE (PG_DIR_TABLE_PAGES - 1)
 
 struct platform_info platform_current;
 unsigned long virt_uart_base = VA_START + VIRT_UART_BASE;
@@ -98,19 +99,64 @@ static int stage1_range_mappable(unsigned long base, unsigned long size)
 	return range_valid(base, size) && base + size <= PLATFORM_STAGE1_LIMIT;
 }
 
-static void map_device_sections(uint64_t *pmd, unsigned long base,
-				unsigned long size)
+static uint64_t *runtime_pgd;
+static unsigned int runtime_table_pages;
+
+static uint64_t *runtime_alloc_table(void)
 {
-	unsigned long start = align_down(base, SECTION_SIZE);
-	unsigned long end = align_up(base + size, SECTION_SIZE);
+	uint64_t *table;
 
+	if (runtime_table_pages >= PLATFORM_RUNTIME_TABLE_LAST_PAGE -
+			PLATFORM_RUNTIME_TABLE_FIRST_PAGE + 1)
+		return NULL;
+	table = (uint64_t *)((unsigned long)&pg_dir +
+			(PLATFORM_RUNTIME_TABLE_FIRST_PAGE + runtime_table_pages) * PAGE_SIZE);
+	runtime_table_pages++;
+	memzero(table, PAGE_SIZE);
+	return table;
+}
+
+static uint64_t *runtime_get_next_table(uint64_t *parent, unsigned long index)
+{
+	uint64_t descriptor = parent[index];
+	uint64_t *table;
+
+	if (descriptor)
+		return (uint64_t *)(unsigned long)(descriptor & PAGE_MASK);
+	table = runtime_alloc_table();
+	if (!table)
+		return NULL;
+	parent[index] = TO_PADDR((unsigned long)table) | MM_TYPE_PAGE_TABLE;
+	return table;
+}
+
+static int map_runtime_range(unsigned long base, unsigned long size,
+				     uint64_t flags)
+{
+	unsigned long start, end;
+
+	if (!stage1_range_mappable(base, size))
+		return -1;
+	start = align_down(base, SECTION_SIZE);
+	end = align_up(base + size, SECTION_SIZE);
 	while (start < end) {
-		unsigned long index = (start >> SECTION_SHIFT) &
+		unsigned long pgd_index = start >> PGD_SHIFT;
+		unsigned long pud_index = (start >> PUD_SHIFT) &
 				      (PTRS_PER_TABLE - 1);
+		unsigned long pmd_index = (start >> SECTION_SHIFT) &
+				      (PTRS_PER_TABLE - 1);
+		uint64_t *pud = runtime_get_next_table(runtime_pgd, pgd_index);
+		uint64_t *pmd;
 
-		pmd[index] = start | MMU_DEVICE_FLAGS;
+		if (!pud)
+			return -1;
+		pmd = runtime_get_next_table(pud, pud_index);
+		if (!pmd)
+			return -1;
+		pmd[pmd_index] = start | flags;
 		start += SECTION_SIZE;
 	}
+	return 0;
 }
 
 static int ranges_overlap(unsigned long base1, unsigned long size1,
@@ -119,6 +165,63 @@ static int ranges_overlap(unsigned long base1, unsigned long size1,
 	if (!range_valid(base1, size1) || !range_valid(base2, size2))
 		return 0;
 	return base1 < base2 + size2 && base2 < base1 + size1;
+}
+
+static void add_memory_bank(unsigned long base, unsigned long size)
+{
+	struct platform_reserved_range *bank;
+
+	if (!range_valid(base, size)) {
+		platform_current.memory_bank_overflow++;
+		return;
+	}
+	if (platform_current.memory_bank_count >= PLATFORM_MAX_MEMORY_BANKS) {
+		platform_current.memory_bank_overflow++;
+		return;
+	}
+	bank = &platform_current.memory_banks[platform_current.memory_bank_count++];
+	bank->base = base;
+	bank->size = size;
+	bank->type = PLATFORM_MEMORY_FIRMWARE;
+	if (platform_current.memory_bank_count == 1) {
+		platform_current.memory_base = base;
+		platform_current.memory_size = size;
+	}
+	platform_current.memory_discovered = 1;
+}
+
+static void normalize_memory_banks(void)
+{
+	unsigned int i, j;
+
+	for (i = 1; i < platform_current.memory_bank_count; i++) {
+		struct platform_reserved_range item = platform_current.memory_banks[i];
+
+		for (j = i; j && platform_current.memory_banks[j - 1].base > item.base; j--)
+			platform_current.memory_banks[j] = platform_current.memory_banks[j - 1];
+		platform_current.memory_banks[j] = item;
+	}
+	for (i = 0, j = 0; i < platform_current.memory_bank_count; i++) {
+		struct platform_reserved_range *bank = &platform_current.memory_banks[i];
+
+		if (j && bank->base <= platform_current.memory_banks[j - 1].base +
+					platform_current.memory_banks[j - 1].size) {
+			unsigned long end = bank->base + bank->size;
+			unsigned long previous_end = platform_current.memory_banks[j - 1].base +
+						     platform_current.memory_banks[j - 1].size;
+
+			if (end > previous_end)
+				platform_current.memory_banks[j - 1].size =
+					end - platform_current.memory_banks[j - 1].base;
+		} else {
+			platform_current.memory_banks[j++] = *bank;
+		}
+	}
+	platform_current.memory_bank_count = j;
+	if (j) {
+		platform_current.memory_base = platform_current.memory_banks[0].base;
+		platform_current.memory_size = platform_current.memory_banks[0].size;
+	}
 }
 
 static void add_reserved_range(unsigned long base, unsigned long size)
@@ -189,26 +292,30 @@ static const char *fdt_string(const unsigned char *strings, unsigned int size,
 static void add_occupied_range(unsigned long base, unsigned long size,
 			       enum platform_memory_range_type type)
 {
-	unsigned long memory_start = platform_current.memory_base;
-	unsigned long memory_end = memory_start + platform_current.memory_size;
-	unsigned long end;
-	struct platform_reserved_range *range;
+	unsigned long occupied_end;
+	unsigned int i;
 
-	if (!range_valid(base, size) || base >= memory_end || base + size <= memory_start)
+	if (!range_valid(base, size))
 		return;
-	end = base + size;
-	if (base < memory_start)
-		base = memory_start;
-	if (end > memory_end)
-		end = memory_end;
-	if (platform_current.occupied_count >= PLATFORM_MAX_MEMORY_RANGES) {
-		platform_current.memory_map_overflow++;
-		return;
+	occupied_end = base + size;
+	for (i = 0; i < platform_current.memory_bank_count; i++) {
+		struct platform_reserved_range *bank = &platform_current.memory_banks[i];
+		unsigned long bank_end = bank->base + bank->size;
+		unsigned long start = base > bank->base ? base : bank->base;
+		unsigned long end = occupied_end < bank_end ? occupied_end : bank_end;
+		struct platform_reserved_range *range;
+
+		if (end <= start)
+			continue;
+		if (platform_current.occupied_count >= PLATFORM_MAX_MEMORY_RANGES) {
+			platform_current.memory_map_overflow++;
+			return;
+		}
+		range = &platform_current.occupied[platform_current.occupied_count++];
+		range->base = start;
+		range->size = end - start;
+		range->type = type;
 	}
-	range = &platform_current.occupied[platform_current.occupied_count++];
-	range->base = base;
-	range->size = end - base;
-	range->type = type;
 }
 
 static void normalize_occupied_ranges(void)
@@ -264,9 +371,7 @@ static void add_free_range(unsigned long base, unsigned long end)
 
 static void build_memory_map(void)
 {
-	unsigned long cursor = platform_current.memory_base;
-	unsigned long memory_end = cursor + platform_current.memory_size;
-	unsigned int i;
+	unsigned int i, bank_id;
 
 	platform_current.image_base = VIRT_DRAM_BASE + 0x80000UL;
 	platform_current.image_size = (unsigned long)image_end - platform_current.image_base;
@@ -286,13 +391,24 @@ static void build_memory_map(void)
 				   PLATFORM_MEMORY_FIRMWARE);
 	normalize_occupied_ranges();
 
-	for (i = 0; i < platform_current.occupied_count; i++) {
-		struct platform_reserved_range *range = &platform_current.occupied[i];
+	for (bank_id = 0; bank_id < platform_current.memory_bank_count; bank_id++) {
+		struct platform_reserved_range *bank =
+			&platform_current.memory_banks[bank_id];
+		unsigned long cursor = bank->base;
+		unsigned long bank_end = bank->base + bank->size;
 
-		add_free_range(cursor, range->base);
-		cursor = range->base + range->size;
+		for (i = 0; i < platform_current.occupied_count; i++) {
+			struct platform_reserved_range *range = &platform_current.occupied[i];
+			unsigned long range_end = range->base + range->size;
+
+			if (range_end <= bank->base || range->base >= bank_end)
+				continue;
+			add_free_range(cursor, range->base);
+			if (range_end > cursor)
+				cursor = range_end;
+		}
+		add_free_range(cursor, bank_end);
 	}
-	add_free_range(cursor, memory_end);
 }
 
 static void validate_reserved_memory(void)
@@ -325,6 +441,7 @@ static void validate_reserved_memory(void)
 		!platform_current.page_pool_conflict;
 	platform_current.page_pool_plan_safe =
 		platform_current.dtb_valid &&
+		!platform_current.memory_bank_overflow &&
 		!platform_current.reserved_overflow &&
 		platform_current.memory_map_overflow == 0;
 }
@@ -534,15 +651,15 @@ static int fdt_parse(unsigned long dtb)
 
 			if (depth == 1 && memory_node && !strcmp(prop, FDT_REG) &&
 			    len >= (address_cells + size_cells) * 4) {
-				unsigned int i;
-				unsigned long address = 0, size = 0;
-				for (i = 0; i < address_cells; i++)
-					address = (address << 32) | be32(value + i * 4);
-				for (i = 0; i < size_cells; i++)
-					size = (size << 32) | be32(value + (address_cells + i) * 4);
-				platform_current.memory_base = address;
-				platform_current.memory_size = size;
-				platform_current.memory_discovered = 1;
+				unsigned int tuple_cells = address_cells + size_cells;
+				unsigned int offset;
+
+				for (offset = 0; offset + tuple_cells * 4 <= len;
+				     offset += tuple_cells * 4)
+					add_memory_bank(
+						read_cells(value + offset, address_cells),
+						read_cells(value + offset + address_cells * 4,
+							   size_cells));
 			}
 			cursor = align4(cursor + len);
 			continue;
@@ -601,13 +718,15 @@ int platform_mmio_config_valid(void)
 
 int platform_apply_runtime_mappings(void)
 {
-	uint64_t *pud = (uint64_t *)((unsigned long)&pg_dir +
-				     PLATFORM_PUD_PAGE_OFFSET);
-	uint64_t *shadow = (uint64_t *)((unsigned long)&pg_dir +
-					PLATFORM_SHADOW_PMD_OFFSET);
+	uint64_t *shadow_pgd = (uint64_t *)((unsigned long)&pg_dir +
+					   PLATFORM_RUNTIME_SHADOW_PGD_PAGE * PAGE_SIZE);
+	uint64_t *bootstrap_pgd = (uint64_t *)((unsigned long)&pg_dir);
+	unsigned int i;
 
 	platform_current.runtime_mapping_valid = 0;
+	platform_current.runtime_table_count = 0;
 	if (!platform_runtime_config_valid() ||
+	    !platform_current.memory_bank_count ||
 	    !stage1_range_mappable(platform_current.uart_base,
 				      platform_current.uart_size) ||
 	    !stage1_range_mappable(platform_current.gicd_base,
@@ -618,30 +737,43 @@ int platform_apply_runtime_mappings(void)
 				      platform_current.gits_size))
 		return -1;
 
-	memzero(shadow, PAGE_SIZE);
-	map_device_sections(shadow, platform_current.uart_base,
-			    platform_current.uart_size);
-	map_device_sections(shadow, platform_current.gicd_base,
-			    platform_current.gicd_size);
-	map_device_sections(shadow, platform_current.gicr_base,
-			    platform_current.gicr_size);
-	map_device_sections(shadow, platform_current.gits_base,
-			    platform_current.gits_size);
+	memzero(shadow_pgd, PAGE_SIZE);
+	runtime_pgd = shadow_pgd;
+	runtime_table_pages = 0;
+	for (i = 0; i < platform_current.memory_bank_count; i++)
+		if (map_runtime_range(platform_current.memory_banks[i].base,
+				      platform_current.memory_banks[i].size,
+				      MMU_FLAGS) < 0)
+			return -1;
+	if (map_runtime_range(platform_current.uart_base, platform_current.uart_size,
+			      MMU_DEVICE_FLAGS) < 0 ||
+	    map_runtime_range(platform_current.gicd_base, platform_current.gicd_size,
+			      MMU_DEVICE_FLAGS) < 0 ||
+	    map_runtime_range(platform_current.gicr_base, platform_current.gicr_size,
+			      MMU_DEVICE_FLAGS) < 0 ||
+	    map_runtime_range(platform_current.gits_base, platform_current.gits_size,
+			      MMU_DEVICE_FLAGS) < 0 ||
+	    map_runtime_range(VIRT_PCIE_MMIO_BASE, SECTION_SIZE,
+			      MMU_DEVICE_FLAGS) < 0 ||
+	    map_runtime_range(VIRT_PCIE_ECAM_BASE, VIRT_PCIE_ECAM_SIZE,
+			      MMU_DEVICE_FLAGS) < 0)
+		return -1;
 
-	/* QEMU PCI 仍由固定布局提供，直到 PCI host bridge 也由 DTB 解析。 */
-	map_device_sections(shadow, VIRT_PCIE_MMIO_BASE, SECTION_SIZE);
-	map_device_sections(shadow, VIRT_PCIE_ECAM_BASE, VIRT_PCIE_ECAM_SIZE);
-
-	/* 按 Arm break-before-make 顺序替换有效的 Stage-1 table descriptor。 */
-	pud[PLATFORM_PUD_MMIO_INDEX] = 0;
+	/* 新根表已完整构造，先清理旧翻译，再切换 TTBR0，避免在
+	 * 当前执行路径上清空仍在使用的 bootstrap PGD。 */
 	asm volatile("dsb ishst\n"
 		     "tlbi alle2\n"
 		     "dsb ish\n"
-		     "isb" ::: "memory");
-	pud[PLATFORM_PUD_MMIO_INDEX] =
-		TO_PADDR((unsigned long)shadow) | MM_TYPE_PAGE_TABLE;
+		     "isb\n"
+		     "msr ttbr0_el2, %0\n"
+		     "dsb ish\n"
+		     "isb" :: "r"(TO_PADDR((unsigned long)shadow_pgd)) : "memory");
+	/* 次核启动代码仍以 pg_dir 为 TTBR 基址；当前 CPU 切换完成后，
+	 * 将完整 shadow PGD 复制回 bootstrap 根页，保留全部 L0 window。 */
+	memcpy(bootstrap_pgd, shadow_pgd, PAGE_SIZE);
 	asm volatile("dsb ishst\n"
 		     "isb" ::: "memory");
+	platform_current.runtime_table_count = runtime_table_pages + 1;
 	platform_current.runtime_mapping_valid = 1;
 	return 0;
 }
@@ -681,12 +813,27 @@ void platform_early_probe(void)
 	platform_current.mmio_config_valid = 0;
 	platform_current.cpu_count = 0;
 	platform_current.dtb_valid = fdt_parse(platform_current.dtb) == 0;
+	if (!platform_current.dtb_valid) {
+		platform_current.memory_bank_count = 0;
+		platform_current.memory_bank_overflow = 0;
+		platform_current.memory_discovered = 0;
+	}
+	if (!platform_current.memory_bank_count) {
+		struct platform_reserved_range *bank =
+			&platform_current.memory_banks[platform_current.memory_bank_count++];
+
+		bank->base = VIRT_DRAM_BASE;
+		bank->size = PHYS_MEMORY_SIZE;
+		bank->type = PLATFORM_MEMORY_FIRMWARE;
+	}
+	normalize_memory_banks();
 	if (platform_current.dtb_valid && !platform_current.cpu_count)
 		platform_current.cpu_count = MAX_CPUS;
 	validate_reserved_memory();
 	if (platform_current.dtb_valid && platform_current.kind == PLATFORM_KIND_QEMU_VIRT) {
 		platform_current.memory_config_valid =
 			platform_current.memory_discovered &&
+			!platform_current.memory_bank_overflow &&
 			platform_current.memory_base == VIRT_DRAM_BASE &&
 			platform_current.memory_size == PHYS_MEMORY_SIZE &&
 			platform_current.reserved_config_valid;
@@ -767,7 +914,9 @@ void platform_early_probe(void)
 	       platform_current.page_pool_conflict ? "yes" : "no",
 	       (void *)platform_current.usable_memory_base,
 	       platform_current.usable_memory_size >> 20);
-	printf("[platform] memory-map occupied=%u free=%u overflow=%u image=%p+%luKB dtb=%p+%luKB\n",
+	printf("[platform] memory-map banks=%u bank-overflow=%u occupied=%u free=%u overflow=%u image=%p+%luKB dtb=%p+%luKB\n",
+	       platform_current.memory_bank_count,
+	       platform_current.memory_bank_overflow,
 	       platform_current.occupied_count,
 	       platform_current.free_count,
 	       platform_current.memory_map_overflow,
