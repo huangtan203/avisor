@@ -111,6 +111,7 @@ static void add_reserved_range(unsigned long base, unsigned long size)
 	range = &platform_current.reserved[platform_current.reserved_count++];
 	range->base = base;
 	range->size = size;
+	range->type = PLATFORM_MEMORY_FIRMWARE;
 }
 
 static int text_has(const char *data, unsigned int len, const char *needle)
@@ -160,7 +161,8 @@ static const char *fdt_string(const unsigned char *strings, unsigned int size,
 	return (const char *)(strings + offset);
 }
 
-static void add_occupied_range(unsigned long base, unsigned long size)
+static void add_occupied_range(unsigned long base, unsigned long size,
+			       enum platform_memory_range_type type)
 {
 	unsigned long memory_start = platform_current.memory_base;
 	unsigned long memory_end = memory_start + platform_current.memory_size;
@@ -181,6 +183,7 @@ static void add_occupied_range(unsigned long base, unsigned long size)
 	range = &platform_current.occupied[platform_current.occupied_count++];
 	range->base = base;
 	range->size = end - base;
+	range->type = type;
 }
 
 static void normalize_occupied_ranges(void)
@@ -204,7 +207,7 @@ static void normalize_occupied_ranges(void)
 						     platform_current.occupied[j - 1].size;
 
 			if (end > previous_end)
-				platform_current.occupied[j - 1].size =
+					platform_current.occupied[j - 1].size =
 					end - platform_current.occupied[j - 1].base;
 		} else {
 			platform_current.occupied[j++] = *entry;
@@ -245,14 +248,17 @@ static void build_memory_map(void)
 	if (platform_current.dtb_valid)
 		platform_current.dtb_size = be32((const void *)(platform_current.dtb + 4));
 
-	add_occupied_range(platform_current.image_base, platform_current.image_size);
+	add_occupied_range(platform_current.image_base, platform_current.image_size,
+			   PLATFORM_MEMORY_IMAGE);
 	add_occupied_range(LOW_MEMORY - MAX_CPUS * THREAD_SIZE,
-			   MAX_CPUS * THREAD_SIZE);
+			   MAX_CPUS * THREAD_SIZE, PLATFORM_MEMORY_STACK);
 	if (platform_current.dtb_valid)
-		add_occupied_range(platform_current.dtb, platform_current.dtb_size);
+		add_occupied_range(platform_current.dtb, platform_current.dtb_size,
+				   PLATFORM_MEMORY_DTB);
 	for (i = 0; i < platform_current.reserved_count; i++)
 		add_occupied_range(platform_current.reserved[i].base,
-				   platform_current.reserved[i].size);
+				   platform_current.reserved[i].size,
+				   PLATFORM_MEMORY_FIRMWARE);
 	normalize_occupied_ranges();
 
 	for (i = 0; i < platform_current.occupied_count; i++) {
@@ -282,8 +288,16 @@ static void validate_reserved_memory(void)
 	}
 	platform_current.usable_memory_base = platform_current.candidate_pool_base;
 	platform_current.usable_memory_size = platform_current.candidate_pool_size;
+	platform_current.candidate_pool_covers_fixed =
+		platform_current.candidate_pool_base <= LOW_MEMORY &&
+		platform_current.candidate_pool_base + platform_current.candidate_pool_size >=
+			HIGH_MEMORY;
 	if (platform_current.page_pool_conflict)
 		platform_current.reserved_config_valid = 0;
+	platform_current.candidate_pool_safe =
+		platform_current.reserved_config_valid &&
+		platform_current.candidate_pool_covers_fixed &&
+		!platform_current.page_pool_conflict;
 }
 
 static int fdt_parse(unsigned long dtb)
@@ -678,6 +692,11 @@ void platform_early_probe(void)
 	       platform_current.image_size >> 10,
 	       (void *)platform_current.dtb,
 	       platform_current.dtb_size >> 10);
+	printf("[platform] candidate=%p+%luMB covers-fixed=%s safe=%s\n",
+	       (void *)platform_current.candidate_pool_base,
+	       platform_current.candidate_pool_size >> 20,
+	       platform_current.candidate_pool_covers_fixed ? "yes" : "no",
+	       platform_current.candidate_pool_safe ? "yes" : "no");
 	printf("[platform] memory-config=%s mmio-config=%s runtime=%s\n",
 	       platform_current.memory_config_valid ? "valid" : "fallback",
 	       platform_current.mmio_config_valid ? "valid" : "fallback",

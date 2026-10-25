@@ -12,9 +12,17 @@ enum platform_kind {
 #define PLATFORM_MAX_RESERVED_RANGES 16
 #define PLATFORM_MAX_MEMORY_RANGES 24
 
+enum platform_memory_range_type {
+	PLATFORM_MEMORY_IMAGE = 0,
+	PLATFORM_MEMORY_STACK,
+	PLATFORM_MEMORY_DTB,
+	PLATFORM_MEMORY_FIRMWARE,
+};
+
 struct platform_reserved_range {
 	unsigned long base;
 	unsigned long size;
+	enum platform_memory_range_type type;
 };
 
 struct platform_info {
@@ -47,6 +55,8 @@ struct platform_info {
 	unsigned long dtb_size;
 	unsigned long candidate_pool_base;
 	unsigned long candidate_pool_size;
+	int candidate_pool_covers_fixed;
+	int candidate_pool_safe;
 	unsigned long usable_memory_base;
 	unsigned long usable_memory_size;
 	int reserved_config_valid;
