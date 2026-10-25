@@ -34,6 +34,8 @@ unsigned long platform_dtb_address;
 unsigned long platform_dtb_address_alt;
 unsigned long platform_cpu_mpidr[MAX_CPUS];
 
+extern char image_end[];
+
 static unsigned int be32(const void *ptr)
 {
 	const unsigned char *p = ptr;
@@ -52,6 +54,16 @@ static unsigned long be64(const void *ptr)
 static unsigned long align4(unsigned long value)
 {
 	return (value + 3) & ~3UL;
+}
+
+static unsigned long align_up(unsigned long value, unsigned long alignment)
+{
+	return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static unsigned long align_down(unsigned long value, unsigned long alignment)
+{
+	return value & ~(alignment - 1);
 }
 
 static unsigned long read_cells(const unsigned char *value, unsigned int cells)
@@ -148,42 +160,128 @@ static const char *fdt_string(const unsigned char *strings, unsigned int size,
 	return (const char *)(strings + offset);
 }
 
-static void validate_reserved_memory(void)
+static void add_occupied_range(unsigned long base, unsigned long size)
 {
-	unsigned long usable_start = LOW_MEMORY;
-	unsigned long usable_end = HIGH_MEMORY;
+	unsigned long memory_start = platform_current.memory_base;
+	unsigned long memory_end = memory_start + platform_current.memory_size;
+	unsigned long end;
+	struct platform_reserved_range *range;
+
+	if (!range_valid(base, size) || base >= memory_end || base + size <= memory_start)
+		return;
+	end = base + size;
+	if (base < memory_start)
+		base = memory_start;
+	if (end > memory_end)
+		end = memory_end;
+	if (platform_current.occupied_count >= PLATFORM_MAX_MEMORY_RANGES) {
+		platform_current.memory_map_overflow++;
+		return;
+	}
+	range = &platform_current.occupied[platform_current.occupied_count++];
+	range->base = base;
+	range->size = end - base;
+}
+
+static void normalize_occupied_ranges(void)
+{
+	unsigned int i, j;
+
+	for (i = 1; i < platform_current.occupied_count; i++) {
+		struct platform_reserved_range item = platform_current.occupied[i];
+
+		for (j = i; j && platform_current.occupied[j - 1].base > item.base; j--)
+			platform_current.occupied[j] = platform_current.occupied[j - 1];
+		platform_current.occupied[j] = item;
+	}
+	for (i = 0, j = 0; i < platform_current.occupied_count; i++) {
+		struct platform_reserved_range *entry = &platform_current.occupied[i];
+
+		if (j && entry->base <= platform_current.occupied[j - 1].base +
+					   platform_current.occupied[j - 1].size) {
+			unsigned long end = entry->base + entry->size;
+			unsigned long previous_end = platform_current.occupied[j - 1].base +
+						     platform_current.occupied[j - 1].size;
+
+			if (end > previous_end)
+				platform_current.occupied[j - 1].size =
+					end - platform_current.occupied[j - 1].base;
+		} else {
+			platform_current.occupied[j++] = *entry;
+		}
+	}
+	platform_current.occupied_count = j;
+}
+
+static void add_free_range(unsigned long base, unsigned long end)
+{
+	struct platform_reserved_range *range;
+
+	base = align_up(base, PAGE_SIZE);
+	end = align_down(end, PAGE_SIZE);
+	if (end <= base)
+		return;
+	if (platform_current.free_count >= PLATFORM_MAX_MEMORY_RANGES) {
+		platform_current.memory_map_overflow++;
+		return;
+	}
+	range = &platform_current.free[platform_current.free_count++];
+	range->base = base;
+	range->size = end - base;
+	if (range->size > platform_current.candidate_pool_size) {
+		platform_current.candidate_pool_base = base;
+		platform_current.candidate_pool_size = range->size;
+	}
+}
+
+static void build_memory_map(void)
+{
+	unsigned long cursor = platform_current.memory_base;
+	unsigned long memory_end = cursor + platform_current.memory_size;
 	unsigned int i;
 
+	platform_current.image_base = VIRT_DRAM_BASE + 0x80000UL;
+	platform_current.image_size = (unsigned long)image_end - platform_current.image_base;
+	if (platform_current.dtb_valid)
+		platform_current.dtb_size = be32((const void *)(platform_current.dtb + 4));
+
+	add_occupied_range(platform_current.image_base, platform_current.image_size);
+	add_occupied_range(LOW_MEMORY - MAX_CPUS * THREAD_SIZE,
+			   MAX_CPUS * THREAD_SIZE);
+	if (platform_current.dtb_valid)
+		add_occupied_range(platform_current.dtb, platform_current.dtb_size);
+	for (i = 0; i < platform_current.reserved_count; i++)
+		add_occupied_range(platform_current.reserved[i].base,
+				   platform_current.reserved[i].size);
+	normalize_occupied_ranges();
+
+	for (i = 0; i < platform_current.occupied_count; i++) {
+		struct platform_reserved_range *range = &platform_current.occupied[i];
+
+		add_free_range(cursor, range->base);
+		cursor = range->base + range->size;
+	}
+	add_free_range(cursor, memory_end);
+}
+
+static void validate_reserved_memory(void)
+{
+	unsigned int i;
+
+	build_memory_map();
 	platform_current.reserved_config_valid =
-		platform_current.dtb_valid && !platform_current.reserved_overflow;
+		platform_current.dtb_valid && !platform_current.reserved_overflow &&
+		!platform_current.memory_map_overflow;
 	platform_current.page_pool_conflict = 0;
 	for (i = 0; i < platform_current.reserved_count; i++) {
 		struct platform_reserved_range *range = &platform_current.reserved[i];
-		unsigned long range_end = range->base + range->size;
 
-		if (!range_within(range->base, range->size,
-				  platform_current.memory_base,
-				  platform_current.memory_size))
-			continue;
 		if (ranges_overlap(range->base, range->size,
-				   LOW_MEMORY, PAGING_MEMORY)) {
+				   LOW_MEMORY, PAGING_MEMORY))
 			platform_current.page_pool_conflict = 1;
-			if (range->base <= usable_start)
-				usable_end = usable_start;
-			else if (range->base < usable_end)
-				usable_end = range->base;
-		}
-		if (range->base <= usable_start && range_end > usable_start)
-			usable_start = range_end;
 	}
-	if (usable_end < usable_start) {
-		platform_current.reserved_config_valid = 0;
-		platform_current.usable_memory_base = 0;
-		platform_current.usable_memory_size = 0;
-		return;
-	}
-	platform_current.usable_memory_base = usable_start;
-	platform_current.usable_memory_size = usable_end - usable_start;
+	platform_current.usable_memory_base = platform_current.candidate_pool_base;
+	platform_current.usable_memory_size = platform_current.candidate_pool_size;
 	if (platform_current.page_pool_conflict)
 		platform_current.reserved_config_valid = 0;
 }
@@ -572,6 +670,14 @@ void platform_early_probe(void)
 	       platform_current.page_pool_conflict ? "yes" : "no",
 	       (void *)platform_current.usable_memory_base,
 	       platform_current.usable_memory_size >> 20);
+	printf("[platform] memory-map occupied=%u free=%u overflow=%u image=%p+%luKB dtb=%p+%luKB\n",
+	       platform_current.occupied_count,
+	       platform_current.free_count,
+	       platform_current.memory_map_overflow,
+	       (void *)platform_current.image_base,
+	       platform_current.image_size >> 10,
+	       (void *)platform_current.dtb,
+	       platform_current.dtb_size >> 10);
 	printf("[platform] memory-config=%s mmio-config=%s runtime=%s\n",
 	       platform_current.memory_config_valid ? "valid" : "fallback",
 	       platform_current.mmio_config_valid ? "valid" : "fallback",

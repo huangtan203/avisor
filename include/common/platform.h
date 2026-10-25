@@ -10,6 +10,7 @@ enum platform_kind {
 };
 
 #define PLATFORM_MAX_RESERVED_RANGES 16
+#define PLATFORM_MAX_MEMORY_RANGES 24
 
 struct platform_reserved_range {
 	unsigned long base;
@@ -36,6 +37,16 @@ struct platform_info {
 	struct platform_reserved_range reserved[PLATFORM_MAX_RESERVED_RANGES];
 	unsigned int reserved_count;
 	unsigned int reserved_overflow;
+	struct platform_reserved_range occupied[PLATFORM_MAX_MEMORY_RANGES];
+	unsigned int occupied_count;
+	struct platform_reserved_range free[PLATFORM_MAX_MEMORY_RANGES];
+	unsigned int free_count;
+	unsigned int memory_map_overflow;
+	unsigned long image_base;
+	unsigned long image_size;
+	unsigned long dtb_size;
+	unsigned long candidate_pool_base;
+	unsigned long candidate_pool_size;
 	unsigned long usable_memory_base;
 	unsigned long usable_memory_size;
 	int reserved_config_valid;

@@ -54,4 +54,5 @@ SECTIONS
   . = ALIGN(0x00001000);
   pg_dir = .;
   .data.pgd : { . += (5 * (1 << 12)); }
+  image_end = .;
 }
