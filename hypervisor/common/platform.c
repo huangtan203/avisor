@@ -298,6 +298,10 @@ static void validate_reserved_memory(void)
 		platform_current.reserved_config_valid &&
 		platform_current.candidate_pool_covers_fixed &&
 		!platform_current.page_pool_conflict;
+	platform_current.page_pool_plan_safe =
+		platform_current.dtb_valid &&
+		!platform_current.reserved_overflow &&
+		platform_current.memory_map_overflow == 0;
 }
 
 static int fdt_parse(unsigned long dtb)

@@ -143,6 +143,7 @@ void hypervisor_main()
     uart_init();
     /* 2. 探测平台并覆盖有效 DTB 提供的运行时基址。 */
     platform_early_probe();
+    virt_page_pool_init();
     uart_init();
 
     printf("\n");

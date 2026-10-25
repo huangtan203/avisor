@@ -23,6 +23,7 @@
 #include "boards/virt/vgic.h"
 #include "boards/virt/virtio_mmio.h"
 #include "boards/virt/ivshmem.h"
+#include "common/platform.h"
 #include "boards/virt/pci.h"
 #include "boards/virt/vits.h"
 #include "boards/virt/base.h"
@@ -92,7 +93,64 @@ static struct page_pool virt_page_pool = {
 	.page_nr = PAGING_PAGES,
 	.memap = virt_page_memap,
 	.last_page_id = 0,
+	.range_count = 0,
+	.next_range_id = 0,
 };
+
+void virt_page_pool_init(void)
+{
+	struct page_pool_range planned[PAGE_POOL_MAX_RANGES];
+	unsigned int planned_count = 0;
+	uint64_t bitmap_offset = 0;
+	unsigned int i;
+
+	virt_page_pool.range_count = 0;
+	virt_page_pool.next_range_id = 0;
+	if (!platform_current.page_pool_plan_safe)
+		goto legacy;
+
+	for (i = 0; i < platform_current.free_count; i++) {
+		struct platform_reserved_range *free = &platform_current.free[i];
+		paddr_t start = free->base > LOW_MEMORY ? free->base : LOW_MEMORY;
+		paddr_t free_end = free->base + free->size;
+		paddr_t end = free_end < HIGH_MEMORY ? free_end : HIGH_MEMORY;
+		uint64_t pages;
+
+		if (end <= start)
+			continue;
+		pages = (end - start) / PAGE_SIZE;
+		if (!pages)
+			continue;
+		if (planned_count >= PAGE_POOL_MAX_RANGES ||
+		    pages > PAGING_PAGES - bitmap_offset)
+			goto legacy;
+		planned[planned_count++] = (struct page_pool_range){
+			.start_addr = start,
+			.page_nr = pages,
+			.memap = virt_page_memap + bitmap_offset,
+			.last_page_id = 0,
+		};
+		bitmap_offset += pages;
+	}
+	if (!planned_count)
+		goto legacy;
+
+	memzero(virt_page_memap, bitmap_offset);
+	for (i = 0; i < planned_count; i++)
+		virt_page_pool.ranges[i] = planned[i];
+	virt_page_pool.start_addr = planned[0].start_addr;
+	virt_page_pool.page_nr = bitmap_offset;
+	virt_page_pool.memap = virt_page_memap;
+	virt_page_pool.last_page_id = 0;
+	virt_page_pool.range_count = planned_count;
+	printf("[platform] page-pool=planned ranges=%u pages=%lu\n",
+	       planned_count, bitmap_offset);
+	return;
+
+legacy:
+	printf("[platform] page-pool=legacy ranges=0 pages=%lu\n",
+	       virt_page_pool.page_nr);
+}
 
 struct page_pool *get_virt_page_pool(void)
 {

@@ -131,6 +131,21 @@ static struct ksm_page *ksm_hash_lookup(uint32_t hash, const void *page_vaddr)
 	return 0;
 }
 
+static struct ksm_page *ksm_hash_lookup_pa(paddr_t pa)
+{
+	unsigned int i;
+
+	/* 共享页可能已被错误写入，不能用当前内容重算哈希桶。 */
+	for (i = 0; i < KSM_HASH_SIZE; i++) {
+		struct ksm_page *kp;
+
+		for (kp = ksm_hashtab[i]; kp; kp = kp->next)
+			if (kp->pa == pa && kp->status == KSM_PAGE_SHARED)
+				return kp;
+	}
+	return 0;
+}
+
 /*
  * 将一个普通页转换为共享页（首次加入哈希表）
  *   pa: 物理页地址
@@ -484,7 +499,6 @@ int ksm_drop_vm(struct task_struct *task)
 				uint64_t e3 = l3[i3];
 				paddr_t shared_pa;
 				struct ksm_page *kp;
-				uint32_t hash;
 
 				if ((e3 & 0x3) != 0x3)
 					continue;
@@ -492,9 +506,7 @@ int ksm_drop_vm(struct task_struct *task)
 					continue;
 
 				shared_pa = e3 & MM_STAGE2_PA_MASK;
-				hash = ksm_page_hash((void *)TO_VADDR(shared_pa));
-				kp = ksm_hash_lookup(hash,
-						     (void *)TO_VADDR(shared_pa));
+				kp = ksm_hash_lookup_pa(shared_pa);
 				if (!kp) {
 					failed = 1;
 					continue;

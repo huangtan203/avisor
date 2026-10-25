@@ -32,7 +32,7 @@
 #include "boards/raspi/raspi3b.h"
 static inline struct page_pool *get_page_pool(void)
 {
-    return get_page_pool();
+    return get_rasp3b_page_pool();
 }
 #else
 #include "boards/virt/virt_board.h"
@@ -124,6 +124,30 @@ paddr_t get_free_page(struct page_pool *pool)
 {
 	uint64_t i, index;
 	paddr_t page;
+	unsigned int r;
+
+	if (pool->range_count) {
+		for (r = 0; r < pool->range_count; r++) {
+			unsigned int range_id =
+				(pool->next_range_id + r) % pool->range_count;
+			struct page_pool_range *range = &pool->ranges[range_id];
+
+			for (i = 0; i < range->page_nr; i++) {
+				index = (range->last_page_id + i) % range->page_nr;
+				if (range->memap[index] == 0) {
+					range->memap[index] = 1;
+					page = range->start_addr + index * PAGE_SIZE;
+					memzero((void *)TO_VADDR(page), PAGE_SIZE);
+					range->last_page_id = (index + 1) % range->page_nr;
+					pool->next_range_id =
+						(range_id + 1) % pool->range_count;
+					return page;
+				}
+			}
+		}
+		PANIC("no free pages in physical ranges!\n");
+		return 0;
+	}
 
 	for (i = pool->last_page_id; i < (pool->last_page_id + pool->page_nr);
 	     i++) {
@@ -143,12 +167,40 @@ paddr_t get_free_page(struct page_pool *pool)
 
 void free_page(struct page_pool *pool, paddr_t p)
 {
-	unsigned long idx = (p - pool->start_addr) / PAGE_SIZE;
-	if (p < pool->start_addr || idx >= pool->page_nr) {
-		PANIC("free_page: invalid pa 0x%lx (start=0x%lx nr=%lu idx=%lu)",
-		      p, pool->start_addr, pool->page_nr, idx);
+	unsigned int r;
+
+	if (pool->range_count) {
+		for (r = 0; r < pool->range_count; r++) {
+			struct page_pool_range *range = &pool->ranges[r];
+			paddr_t end = range->start_addr + range->page_nr * PAGE_SIZE;
+
+			if (p >= range->start_addr && p < end &&
+			    ((p - range->start_addr) & (PAGE_SIZE - 1)) == 0) {
+				range->memap[(p - range->start_addr) / PAGE_SIZE] = 0;
+				return;
+			}
+		}
+		PANIC("free_page: invalid ranged pa 0x%lx", p);
+		return;
 	}
-	pool->memap[idx] = 0;
+
+	{
+		unsigned long idx;
+
+		if (p < pool->start_addr ||
+		    ((p - pool->start_addr) & (PAGE_SIZE - 1)) != 0) {
+			PANIC("free_page: invalid pa 0x%lx (start=0x%lx nr=%lu)",
+			      p, pool->start_addr, pool->page_nr);
+			return;
+		}
+		idx = (p - pool->start_addr) / PAGE_SIZE;
+		if (idx >= pool->page_nr) {
+			PANIC("free_page: invalid pa 0x%lx (start=0x%lx nr=%lu idx=%lu)",
+			      p, pool->start_addr, pool->page_nr, idx);
+			return;
+		}
+		pool->memap[idx] = 0;
+	}
 }
 
 void map_stage2_table_entry(vaddr_t pte, vaddr_t va, paddr_t pa, uint64_t flags)
@@ -694,32 +746,58 @@ paddr_t allocate_block_pages(int npages)
 
 	page_pool_lock_acquire();
 
-	for (unsigned long i = 0; i < pool->page_nr; i++) {
-		unsigned long start =
-			(pool->last_page_id + i) % pool->page_nr;
+	if (pool->range_count) {
+		for (unsigned int r = 0; r < pool->range_count && !result; r++) {
+			struct page_pool_range *range = &pool->ranges[r];
 
-		/* 自然对齐：起始索引必须是 npages 的倍数 */
-		if (start % (unsigned long)npages != 0)
-			continue;
+			for (unsigned long i = 0; i < range->page_nr; i++) {
+				unsigned long start =
+					(range->last_page_id + i) % range->page_nr;
+				paddr_t pa = range->start_addr + start * PAGE_SIZE;
+				int ok = 1;
 
-		/* 检查 npages 个连续页是否都空闲 */
-		int ok = 1;
-		for (int j = 0; j < npages; j++) {
-			unsigned long idx = start + j;
-			if (idx >= pool->page_nr ||
-			    pool->memap[idx] != 0) {
-				ok = 0;
-				break;
+				if ((pa & (npages * PAGE_SIZE - 1)) != 0 ||
+				    start + npages > range->page_nr)
+					continue;
+				for (int j = 0; j < npages; j++) {
+					if (range->memap[start + j] != 0) {
+						ok = 0;
+						break;
+					}
+				}
+				if (ok) {
+					for (int j = 0; j < npages; j++)
+						range->memap[start + j] = 1;
+					result = pa;
+					range->last_page_id =
+						(start + npages) % range->page_nr;
+					break;
+				}
 			}
 		}
+	} else {
+		for (unsigned long i = 0; i < pool->page_nr; i++) {
+			unsigned long start =
+				(pool->last_page_id + i) % pool->page_nr;
 
-		if (ok) {
-			for (int j = 0; j < npages; j++)
-				pool->memap[start + j] = 1;
-			result = pool->start_addr + start * PAGE_SIZE;
-			pool->last_page_id =
-				(start + npages) % pool->page_nr;
-			break;
+			if (start % (unsigned long)npages != 0)
+				continue;
+			int ok = 1;
+			for (int j = 0; j < npages; j++) {
+				unsigned long idx = start + j;
+				if (idx >= pool->page_nr || pool->memap[idx] != 0) {
+					ok = 0;
+					break;
+				}
+			}
+			if (ok) {
+				for (int j = 0; j < npages; j++)
+					pool->memap[start + j] = 1;
+				result = pool->start_addr + start * PAGE_SIZE;
+				pool->last_page_id =
+					(start + npages) % pool->page_nr;
+				break;
+			}
 		}
 	}
 
@@ -733,18 +811,55 @@ paddr_t allocate_block_pages(int npages)
 void free_block_pages(paddr_t block_pa, int npages)
 {
 	struct page_pool *pool = get_page_pool();
-	unsigned long start_idx =
-		(block_pa - pool->start_addr) / PAGE_SIZE;
+	unsigned long start_idx;
+	struct page_pool_range *matched = 0;
 
-	if (block_pa < pool->start_addr ||
-	    start_idx + npages > pool->page_nr) {
+	if (npages <= 0 || (block_pa & (PAGE_SIZE - 1)) != 0) {
 		PANIC("free_block_pages: invalid pa 0x%lx (npages=%d)",
 		      block_pa, npages);
+		return;
 	}
 
 	page_pool_lock_acquire();
-	for (int j = 0; j < npages; j++)
-		pool->memap[start_idx + j] = 0;
+	if (pool->range_count) {
+		for (unsigned int r = 0; r < pool->range_count; r++) {
+			struct page_pool_range *range = &pool->ranges[r];
+			paddr_t end = range->start_addr + range->page_nr * PAGE_SIZE;
+
+			if (block_pa >= range->start_addr && block_pa < end) {
+				matched = range;
+				start_idx = (block_pa - range->start_addr) / PAGE_SIZE;
+				if (start_idx + npages > range->page_nr)
+					matched = 0;
+				break;
+			}
+		}
+		if (!matched) {
+			page_pool_lock_release();
+			PANIC("free_block_pages: invalid ranged pa 0x%lx (npages=%d)",
+			      block_pa, npages);
+			return;
+		}
+		for (int j = 0; j < npages; j++)
+			matched->memap[start_idx + j] = 0;
+	} else {
+		if (block_pa < pool->start_addr) {
+			page_pool_lock_release();
+			PANIC("free_block_pages: invalid pa 0x%lx (npages=%d)",
+			      block_pa, npages);
+			return;
+		}
+		start_idx = (block_pa - pool->start_addr) / PAGE_SIZE;
+		if (start_idx >= pool->page_nr ||
+		    (unsigned long)npages > pool->page_nr - start_idx) {
+			page_pool_lock_release();
+			PANIC("free_block_pages: invalid pa 0x%lx (npages=%d)",
+			      block_pa, npages);
+			return;
+		}
+		for (int j = 0; j < npages; j++)
+			pool->memap[start_idx + j] = 0;
+	}
 	page_pool_lock_release();
 }
 

@@ -12,12 +12,4 @@
 #include "common/mm.h"
 #include "common/types.h"
 
-struct page_pool {
-	paddr_t start_addr;
-	// spinlock_t lock;	// TODO: need a lock
-	uint64_t page_nr;
-	uint8_t *memap;
-	uint64_t last_page_id;
-};
-
 struct page_pool *get_rasp3b_page_pool(void);

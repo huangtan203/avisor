@@ -14,13 +14,7 @@
 #include "common/types.h"
 #include "common/board.h"
 
-struct page_pool {
-    paddr_t start_addr;
-    uint64_t page_nr;
-    uint8_t *memap;
-    uint64_t last_page_id;
-};
-
+void virt_page_pool_init(void);
 struct page_pool *get_virt_page_pool(void);
 
 /* virt 平台的 VM 设备模型（Phase 2） */

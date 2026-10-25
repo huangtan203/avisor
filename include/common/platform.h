@@ -57,6 +57,7 @@ struct platform_info {
 	unsigned long candidate_pool_size;
 	int candidate_pool_covers_fixed;
 	int candidate_pool_safe;
+	int page_pool_plan_safe;
 	unsigned long usable_memory_base;
 	unsigned long usable_memory_size;
 	int reserved_config_valid;

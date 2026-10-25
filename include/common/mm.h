@@ -78,6 +78,25 @@ typedef uint64_t vaddr_t;
 #define TO_PADDR(pa) ((paddr_t)pa - VA_START)
 #endif
 
+#define PAGE_POOL_MAX_RANGES 8
+
+struct page_pool_range {
+	paddr_t start_addr;
+	uint64_t page_nr;
+	uint8_t *memap;
+	uint64_t last_page_id;
+};
+
+struct page_pool {
+	paddr_t start_addr;
+	uint64_t page_nr;
+	uint8_t *memap;
+	uint64_t last_page_id;
+	struct page_pool_range ranges[PAGE_POOL_MAX_RANGES];
+	unsigned int range_count;
+	unsigned int next_range_id;
+};
+
 void map_stage2_page(struct task_struct *task, vaddr_t va, paddr_t page,
 		     uint64_t flags);
 int unmap_stage2_page(struct task_struct *task, vaddr_t va, int do_free);
