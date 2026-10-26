@@ -311,3 +311,7 @@ make -f Makefile.tegra tegra-verify-deploy
 ```
 
 该目标要求先存在 `manifest.sha256`，再检查四个清单条目、对应文件和全部 SHA-256 值。任何文件缺失、清单条目变化或内容被替换都会失败。它只读取 `bin_tegra/deploy`，不会访问真实设备，也不会修改部署目录。
+
+## 19. Phase 74：自定义部署路径一致性
+
+`TEGRA_IMAGE_PATH` 和 `TEGRA_DTB_PATH` 可以覆盖目标系统中的默认路径。Phase 74 让部署文件的相对路径、SHA-256 清单和 `tegra-verify-deploy` 使用同一组配置，不再硬编码默认路径；同时拒绝 Image、DTB、U-Boot 脚本或 extlinux 片段使用重复的部署路径。
