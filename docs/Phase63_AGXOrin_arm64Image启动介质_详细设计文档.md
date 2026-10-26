@@ -340,3 +340,13 @@ arm64 Image header 的 `image_size` 只描述文件 payload，不包含加载后
 ## 23. Phase 78：DTB 完整加载区间校验
 
 布局检查读取实际 DTB 文件长度，计算半开区间 `[TEGRA_DTB_LOAD_ADDR, dtb_end)`。除起始地址不得覆盖 `image_end` 外，还要求该区间非空且结束地址不超过 `2^48`，与当前 EL2 Stage-1 的 48-bit 地址契约保持一致。预检输出完整 DTB 区间，避免只审计起始地址而遗漏尾部溢出。
+
+## 24. Phase 79：启动产物白名单审计
+
+新增 `tegra-boot-artifacts-check`，对生成的 U-Boot 脚本和 extlinux 片段执行精确行匹配：
+
+- U-Boot 脚本只能包含两条 `fatload` 和一条 `booti`；
+- extlinux 片段只能包含 `LABEL`、`MENU LABEL`、`LINUX` 和 `FDT` 四行；
+- 任何额外命令或配置行都会使 `tegra-preflight` 失败。
+
+该审计用于防止部署产物被意外注入额外启动动作。

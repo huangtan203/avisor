@@ -25,7 +25,7 @@ TEGRA_MANIFEST := $(TEGRA_DEPLOY_DIR)/boot/avisor/manifest.sha256
 
 include Makefile.virt
 
-.PHONY: tegra-image verify-layout tegra-dtb-check tegra-path-check tegra-uboot-args-check extlinux-package uboot-package tegra-preflight tegra-verify-deploy
+.PHONY: tegra-image verify-layout tegra-dtb-check tegra-path-check tegra-uboot-args-check tegra-boot-artifacts-check extlinux-package uboot-package tegra-preflight tegra-verify-deploy
 tegra-image: kernel8.img
 	cp $(OUTDIR)/kernel8.img $(OUTDIR)/Image
 
@@ -39,6 +39,9 @@ tegra-path-check:
 tegra-uboot-args-check:
 	@python3 -c 'import re; interface="$(TEGRA_UBOOT_INTERFACE)"; device="$(TEGRA_UBOOT_DEVICE)"; partition="$(TEGRA_UBOOT_PARTITION)"; assert interface in {"mmc","usb","nvme"}, "unsupported TEGRA_UBOOT_INTERFACE"; assert re.fullmatch(r"[0-9]+",device), "TEGRA_UBOOT_DEVICE must be a decimal number"; assert re.fullmatch(r"[0-9]+",partition), "TEGRA_UBOOT_PARTITION must be a decimal number"; assert int(device)>=0 and int(partition)>0, "invalid U-Boot device or partition"; print("Tegra U-Boot arguments verified:",interface,device+":"+partition)'
 	@python3 -c 'import re; values=["$(TEGRA_IMAGE_LOAD_ADDR)","$(TEGRA_DTB_LOAD_ADDR)"]; parsed=[int(value,0) for value in values]; assert all(value>0 and value%0x1000==0 for value in parsed), "U-Boot load addresses must be positive and 4K aligned"; assert parsed[0]==0x80000000, "Image load address must match the linked entry contract"; assert parsed[1]>=parsed[0], "DTB load address must not precede Image"; print("Tegra U-Boot load addresses verified:",*[hex(value) for value in parsed])'
+
+tegra-boot-artifacts-check:
+	@python3 -c 'import pathlib; u=pathlib.Path("$(TEGRA_UBOOT_SCRIPT)").read_text().splitlines(); expected=["fatload $(TEGRA_UBOOT_INTERFACE) $(TEGRA_UBOOT_DEVICE):$(TEGRA_UBOOT_PARTITION) $(TEGRA_IMAGE_LOAD_ADDR) $(TEGRA_IMAGE_PATH)","fatload $(TEGRA_UBOOT_INTERFACE) $(TEGRA_UBOOT_DEVICE):$(TEGRA_UBOOT_PARTITION) $(TEGRA_DTB_LOAD_ADDR) $(TEGRA_DTB_PATH)","booti $(TEGRA_IMAGE_LOAD_ADDR) - $(TEGRA_DTB_LOAD_ADDR)"]; assert u==expected, (u,expected); e=pathlib.Path("$(TEGRA_EXTLINUX_FRAGMENT)").read_text().splitlines(); expected_ext=["LABEL avisor","      MENU LABEL aVisor Tegra234 EL2 bring-up","      LINUX $(TEGRA_IMAGE_PATH)","      FDT $(TEGRA_DTB_PATH)"]; assert e==expected_ext, (e,expected_ext); print("Tegra boot artifacts whitelist verified")'
 
 tegra-dtb-check:
 	@test -n "$(strip $(TEGRA_DTB_SOURCE))" || { echo "error: set TEGRA_DTB_SOURCE to the board DTB file"; exit 1; }
@@ -80,7 +83,7 @@ uboot-package: verify-layout tegra-path-check tegra-uboot-args-check tegra-dtb-c
 	@python3 -c 'import pathlib; p=pathlib.Path("$(TEGRA_UBOOT_SCRIPT)"); s=p.read_text(); assert "fatload $(TEGRA_UBOOT_INTERFACE) $(TEGRA_UBOOT_DEVICE):$(TEGRA_UBOOT_PARTITION) $(TEGRA_IMAGE_LOAD_ADDR) $(TEGRA_IMAGE_PATH)\n" in s; assert "booti $(TEGRA_IMAGE_LOAD_ADDR) - $(TEGRA_DTB_LOAD_ADDR)\n" in s; print("U-Boot script verified:", p)'
 	@echo "Review $(TEGRA_UBOOT_SCRIPT) before executing it; keep a recovery boot entry."
 
-tegra-preflight: verify-layout tegra-path-check tegra-uboot-args-check tegra-dtb-check uboot-package extlinux-package
+tegra-preflight: verify-layout tegra-path-check tegra-uboot-args-check tegra-dtb-check uboot-package extlinux-package tegra-boot-artifacts-check
 	@python3 -c 'import pathlib; p=pathlib.Path("$(TEGRA_UBOOT_SCRIPT)"); s=p.read_text(); assert s.endswith("booti $(TEGRA_IMAGE_LOAD_ADDR) - $(TEGRA_DTB_LOAD_ADDR)\n"); print("Tegra preflight passed:"); print("  Image: $(OUTDIR)/Image"); print("  DTB: $(TEGRA_DTB_SOURCE) -> $(TEGRA_DTB_PATH)"); print("  entry: 0x80080000 (load $(TEGRA_IMAGE_LOAD_ADDR))"); print("  U-Boot: $(TEGRA_UBOOT_INTERFACE) $(TEGRA_UBOOT_DEVICE):$(TEGRA_UBOOT_PARTITION)")'
 	@python3 -c 'import hashlib,pathlib; root=pathlib.Path("$(TEGRA_DEPLOY_DIR)"); files=[pathlib.Path("$(TEGRA_IMAGE_DEPLOY_REL)"),pathlib.Path("$(TEGRA_DTB_DEPLOY_REL)"),pathlib.Path("boot/avisor/avisor-boot.cmd"),pathlib.Path("boot/extlinux/avisor.conf.fragment")]; assert len(set(files))==4, "deployment paths must be distinct"; out=pathlib.Path("$(TEGRA_MANIFEST)"); lines=[]; [lines.append("%s  %s" % (hashlib.sha256((root/f).read_bytes()).hexdigest(),f.as_posix())) for f in files]; out.write_text("\n".join(lines)+"\n"); print("Deployment manifest generated:",out)'
 	@echo "Review deployment files under $(TEGRA_DEPLOY_DIR) before copying them to the target."
