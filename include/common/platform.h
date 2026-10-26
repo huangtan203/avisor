@@ -9,6 +9,12 @@ enum platform_kind {
 	PLATFORM_KIND_AGX_ORIN,
 };
 
+enum platform_uart_kind {
+	PLATFORM_UART_UNKNOWN = 0,
+	PLATFORM_UART_PL011,
+	PLATFORM_UART_TEGRA_HSUART,
+};
+
 #define PLATFORM_MAX_RESERVED_RANGES 16
 #define PLATFORM_MAX_MEMORY_RANGES 24
 #define PLATFORM_MAX_MEMORY_BANKS 8
@@ -38,6 +44,11 @@ struct platform_info {
 	unsigned int memory_bank_overflow;
 	unsigned long uart_base;
 	unsigned long uart_size;
+	enum platform_uart_kind uart_kind;
+	unsigned long uart_reg_shift;
+	unsigned long uart_clock_hz;
+	unsigned long uart_baudrate;
+	int uart_compatible;
 	unsigned long gicd_base;
 	unsigned long gicd_size;
 	unsigned long gicr_base;
@@ -97,6 +108,7 @@ unsigned long platform_gits_base(void);
 unsigned int platform_timer_hyp_ppi(void);
 unsigned int platform_timer_virt_ppi(void);
 int platform_runtime_config_valid(void);
+int platform_full_bringup_supported(void);
 int platform_memory_config_valid(void);
 int platform_mmio_config_valid(void);
 int platform_apply_runtime_mappings(void);

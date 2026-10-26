@@ -19,6 +19,11 @@
 #define FDT_REG "reg"
 #define FDT_INTERRUPTS "interrupts"
 #define FDT_REDIST_STRIDE "redistributor-stride"
+#define FDT_REG_SHIFT "reg-shift"
+#define FDT_CLOCK_FREQUENCY "clock-frequency"
+#define FDT_CURRENT_SPEED "current-speed"
+#define PLATFORM_UART_COMPAT_PL011 "arm,pl011"
+#define PLATFORM_UART_COMPAT_TEGRA "nvidia,tegra194-hsuart"
 
 #define GIC_PPI_TYPE 1U
 #define GIC_PPI_BASE 16U
@@ -516,7 +521,10 @@ static int fdt_parse(unsigned long dtb)
 			reserved_child = reserved_depth >= 0 && depth == reserved_depth + 1;
 			memory_node = text_has(name, len, "memory");
 			cpu_node = depth >= 1 && text_has(name, len, "cpu");
-			uart_node = text_has(name, len, "pl011");
+			uart_node = text_has(name, len, "pl011") ||
+				text_has(name, len, "serial") ||
+				text_has(name, len, "uart") ||
+				text_has(name, len, "hsuart");
 			gic_node = text_has(name, len, "intc");
 			its_node = text_has(name, len, "its");
 			timer_node = depth == 1 && text_has(name, len, "timer");
@@ -599,6 +607,16 @@ static int fdt_parse(unsigned long dtb)
 			if (depth >= 2 && cpu_node && !strcmp(prop, FDT_DEVICE_TYPE) &&
 			    text_has((const char *)value, len, "cpu"))
 				platform_current.cpu_count++;
+			if (depth >= 1 && uart_node && !strcmp(prop, FDT_COMPATIBLE)) {
+				if (compatible_has(value, len, PLATFORM_UART_COMPAT_PL011)) {
+					platform_current.uart_kind = PLATFORM_UART_PL011;
+					platform_current.uart_compatible = 1;
+				}
+				if (compatible_has(value, len, PLATFORM_UART_COMPAT_TEGRA)) {
+					platform_current.uart_kind = PLATFORM_UART_TEGRA_HSUART;
+					platform_current.uart_compatible = 1;
+				}
+			}
 			if (depth >= 1 && uart_node && !strcmp(prop, FDT_REG) &&
 			    len >= (address_cells + size_cells) * 4) {
 				platform_current.uart_base = read_cells(value, address_cells);
@@ -606,6 +624,12 @@ static int fdt_parse(unsigned long dtb)
 					read_cells(value + address_cells * 4, size_cells);
 				platform_current.uart_discovered = 1;
 			}
+			if (depth >= 1 && uart_node && !strcmp(prop, FDT_REG_SHIFT) && len >= 4)
+				platform_current.uart_reg_shift = read_cells(value, 1);
+			if (depth >= 1 && uart_node && !strcmp(prop, FDT_CLOCK_FREQUENCY) && len >= 4)
+				platform_current.uart_clock_hz = read_cells(value, 1);
+			if (depth >= 1 && uart_node && !strcmp(prop, FDT_CURRENT_SPEED) && len >= 4)
+				platform_current.uart_baudrate = read_cells(value, 1);
 			if (depth >= 1 && gic_node && !strcmp(prop, FDT_REG) &&
 			    len >= (address_cells + size_cells) * 4) {
 				unsigned int tuple_cells = address_cells + size_cells;
@@ -702,8 +726,19 @@ unsigned int platform_timer_virt_ppi(void)
 
 int platform_runtime_config_valid(void)
 {
-	return platform_current.dtb_valid && platform_current.kind == PLATFORM_KIND_QEMU_VIRT &&
-	       platform_current.memory_config_valid && platform_current.mmio_config_valid;
+	if (!platform_current.dtb_valid || !platform_current.memory_config_valid)
+		return 0;
+	if (platform_current.kind == PLATFORM_KIND_QEMU_VIRT)
+		return platform_current.mmio_config_valid;
+	return platform_current.kind == PLATFORM_KIND_AGX_ORIN &&
+	       platform_current.uart_discovered &&
+	       platform_current.uart_compatible &&
+	       platform_current.uart_kind == PLATFORM_UART_TEGRA_HSUART;
+}
+
+int platform_full_bringup_supported(void)
+{
+	return platform_current.kind == PLATFORM_KIND_QEMU_VIRT;
 }
 
 int platform_memory_config_valid(void)
@@ -728,11 +763,16 @@ int platform_apply_runtime_mappings(void)
 	if (!platform_runtime_config_valid() ||
 	    !platform_current.memory_bank_count ||
 	    !stage1_range_mappable(platform_current.uart_base,
-				      platform_current.uart_size) ||
-	    !stage1_range_mappable(platform_current.gicd_base,
-				      platform_current.gicd_size) ||
-	    !stage1_range_mappable(platform_current.gicr_base,
-				      platform_current.gicr_size) ||
+				      platform_current.uart_size))
+		return -1;
+	if (platform_current.gic_discovered &&
+	    (!stage1_range_mappable(platform_current.gicd_base,
+				       platform_current.gicd_size) ||
+	     (platform_current.gicr_discovered &&
+	      !stage1_range_mappable(platform_current.gicr_base,
+					platform_current.gicr_size))))
+		return -1;
+	if (platform_current.gits_discovered &&
 	    !stage1_range_mappable(platform_current.gits_base,
 				      platform_current.gits_size))
 		return -1;
@@ -746,17 +786,25 @@ int platform_apply_runtime_mappings(void)
 				      MMU_FLAGS) < 0)
 			return -1;
 	if (map_runtime_range(platform_current.uart_base, platform_current.uart_size,
-			      MMU_DEVICE_FLAGS) < 0 ||
-	    map_runtime_range(platform_current.gicd_base, platform_current.gicd_size,
-			      MMU_DEVICE_FLAGS) < 0 ||
-	    map_runtime_range(platform_current.gicr_base, platform_current.gicr_size,
-			      MMU_DEVICE_FLAGS) < 0 ||
-	    map_runtime_range(platform_current.gits_base, platform_current.gits_size,
-			      MMU_DEVICE_FLAGS) < 0 ||
-	    map_runtime_range(VIRT_PCIE_MMIO_BASE, SECTION_SIZE,
-			      MMU_DEVICE_FLAGS) < 0 ||
-	    map_runtime_range(VIRT_PCIE_ECAM_BASE, VIRT_PCIE_ECAM_SIZE,
 			      MMU_DEVICE_FLAGS) < 0)
+		return -1;
+	if (platform_current.gic_discovered &&
+	    map_runtime_range(platform_current.gicd_base, platform_current.gicd_size,
+			      MMU_DEVICE_FLAGS) < 0)
+		return -1;
+	if (platform_current.gicr_discovered &&
+	    map_runtime_range(platform_current.gicr_base, platform_current.gicr_size,
+			      MMU_DEVICE_FLAGS) < 0)
+		return -1;
+	if (platform_current.gits_discovered &&
+	    map_runtime_range(platform_current.gits_base, platform_current.gits_size,
+			      MMU_DEVICE_FLAGS) < 0)
+		return -1;
+	if (platform_current.kind == PLATFORM_KIND_QEMU_VIRT &&
+	    (map_runtime_range(VIRT_PCIE_MMIO_BASE, SECTION_SIZE,
+			       MMU_DEVICE_FLAGS) < 0 ||
+	     map_runtime_range(VIRT_PCIE_ECAM_BASE, VIRT_PCIE_ECAM_SIZE,
+			       MMU_DEVICE_FLAGS) < 0))
 		return -1;
 
 	/* 新根表已完整构造，先清理旧翻译，再切换 TTBR0，避免在
@@ -800,6 +848,10 @@ void platform_early_probe(void)
 	platform_current.memory_size = PHYS_MEMORY_SIZE;
 	platform_current.uart_base = VIRT_UART_BASE;
 	platform_current.uart_size = 0x1000UL;
+	platform_current.uart_kind = PLATFORM_UART_PL011;
+	platform_current.uart_clock_hz = 24000000UL;
+	platform_current.uart_baudrate = 115200UL;
+	platform_current.uart_compatible = 1;
 	platform_current.gicd_base = VIRT_GICD_BASE;
 	platform_current.gicd_size = 0x10000UL;
 	platform_current.gicr_base = VIRT_GICR_BASE;
@@ -830,15 +882,21 @@ void platform_early_probe(void)
 	if (platform_current.dtb_valid && !platform_current.cpu_count)
 		platform_current.cpu_count = MAX_CPUS;
 	validate_reserved_memory();
+	platform_current.memory_config_valid =
+		platform_current.dtb_valid &&
+		platform_current.memory_discovered &&
+		platform_current.memory_bank_count &&
+		!platform_current.memory_bank_overflow &&
+		platform_current.reserved_config_valid;
 	if (platform_current.dtb_valid && platform_current.kind == PLATFORM_KIND_QEMU_VIRT) {
 		platform_current.memory_config_valid =
-			platform_current.memory_discovered &&
-			!platform_current.memory_bank_overflow &&
+			platform_current.memory_config_valid &&
 			platform_current.memory_base == VIRT_DRAM_BASE &&
-			platform_current.memory_size == PHYS_MEMORY_SIZE &&
-			platform_current.reserved_config_valid;
+			platform_current.memory_size == PHYS_MEMORY_SIZE;
 		platform_current.mmio_config_valid =
 			platform_current.uart_discovered &&
+			platform_current.uart_compatible &&
+			platform_current.uart_kind == PLATFORM_UART_PL011 &&
 			platform_current.gic_discovered &&
 			platform_current.gicv3_discovered &&
 			platform_current.gicr_discovered &&
@@ -880,6 +938,9 @@ void platform_early_probe(void)
 		platform_current.memory_size = PHYS_MEMORY_SIZE;
 		platform_current.uart_base = VIRT_UART_BASE;
 		platform_current.uart_size = 0x1000UL;
+		platform_current.uart_kind = PLATFORM_UART_PL011;
+		platform_current.uart_clock_hz = 24000000UL;
+		platform_current.uart_baudrate = 115200UL;
 		platform_current.gicd_base = VIRT_GICD_BASE;
 		platform_current.gicd_size = 0x10000UL;
 		platform_current.gicr_base = VIRT_GICR_BASE;

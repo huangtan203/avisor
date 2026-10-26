@@ -149,8 +149,17 @@ void hypervisor_main()
                platform_current.runtime_table_count);
     else
         printf("[platform] stage1-map=fixed-layout\n");
-    virt_page_pool_init();
     uart_init();
+    if (!platform_full_bringup_supported()) {
+        printf("[platform] bring-up only: QEMU devices and guests are disabled\n");
+        printf("[platform] UART=%p DRAM-banks=%u tables=%u\n",
+               (void *)platform_current.uart_base,
+               platform_current.memory_bank_count,
+               platform_current.runtime_table_count);
+        for (;;)
+            asm volatile("wfe");
+    }
+    virt_page_pool_init();
 
     printf("\n");
     printf("========================================\n");

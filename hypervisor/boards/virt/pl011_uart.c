@@ -34,6 +34,31 @@
  */
 extern int uart_forwarded_task;
 
+#define TEGRA_UART_THR 0
+#define TEGRA_UART_IER 1
+#define TEGRA_UART_FCR 2
+#define TEGRA_UART_LCR 3
+#define TEGRA_UART_LSR 5
+#define TEGRA_UART_LSR_DR (1 << 0)
+#define TEGRA_UART_LSR_THRE (1 << 5)
+#define TEGRA_UART_LCR_DLAB (1 << 7)
+
+static inline unsigned long tegra_uart_reg(unsigned int reg)
+{
+    return platform_current.uart_base +
+           (reg << platform_current.uart_reg_shift);
+}
+
+static inline uint32_t tegra_uart_read(unsigned int reg)
+{
+    return get32(tegra_uart_reg(reg));
+}
+
+static inline void tegra_uart_write(unsigned int reg, uint32_t value)
+{
+    put32(tegra_uart_reg(reg), value);
+}
+
 /* 判断某个任务是否是当前 UART 转发的目标 */
 int is_uart_forwarded_task(struct task_struct *tsk)
 {
@@ -59,6 +84,15 @@ extern int uart_forwarded_task;
  */
 void uart_send(char c)
 {
+    if (platform_current.uart_kind == PLATFORM_UART_TEGRA_HSUART &&
+        !platform_current.runtime_mapping_valid)
+        return;
+    if (platform_current.uart_kind == PLATFORM_UART_TEGRA_HSUART) {
+        while (!(tegra_uart_read(TEGRA_UART_LSR) & TEGRA_UART_LSR_THRE))
+            ;
+        tegra_uart_write(TEGRA_UART_THR, c);
+        return;
+    }
     /* 等待 TX FIFO 有空间 */
     while (get32(UARTFR) & UARTFR_TXFF)
         ;
@@ -72,6 +106,11 @@ void uart_send(char c)
  */
 char uart_recv(void)
 {
+    if (platform_current.uart_kind == PLATFORM_UART_TEGRA_HSUART) {
+        while (!(tegra_uart_read(TEGRA_UART_LSR) & TEGRA_UART_LSR_DR))
+            ;
+        return tegra_uart_read(TEGRA_UART_THR) & 0xFF;
+    }
     /* 等待 RX FIFO 有数据 */
     while (get32(UARTFR) & UARTFR_RXFE)
         ;
@@ -85,6 +124,8 @@ char uart_recv(void)
  */
 int uart_is_rx_ready(void)
 {
+    if (platform_current.uart_kind == PLATFORM_UART_TEGRA_HSUART)
+        return tegra_uart_read(TEGRA_UART_LSR) & TEGRA_UART_LSR_DR;
     return !(get32(UARTFR) & UARTFR_RXFE);
 }
 
@@ -151,6 +192,16 @@ clear_int:
 /* Phase 1 简化版：读一个字符并回显 */
 void handle_uart_irq(void)
 {
+    if (platform_current.uart_kind == PLATFORM_UART_TEGRA_HSUART) {
+        while (uart_is_rx_ready()) {
+            char c = uart_recv();
+
+            uart_send(c);
+            if (c == '\r')
+                uart_send('\n');
+        }
+        return;
+    }
     while (!(get32(UARTFR) & UARTFR_RXFE)) {
         char c = get32(UARTDR) & 0xff;
         /* 回显 */
@@ -182,9 +233,24 @@ void handle_uart_irq(void)
  */
 void uart_init(void)
 {
-    unsigned int uartclk = 24000000;  /* QEMU virt PL011 时钟：24MHz */
-    unsigned int baudrate = 115200;
+    unsigned int uartclk = platform_current.uart_clock_hz ?: 24000000UL;
+    unsigned int baudrate = platform_current.uart_baudrate ?: 115200UL;
     unsigned int bauddiv;
+
+    if (platform_current.uart_kind == PLATFORM_UART_TEGRA_HSUART) {
+        unsigned int divisor = uartclk / (16 * baudrate);
+
+        if (!platform_current.runtime_mapping_valid)
+            return;
+
+        tegra_uart_write(TEGRA_UART_IER, 0);
+        tegra_uart_write(TEGRA_UART_LCR, TEGRA_UART_LCR_DLAB);
+        tegra_uart_write(TEGRA_UART_THR, divisor & 0xff);
+        tegra_uart_write(TEGRA_UART_IER, (divisor >> 8) & 0xff);
+        tegra_uart_write(TEGRA_UART_LCR, 3);
+        tegra_uart_write(TEGRA_UART_FCR, 7);
+        return;
+    }
     unsigned int ibrd, fbrd;
     unsigned int lcr_h;
 
