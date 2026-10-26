@@ -319,3 +319,16 @@ make -f Makefile.tegra tegra-verify-deploy
 ## 20. Phase 75：部署路径遍历防护
 
 新增 `tegra-path-check`，统一要求 Image 和 DTB 目标路径为绝对 POSIX 路径、互不相同且不包含 `..`。同时拒绝与生成的 U-Boot 脚本和 extlinux 片段路径冲突，避免自定义参数将文件写出 `bin_tegra/deploy` 或覆盖启动元数据。
+
+## 21. Phase 76：U-Boot 参数预检
+
+新增 `tegra-uboot-args-check`，统一校验：
+
+- 介质类型只能是 `mmc`、`usb` 或 `nvme`；
+- 设备号为非负十进制整数；
+- 分区号为正十进制整数；
+- Image 和 DTB 加载地址为正数且 4KB 对齐；
+- Image 加载地址必须保持 `0x80000000`；
+- DTB 加载地址不得早于 Image 加载地址。
+
+该检查在 U-Boot 打包和 `tegra-preflight` 中自动执行，避免把非法参数直接写入 `fatload`/`booti` 脚本。
