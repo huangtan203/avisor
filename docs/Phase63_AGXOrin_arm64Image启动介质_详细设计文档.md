@@ -146,3 +146,25 @@ migration: source VM reclaimed (... done=1)
 2. 若只有 UEFI：实现最小 EFI loader 或 PE/COFF stub，由其加载 aVisor、获取 DTB/系统表并退出 Boot Services 后转入 EL2 入口。
 
 在确认启动链类型前，不应声称当前 `Image` 可以直接从 Jetson UEFI 菜单执行。
+
+## 10. Phase 64–65：extlinux 部署与 DTB 交付
+
+Phase 64 在 `Makefile.tegra` 增加 `extlinux-package` 目标。Phase 65 进一步要求显式提供实际 DTB 文件，并对其 FDT magic 和 total size 做校验：
+
+```sh
+make -f Makefile.tegra extlinux-package \\
+  TEGRA_DTB_SOURCE=/path/to/tegra234.dtb \\
+  TEGRA_DTB_PATH=/boot/avisor/board.dtb
+```
+
+目标先运行 `verify-layout`，再生成：
+
+```text
+bin_tegra/deploy/boot/avisor/Image
+bin_tegra/deploy/boot/avisor/board.dtb
+bin_tegra/deploy/boot/extlinux/avisor.conf.fragment
+```
+
+配置片段仅包含 aVisor 的 `LABEL`、`LINUX` 和 `FDT` 项。应将其内容合并到现有 `extlinux.conf`，并保留原始 Jetson 启动项作为恢复入口。`TEGRA_DTB_PATH` 与 `TEGRA_IMAGE_PATH` 必须是目标系统中的绝对路径；`TEGRA_DTB_SOURCE` 必须指向存在且具有 `0xd00dfeed` magic 的 DTB 文件。
+
+该目标是可审查的部署素材生成器，不会自动写入 SD/NVMe 分区，不会覆盖完整启动配置，也不证明当前固件实际支持 extlinux。DTB 文件名、分区挂载位置和 U-Boot 加载行为仍需在目标设备核实；没有 extlinux/U-Boot 启动路径的固件需要另行实现 EFI loader。

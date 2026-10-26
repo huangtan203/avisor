@@ -6,12 +6,37 @@ BUILD_DIR := build_tegra
 OUTDIR := bin_tegra
 LINKER_FILE := hypervisor/boards/virt/linker_tegra.ld
 
+TEGRA_DTB_SOURCE ?=
+TEGRA_DTB_PATH ?= /boot/avisor/board.dtb
+TEGRA_IMAGE_PATH ?= /boot/avisor/Image
+TEGRA_DEPLOY_DIR := $(OUTDIR)/deploy
+TEGRA_DTB_DEPLOY_FILE = $(TEGRA_DEPLOY_DIR)$(TEGRA_DTB_PATH)
+TEGRA_IMAGE_DEPLOY_FILE = $(TEGRA_DEPLOY_DIR)$(TEGRA_IMAGE_PATH)
+TEGRA_EXTLINUX_FRAGMENT := $(TEGRA_DEPLOY_DIR)/boot/extlinux/avisor.conf.fragment
+
 include Makefile.virt
 
-.PHONY: tegra-image verify-layout
+.PHONY: tegra-image verify-layout extlinux-package
 tegra-image: kernel8.img
 	cp $(OUTDIR)/kernel8.img $(OUTDIR)/Image
 
 verify-layout: tegra-image
 	@test "$$($(GNU_TOOLS)-nm -n $(BUILD_DIR)/kernel8.elf | awk '$$3 == "_start" { print $$1 }')" = "0000000080080000"
 	@python3 -c 'import pathlib,struct; p=pathlib.Path("$(OUTDIR)/Image"); d=p.read_bytes()[:64]; assert len(d)==64; off,size,flags=struct.unpack_from("<QQQ",d,8); magic=struct.unpack_from("<I",d,56)[0]; assert off==0x80000, hex(off); assert size>64 and size<=p.stat().st_size, (size,p.stat().st_size); assert flags==0, hex(flags); assert magic==0x644d5241, hex(magic); print("Tegra arm64 Image verified: entry=0x80080000 offset=0x%x size=%d" % (off,size))'
+
+extlinux-package: verify-layout
+	@test -n "$(strip $(TEGRA_DTB_SOURCE))" || { echo "error: set TEGRA_DTB_SOURCE to the board DTB file"; exit 1; }
+	@case "$(TEGRA_DTB_PATH)" in /*) ;; *) echo "error: TEGRA_DTB_PATH must be an absolute target path"; exit 1;; esac
+	@case "$(TEGRA_IMAGE_PATH)" in /*) ;; *) echo "error: TEGRA_IMAGE_PATH must be an absolute target path"; exit 1;; esac
+	@test -f "$(TEGRA_DTB_SOURCE)" || { echo "error: DTB source does not exist: $(TEGRA_DTB_SOURCE)"; exit 1; }
+	mkdir -p $(TEGRA_DEPLOY_DIR)/boot/extlinux $(dir $(TEGRA_DTB_DEPLOY_FILE)) $(dir $(TEGRA_IMAGE_DEPLOY_FILE))
+	cp $(OUTDIR)/Image $(TEGRA_IMAGE_DEPLOY_FILE)
+	cp $(TEGRA_DTB_SOURCE) $(TEGRA_DTB_DEPLOY_FILE)
+	@python3 -c 'import pathlib,struct; p=pathlib.Path("$(TEGRA_DTB_DEPLOY_FILE)"); d=p.read_bytes(); assert len(d)>=8; assert struct.unpack_from(">I",d,0)[0]==0xd00dfeed; total=struct.unpack_from(">I",d,4)[0]; assert total<=len(d) and total>=40; print("Tegra DTB verified:", p, "bytes=", total)'
+	@printf '%s\n' \
+		'LABEL avisor' \
+		'      MENU LABEL aVisor Tegra234 EL2 bring-up' \
+		'      LINUX $(TEGRA_IMAGE_PATH)' \
+		'      FDT $(TEGRA_DTB_PATH)' > $(TEGRA_EXTLINUX_FRAGMENT)
+	@python3 -c 'import pathlib; p=pathlib.Path("$(TEGRA_EXTLINUX_FRAGMENT)"); s=p.read_text(); assert "LINUX $(TEGRA_IMAGE_PATH)\n" in s; assert "FDT $(TEGRA_DTB_PATH)\n" in s; print("Tegra extlinux package verified:", p)'
+	@echo "Merge $(TEGRA_EXTLINUX_FRAGMENT) into the board extlinux.conf; preserve its recovery entry."
