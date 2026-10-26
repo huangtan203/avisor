@@ -258,3 +258,22 @@ entry-el=2 source=x2
 ```
 
 其中 `entry-el=3` 表示固件把 CPU0 交给 aVisor 时仍在 EL3，随后由入口代码降到 EL2；`entry-el=2` 表示直接从 EL2 进入。`source=x0` 是 AGX Orin 的正式 DTB 契约，`source=x2` 仅保留兼容诊断。DTB 无效时会显示 `source=none` 或 `fallback`，仍按现有平台安全路径处理，不会启用错误的 Tegra MMIO。
+
+## 16. Phase 71：Tegra 交付前一键预检
+
+新增：
+
+```sh
+make -f Makefile.tegra tegra-preflight \\
+  TEGRA_DTB_SOURCE=/path/to/tegra234.dtb
+```
+
+该目标统一执行：
+
+1. arm64 Image 入口和 header 校验；
+2. Tegra234 DTB 静态契约校验；
+3. Image/DTB U-Boot 加载地址冲突校验；
+4. U-Boot `fatload`/`booti` 脚本生成和校验；
+5. extlinux 配置片段生成和校验。
+
+成功后输出 Image、DTB、入口地址和 U-Boot 介质摘要，并在 `bin_tegra/deploy` 下生成待审查素材。该目标不会复制到真实设备、修改 U-Boot 环境或覆盖恢复启动项。

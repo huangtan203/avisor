@@ -22,7 +22,7 @@ TEGRA_UBOOT_SCRIPT := $(TEGRA_DEPLOY_DIR)/boot/avisor/avisor-boot.cmd
 
 include Makefile.virt
 
-.PHONY: tegra-image verify-layout tegra-dtb-check extlinux-package uboot-package
+.PHONY: tegra-image verify-layout tegra-dtb-check extlinux-package uboot-package tegra-preflight
 tegra-image: kernel8.img
 	cp $(OUTDIR)/kernel8.img $(OUTDIR)/Image
 
@@ -69,3 +69,7 @@ uboot-package: verify-layout tegra-dtb-check
 		'booti $(TEGRA_IMAGE_LOAD_ADDR) - $(TEGRA_DTB_LOAD_ADDR)' > $(TEGRA_UBOOT_SCRIPT)
 	@python3 -c 'import pathlib; p=pathlib.Path("$(TEGRA_UBOOT_SCRIPT)"); s=p.read_text(); assert "fatload $(TEGRA_UBOOT_INTERFACE) $(TEGRA_UBOOT_DEVICE):$(TEGRA_UBOOT_PARTITION) $(TEGRA_IMAGE_LOAD_ADDR) $(TEGRA_IMAGE_PATH)\n" in s; assert "booti $(TEGRA_IMAGE_LOAD_ADDR) - $(TEGRA_DTB_LOAD_ADDR)\n" in s; print("U-Boot script verified:", p)'
 	@echo "Review $(TEGRA_UBOOT_SCRIPT) before executing it; keep a recovery boot entry."
+
+tegra-preflight: verify-layout tegra-dtb-check uboot-package extlinux-package
+	@python3 -c 'import pathlib; p=pathlib.Path("$(TEGRA_UBOOT_SCRIPT)"); s=p.read_text(); assert s.endswith("booti $(TEGRA_IMAGE_LOAD_ADDR) - $(TEGRA_DTB_LOAD_ADDR)\n"); print("Tegra preflight passed:"); print("  Image: $(OUTDIR)/Image"); print("  DTB: $(TEGRA_DTB_SOURCE) -> $(TEGRA_DTB_PATH)"); print("  entry: 0x80080000 (load $(TEGRA_IMAGE_LOAD_ADDR))"); print("  U-Boot: $(TEGRA_UBOOT_INTERFACE) $(TEGRA_UBOOT_DEVICE):$(TEGRA_UBOOT_PARTITION)")'
+	@echo "Review deployment files under $(TEGRA_DEPLOY_DIR) before copying them to the target."
