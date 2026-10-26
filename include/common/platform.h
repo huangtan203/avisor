@@ -15,6 +15,12 @@ enum platform_uart_kind {
 	PLATFORM_UART_TEGRA_HSUART,
 };
 
+enum platform_psci_method {
+	PLATFORM_PSCI_UNKNOWN = 0,
+	PLATFORM_PSCI_SMC,
+	PLATFORM_PSCI_HVC,
+};
+
 #define PLATFORM_MAX_RESERVED_RANGES 16
 #define PLATFORM_MAX_MEMORY_RANGES 24
 #define PLATFORM_MAX_MEMORY_BANKS 8
@@ -58,6 +64,9 @@ struct platform_info {
 	unsigned long gits_size;
 	unsigned int timer_hyp_ppi;
 	unsigned int timer_virt_ppi;
+	enum platform_psci_method psci_method;
+	int psci_discovered;
+	int interrupt_config_valid;
 	struct platform_reserved_range reserved[PLATFORM_MAX_RESERVED_RANGES];
 	unsigned int reserved_count;
 	unsigned int reserved_overflow;
@@ -109,6 +118,9 @@ unsigned int platform_timer_hyp_ppi(void);
 unsigned int platform_timer_virt_ppi(void);
 int platform_runtime_config_valid(void);
 int platform_full_bringup_supported(void);
+int platform_interrupt_config_valid(void);
+int platform_psci_cpu_on(unsigned long mpidr, unsigned long entry_point,
+			 unsigned long context_id);
 int platform_memory_config_valid(void);
 int platform_mmio_config_valid(void);
 int platform_apply_runtime_mappings(void);

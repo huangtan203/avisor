@@ -22,7 +22,9 @@
 #define FDT_REG_SHIFT "reg-shift"
 #define FDT_CLOCK_FREQUENCY "clock-frequency"
 #define FDT_CURRENT_SPEED "current-speed"
+#define FDT_METHOD "method"
 #define PLATFORM_UART_COMPAT_PL011 "arm,pl011"
+#define PLATFORM_PSCI_COMPAT "arm,psci"
 #define PLATFORM_UART_COMPAT_TEGRA "nvidia,tegra194-hsuart"
 
 #define GIC_PPI_TYPE 1U
@@ -471,6 +473,7 @@ static int fdt_parse(unsigned long dtb)
 	int gic_node = 0;
 	int its_node = 0;
 	int timer_node = 0;
+	int psci_node = 0;
 
 	if (!dtb || be32(base) != FDT_MAGIC)
 		return -1;
@@ -528,6 +531,7 @@ static int fdt_parse(unsigned long dtb)
 			gic_node = text_has(name, len, "intc");
 			its_node = text_has(name, len, "its");
 			timer_node = depth == 1 && text_has(name, len, "timer");
+			psci_node = depth == 1 && text_has(name, len, "psci");
 			continue;
 		}
 		if (token == FDT_END_NODE) {
@@ -541,6 +545,7 @@ static int fdt_parse(unsigned long dtb)
 			gic_node = 0;
 			its_node = 0;
 			timer_node = 0;
+			psci_node = 0;
 			continue;
 		}
 		if (token == FDT_NOP)
@@ -573,11 +578,22 @@ static int fdt_parse(unsigned long dtb)
 			if (timer_node && !strcmp(prop, FDT_COMPATIBLE) &&
 			    compatible_has(value, len, "arm,armv8-timer"))
 				platform_current.timer_discovered = 1;
+			if (psci_node && !strcmp(prop, FDT_COMPATIBLE) &&
+			    text_has((const char *)value, len, PLATFORM_PSCI_COMPAT))
+				platform_current.psci_discovered = 1;
+			if (psci_node && !strcmp(prop, FDT_METHOD)) {
+				if (text_has((const char *)value, len, "smc"))
+					platform_current.psci_method = PLATFORM_PSCI_SMC;
+				else if (text_has((const char *)value, len, "hvc"))
+					platform_current.psci_method = PLATFORM_PSCI_HVC;
+			}
 			if (depth == 0 && !strcmp(prop, FDT_COMPATIBLE)) {
 				if (text_has((const char *)value, len, "nvidia,tegra234") ||
 				    text_has((const char *)value, len, "jetson-agx-orin")) {
 					platform_current.kind = PLATFORM_KIND_AGX_ORIN;
 					platform_current.name = "NVIDIA Jetson AGX Orin";
+					platform_current.psci_discovered = 0;
+					platform_current.psci_method = PLATFORM_PSCI_UNKNOWN;
 				}
 				if (text_has((const char *)value, len, "linux,dummy-virt")) {
 					platform_current.kind = PLATFORM_KIND_QEMU_VIRT;
@@ -741,6 +757,26 @@ int platform_full_bringup_supported(void)
 	return platform_current.kind == PLATFORM_KIND_QEMU_VIRT;
 }
 
+int platform_interrupt_config_valid(void)
+{
+	return platform_current.interrupt_config_valid;
+}
+
+int platform_psci_cpu_on(unsigned long mpidr, unsigned long entry_point,
+			 unsigned long context_id)
+{
+	register unsigned long x0 asm("x0") = 0xC4000003UL;
+	register unsigned long x1 asm("x1") = mpidr;
+	register unsigned long x2 asm("x2") = entry_point;
+	register unsigned long x3 asm("x3") = context_id;
+
+	if (!platform_current.psci_discovered ||
+	    platform_current.psci_method != PLATFORM_PSCI_SMC)
+		return -1;
+	asm volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+	return (int)x0;
+}
+
 int platform_memory_config_valid(void)
 {
 	return platform_current.memory_config_valid;
@@ -861,6 +897,8 @@ void platform_early_probe(void)
 	platform_current.gits_size = VIRT_GITS_SIZE;
 	platform_current.timer_hyp_ppi = 26;
 	platform_current.timer_virt_ppi = 27;
+	platform_current.psci_method = PLATFORM_PSCI_SMC;
+	platform_current.psci_discovered = 1;
 	platform_current.memory_config_valid = 0;
 	platform_current.mmio_config_valid = 0;
 	platform_current.cpu_count = 0;
@@ -881,6 +919,8 @@ void platform_early_probe(void)
 	normalize_memory_banks();
 	if (platform_current.dtb_valid && !platform_current.cpu_count)
 		platform_current.cpu_count = MAX_CPUS;
+	if (platform_current.gicr_discovered && !platform_current.gicr_stride)
+		platform_current.gicr_stride = 0x20000UL;
 	validate_reserved_memory();
 	platform_current.memory_config_valid =
 		platform_current.dtb_valid &&
@@ -888,6 +928,19 @@ void platform_early_probe(void)
 		platform_current.memory_bank_count &&
 		!platform_current.memory_bank_overflow &&
 		platform_current.reserved_config_valid;
+	platform_current.interrupt_config_valid =
+		platform_current.dtb_valid &&
+		platform_current.gic_discovered &&
+		platform_current.gicv3_discovered &&
+		platform_current.gicr_discovered &&
+		platform_current.gicr_stride >= 0x20000UL &&
+		platform_current.gicr_size >= platform_current.gicr_stride &&
+		platform_current.timer_discovered &&
+		platform_current.timer_interrupts_discovered &&
+		platform_current.timer_hyp_ppi >= 16 &&
+		platform_current.timer_hyp_ppi < 32 &&
+		platform_current.timer_virt_ppi >= 16 &&
+		platform_current.timer_virt_ppi < 32;
 	if (platform_current.dtb_valid && platform_current.kind == PLATFORM_KIND_QEMU_VIRT) {
 		platform_current.memory_config_valid =
 			platform_current.memory_config_valid &&
@@ -962,13 +1015,16 @@ void platform_early_probe(void)
 	       (void *)platform_current.uart_base,
 	       (void *)platform_current.gicd_base,
 	       (void *)platform_current.gicr_base);
-	printf("[platform] gicr-size=%p stride=%p its=%p+%p timer-ppi=%u/%u\n",
+	printf("[platform] gicr-size=%p stride=%p its=%p+%p timer-ppi=%u/%u psci=%s irq-config=%s\n",
 	       (void *)platform_current.gicr_size,
 	       (void *)platform_current.gicr_stride,
 	       (void *)platform_current.gits_base,
 	       (void *)platform_current.gits_size,
 	       platform_current.timer_hyp_ppi,
-	       platform_current.timer_virt_ppi);
+	       platform_current.timer_virt_ppi,
+	       platform_current.psci_method == PLATFORM_PSCI_SMC ? "smc" :
+	       platform_current.psci_method == PLATFORM_PSCI_HVC ? "hvc" : "none",
+	       platform_current.interrupt_config_valid ? "valid" : "fallback");
 	printf("[platform] reserved=%u overflow=%u pool-conflict=%s usable=%p+%luMB\n",
 	       platform_current.reserved_count,
 	       platform_current.reserved_overflow,

@@ -32,6 +32,7 @@
 #include "arch/aarch64/sysregs.h"
 #include "common/board.h"
 #include "common/debug.h"
+#include "common/platform.h"
 #include "common/sched.h"
 #include "common/utils.h"
 static unsigned long timer_freq = 0;
@@ -142,7 +143,7 @@ void timer_init(void)
      * 但实际上不同 GIC 版本/实现可能有差异，
      * QEMU virt + GICv3 下 EL2 物理定时器就是 PPI #26。
      */
-    gic_enable_irq(PPI_EL2_PHYS_TIMER);
+    gic_enable_irq(platform_timer_hyp_ppi());
 
     INFO("Architected Timer initialized.");
 }

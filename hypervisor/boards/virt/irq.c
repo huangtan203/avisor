@@ -25,6 +25,7 @@
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
 #include "common/entry.h"
+#include "common/platform.h"
 #include "common/sched.h"
 #include "common/smp.h"
 #include "common/timer.h"
@@ -201,38 +202,22 @@ void handle_irq(void)
         return;
     }
 
-    /* 2. 根据中断号分发处理 */
-    switch (irq) {
-    case PPI_EL2_PHYS_TIMER:
-        /* EL2 物理定时器中断（Hypervisor tick） */
+    /* 2. 根据 DTB 提供的定时器 PPI 分发处理 */
+    if (irq == platform_timer_hyp_ppi()) {
         handle_timer_irq();
-        /* split EOI 模式下需要显式 DIR deactivate */
-        WRITE_SYSREG64(PPI_EL2_PHYS_TIMER, ICC_DIR_EL1);
+        WRITE_SYSREG64(irq, ICC_DIR_EL1);
         asm volatile("isb");
-        break;
-
-    case PPI_VIRT_TIMER:
-        /*
-         * 虚拟定时器中断（Guest 的 CNTV 到期）
-         *
-         * GICv3 vtimer 标准虚拟化流程（HW 直通模式）：
-         *   1. EL2 ack 物理 27 → active
-         *   2. 注入 HW 模式 LR（vINTID=27, pINTID=27）
-         *   3. 写 EOIR 降优先级（split EOI 模式，保持物理 27 active）
-         *   4. eret 回 EL1 → Guest 收到 vIRQ 27
-         *   5. Guest 处理 → 重装 CVAL（清电平）→ 虚拟 EOI
-         *   6. HW 联动：Guest 写虚拟 EOI 自动 deactivate 物理 27
-         */
-        if (current && current->pid != 0) {
-            vgic_inject_virq_hw(PPI_VIRT_TIMER, PPI_VIRT_TIMER);
-        }
-        /*
-         * split EOI：只写 EOIR（降优先级），不写 DIR。
-         * 物理 27 保持 active，由 Guest 虚拟 EOI 联动硬件 deactivate。
-         */
         gic_eoi_irq(irq);
-        return;  // 跳过末尾的公共处理
+        return;
+    }
+    if (irq == platform_timer_virt_ppi()) {
+        if (current && current->pid != 0)
+            vgic_inject_virq_hw(irq, irq);
+        gic_eoi_irq(irq);
+        return;
+    }
 
+    switch (irq) {
     case 33 + 32:  /* VIRT_UART0_IRQ = SPI #33, 加32得全局中断号 */
         /* PL011 UART 接收中断 */
         handle_uart_irq();

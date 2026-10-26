@@ -13,6 +13,7 @@
 #include "boards/virt/gicv3.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
+#include "common/platform.h"
 #include "common/sched.h"
 #include "common/smp.h"
 #include "common/utils.h"
@@ -106,7 +107,7 @@ void vgic_init(void)
     /*
      * 5. 在 GIC Redistributor 中使能虚拟定时器的物理中断 PPI #27
      */
-    gic_enable_irq(PPI_VIRT_TIMER);
+    gic_enable_irq(platform_timer_virt_ppi());
 
     /*
      * 6. 设置物理 CPU 接口的 EOIMode = 1（split EOI 模式）

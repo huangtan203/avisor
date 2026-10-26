@@ -91,36 +91,6 @@ static struct shared_vm_loader_args global_vm1_shared_args;
 static struct shared_vm_loader_args global_vm2_shared_args;
 
 /*
- * PSCI CPU_ON 函数（通过 SMC #0 调用，由 QEMU 模拟的 PSCI 固件处理）
- *
- * 返回 0 = 成功，其他 = 错误码
- *
- * 注意：
- *   - ARM PSCI 标准使用 SMC 作为调用约定（SMC32/SMC64）
- *   - QEMU 的 TCG 模拟会捕获 SMC 指令并处理 PSCI 调用
- *   - 不能用 HVC #0，因为 hypervisor 本身运行在 EL2，
- *     EL2 执行 HVC 会触发未处理的同步异常（SYNC_INVALID_EL2）
- */
-#define PSCI_CPU_ON_64        0xC4000003
-
-static int psci_cpu_on(unsigned long mpidr, unsigned long entry_point,
-                       unsigned long context_id)
-{
-    register unsigned long x0 asm("x0") = PSCI_CPU_ON_64;
-    register unsigned long x1 asm("x1") = mpidr;
-    register unsigned long x2 asm("x2") = entry_point;
-    register unsigned long x3 asm("x3") = context_id;
-
-    asm volatile(
-        "smc #0\n"
-        : "+r"(x0)
-        : "r"(x1), "r"(x2), "r"(x3)
-        : "memory");
-
-    return (int)x0;
-}
-
-/*
  * 次核的 PSCI 入口点（由 PSCI CPU_ON 在 EL2 跳入）
  * 定义在 boot_virt.S 中
  */
@@ -391,7 +361,8 @@ void hypervisor_main()
      *  - 次核启动后先等待 smp_boot_flag==1，确保主核初始化完成
      */
     {
-        int ret = psci_cpu_on(0x1, (unsigned long)secondary_psci_entry, 0);
+        int ret = platform_psci_cpu_on(0x1,
+                                       (unsigned long)secondary_psci_entry, 0);
         printf("[9] SMP: PSCI CPU_ON(cpu1) returned %d\n", ret);
         if (ret != 0) {
             printf("    WARNING: Failed to boot CPU1!\n");
