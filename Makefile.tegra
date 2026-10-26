@@ -23,10 +23,11 @@ TEGRA_EXTLINUX_FRAGMENT := $(TEGRA_DEPLOY_DIR)/boot/extlinux/avisor.conf.fragmen
 TEGRA_UBOOT_SCRIPT := $(TEGRA_DEPLOY_DIR)/boot/avisor/avisor-boot.cmd
 TEGRA_BOOT_CONTRACT := $(TEGRA_DEPLOY_DIR)/boot/avisor/boot-contract.txt
 TEGRA_MANIFEST := $(TEGRA_DEPLOY_DIR)/boot/avisor/manifest.sha256
+TEGRA_DEPLOY_ARCHIVE := $(OUTDIR)/avisor-tegra234-deploy.tar
 
 include Makefile.virt
 
-.PHONY: tegra-image verify-layout tegra-dtb-check tegra-path-check tegra-uboot-args-check tegra-boot-contract tegra-boot-artifacts-check extlinux-package uboot-package tegra-preflight tegra-verify-deploy
+.PHONY: tegra-image verify-layout tegra-dtb-check tegra-path-check tegra-uboot-args-check tegra-boot-contract tegra-boot-artifacts-check extlinux-package uboot-package tegra-preflight tegra-verify-deploy tegra-package tegra-verify-package
 tegra-image: kernel8.img
 	cp $(OUTDIR)/kernel8.img $(OUTDIR)/Image
 
@@ -107,3 +108,11 @@ tegra-verify-deploy:
 	@python3 -c 'import pathlib; root=pathlib.Path("$(TEGRA_DEPLOY_DIR)"); manifest=pathlib.Path("$(TEGRA_MANIFEST)"); expected={"$(TEGRA_IMAGE_DEPLOY_REL)","$(TEGRA_DTB_DEPLOY_REL)","boot/avisor/avisor-boot.cmd","boot/extlinux/avisor.conf.fragment","boot/avisor/boot-contract.txt"}; lines=manifest.read_text().splitlines(); names={line.split("  ",1)[1] for line in lines if "  " in line}; assert names==expected, (names,expected); assert all((root/pathlib.Path(name)).is_file() for name in expected), "deployment file missing"; print("Deployment manifest entries verified:",len(names))'
 	@cd $(TEGRA_DEPLOY_DIR) && sha256sum -c boot/avisor/manifest.sha256
 	@echo "Tegra deployment verification passed: $(TEGRA_DEPLOY_DIR)"
+
+tegra-package: tegra-preflight tegra-verify-deploy
+	@tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime='UTC 1970-01-01' -cf $(TEGRA_DEPLOY_ARCHIVE) -C $(TEGRA_DEPLOY_DIR) $(TEGRA_IMAGE_DEPLOY_REL) $(TEGRA_DTB_DEPLOY_REL) boot/avisor/avisor-boot.cmd boot/extlinux/avisor.conf.fragment boot/avisor/boot-contract.txt boot/avisor/manifest.sha256
+	@echo "Tegra deployment archive generated: $(TEGRA_DEPLOY_ARCHIVE)"
+
+tegra-verify-package:
+	@test -f "$(TEGRA_DEPLOY_ARCHIVE)" || { echo "error: deployment archive is missing; run tegra-package first"; exit 1; }
+	@python3 -c 'import hashlib,pathlib,tarfile; archive=pathlib.Path("$(TEGRA_DEPLOY_ARCHIVE)"); expected={"$(TEGRA_IMAGE_DEPLOY_REL)","$(TEGRA_DTB_DEPLOY_REL)","boot/avisor/avisor-boot.cmd","boot/extlinux/avisor.conf.fragment","boot/avisor/boot-contract.txt","boot/avisor/manifest.sha256"}; tf=tarfile.open(archive); members=tf.getmembers(); names={m.name for m in members if m.isfile()}; assert names==expected, (names,expected); assert all(not pathlib.PurePosixPath(m.name).is_absolute() and ".." not in pathlib.PurePosixPath(m.name).parts for m in members), "unsafe archive path"; assert all(m.isfile() or m.isdir() for m in members), "archive contains unsupported member"; manifest=tf.extractfile("boot/avisor/manifest.sha256").read().decode().splitlines(); entries=dict(line.split("  ",1)[::-1] for line in manifest); assert set(entries)==expected-{"boot/avisor/manifest.sha256"}, (set(entries),expected); assert all(hashlib.sha256(tf.extractfile(name).read()).hexdigest()==digest for name,digest in entries.items()), "archive checksum mismatch"; print("Tegra deployment archive verified:",archive,"files=",len(names))'

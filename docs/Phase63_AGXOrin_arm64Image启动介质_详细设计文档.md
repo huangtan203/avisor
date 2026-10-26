@@ -354,3 +354,24 @@ arm64 Image header 的 `image_size` 只描述文件 payload，不包含加载后
 ## 25. Phase 80：启动契约快照
 
 `tegra-preflight` 新增 `boot/avisor/boot-contract.txt`，记录平台、入口、Image/DTB 加载地址和目标路径，以及 U-Boot 介质、设备和分区参数。契约文件使用固定键顺序，并纳入启动产物白名单和 `manifest.sha256`；`tegra-verify-deploy` 要求五个交付条目完整存在且哈希匹配。这样部署包可以独立说明自身的生成参数，契约被修改后也会被复核拒绝。
+
+## 26. Phase 81：可复核部署归档
+
+新增：
+
+```sh
+make -f Makefile.tegra tegra-package \
+  TEGRA_DTB_SOURCE=/path/to/tegra234.dtb
+make -f Makefile.tegra tegra-verify-package
+```
+
+`tegra-package` 先执行完整预检和部署目录复核，再生成 `bin_tegra/avisor-tegra234-deploy.tar`。归档使用固定文件顺序、所有者、时间戳和 ustar 格式，便于相同输入产生稳定交付物。
+
+`tegra-verify-package` 不解包到文件系统，直接检查归档成员：
+
+- 文件白名单必须由五个清单条目和 `manifest.sha256` 组成；
+- 成员路径必须为相对路径且不得包含 `..`；
+- 不允许符号链接、硬链接或其他特殊成员；
+- 归档内五个交付文件必须通过清单中的 SHA-256 校验。
+
+该归档只用于离线传输和复核，不会写入启动介质，也不会修改目标板的 U-Boot 或 extlinux 配置。
