@@ -332,3 +332,7 @@ make -f Makefile.tegra tegra-verify-deploy
 - DTB 加载地址不得早于 Image 加载地址。
 
 该检查在 U-Boot 打包和 `tegra-preflight` 中自动执行，避免把非法参数直接写入 `fatload`/`booti` 脚本。
+
+## 22. Phase 77：DTB 与运行时保留区隔离
+
+arm64 Image header 的 `image_size` 只描述文件 payload，不包含加载后使用的 BSS 和 Stage-1 页表存储。Phase 77 从 Tegra ELF 读取 `image_end`，要求 `TEGRA_DTB_LOAD_ADDR >= image_end`，防止 DTB 虽未覆盖 Image 文件内容，却覆盖运行时 BSS 或 128 页页表区。预检同时输出文件 payload 结束地址、运行时保留区结束地址和 DTB 地址，便于实机审计。
