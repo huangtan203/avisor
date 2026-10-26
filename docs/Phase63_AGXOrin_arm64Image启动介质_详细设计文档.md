@@ -336,3 +336,7 @@ make -f Makefile.tegra tegra-verify-deploy
 ## 22. Phase 77：DTB 与运行时保留区隔离
 
 arm64 Image header 的 `image_size` 只描述文件 payload，不包含加载后使用的 BSS 和 Stage-1 页表存储。Phase 77 从 Tegra ELF 读取 `image_end`，要求 `TEGRA_DTB_LOAD_ADDR >= image_end`，防止 DTB 虽未覆盖 Image 文件内容，却覆盖运行时 BSS 或 128 页页表区。预检同时输出文件 payload 结束地址、运行时保留区结束地址和 DTB 地址，便于实机审计。
+
+## 23. Phase 78：DTB 完整加载区间校验
+
+布局检查读取实际 DTB 文件长度，计算半开区间 `[TEGRA_DTB_LOAD_ADDR, dtb_end)`。除起始地址不得覆盖 `image_end` 外，还要求该区间非空且结束地址不超过 `2^48`，与当前 EL2 Stage-1 的 48-bit 地址契约保持一致。预检输出完整 DTB 区间，避免只审计起始地址而遗漏尾部溢出。
