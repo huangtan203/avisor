@@ -350,3 +350,7 @@ arm64 Image header 的 `image_size` 只描述文件 payload，不包含加载后
 - 任何额外命令或配置行都会使 `tegra-preflight` 失败。
 
 该审计用于防止部署产物被意外注入额外启动动作。
+
+## 25. Phase 80：启动契约快照
+
+`tegra-preflight` 新增 `boot/avisor/boot-contract.txt`，记录平台、入口、Image/DTB 加载地址和目标路径，以及 U-Boot 介质、设备和分区参数。契约文件使用固定键顺序，并纳入启动产物白名单和 `manifest.sha256`；`tegra-verify-deploy` 要求五个交付条目完整存在且哈希匹配。这样部署包可以独立说明自身的生成参数，契约被修改后也会被复核拒绝。
