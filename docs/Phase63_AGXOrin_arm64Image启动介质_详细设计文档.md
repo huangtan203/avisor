@@ -168,3 +168,31 @@ bin_tegra/deploy/boot/extlinux/avisor.conf.fragment
 配置片段仅包含 aVisor 的 `LABEL`、`LINUX` 和 `FDT` 项。应将其内容合并到现有 `extlinux.conf`，并保留原始 Jetson 启动项作为恢复入口。`TEGRA_DTB_PATH` 与 `TEGRA_IMAGE_PATH` 必须是目标系统中的绝对路径；`TEGRA_DTB_SOURCE` 必须指向存在且具有 `0xd00dfeed` magic 的 DTB 文件。
 
 该目标是可审查的部署素材生成器，不会自动写入 SD/NVMe 分区，不会覆盖完整启动配置，也不证明当前固件实际支持 extlinux。DTB 文件名、分区挂载位置和 U-Boot 加载行为仍需在目标设备核实；没有 extlinux/U-Boot 启动路径的固件需要另行实现 EFI loader。
+
+## 11. Phase 66：U-Boot 一次性启动脚本
+
+`Makefile.tegra` 还提供 `uboot-package`，生成不修改环境变量的 U-Boot 命令脚本：
+
+```sh
+make -f Makefile.tegra uboot-package \\
+  TEGRA_DTB_SOURCE=/path/to/tegra234.dtb \\
+  TEGRA_UBOOT_INTERFACE=mmc \\
+  TEGRA_UBOOT_DEVICE=0 \\
+  TEGRA_UBOOT_PARTITION=1
+```
+
+默认生成：
+
+```text
+bin_tegra/deploy/boot/avisor/avisor-boot.cmd
+```
+
+内容等价于：
+
+```text
+fatload mmc 0:1 0x80000000 /boot/avisor/Image
+fatload mmc 0:1 0x88000000 /boot/avisor/board.dtb
+booti 0x80000000 - 0x88000000
+```
+
+该脚本只覆盖 `mmc`、`usb` 和 `nvme` 三类介质的命令模板；它不会自动执行 `saveenv`、不会写入启动分区，也不会替换恢复项。Image 加载地址 `0x80000000` 与 DTB 加载地址 `0x88000000` 是模板默认值，实际板卡必须确认没有覆盖固件、内核或其他保留内存。
