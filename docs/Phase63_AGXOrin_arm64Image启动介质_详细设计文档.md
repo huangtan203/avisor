@@ -277,3 +277,37 @@ make -f Makefile.tegra tegra-preflight \\
 5. extlinux 配置片段生成和校验。
 
 成功后输出 Image、DTB、入口地址和 U-Boot 介质摘要，并在 `bin_tegra/deploy` 下生成待审查素材。该目标不会复制到真实设备、修改 U-Boot 环境或覆盖恢复启动项。
+
+## 17. Phase 72：部署清单与 SHA-256 校验
+
+`tegra-preflight` 还生成：
+
+```text
+bin_tegra/deploy/boot/avisor/manifest.sha256
+```
+
+清单覆盖四个交付文件：
+
+- `boot/avisor/Image`；
+- `boot/avisor/board.dtb`；
+- `boot/avisor/avisor-boot.cmd`；
+- `boot/extlinux/avisor.conf.fragment`。
+
+在部署目录中可执行：
+
+```sh
+cd bin_tegra/deploy
+sha256sum -c boot/avisor/manifest.sha256
+```
+
+清单只用于交付审计，不是启动时安全验证，也不会自动复制到目标设备。
+
+## 18. Phase 73：部署目录复核
+
+新增：
+
+```sh
+make -f Makefile.tegra tegra-verify-deploy
+```
+
+该目标要求先存在 `manifest.sha256`，再检查四个清单条目、对应文件和全部 SHA-256 值。任何文件缺失、清单条目变化或内容被替换都会失败。它只读取 `bin_tegra/deploy`，不会访问真实设备，也不会修改部署目录。
