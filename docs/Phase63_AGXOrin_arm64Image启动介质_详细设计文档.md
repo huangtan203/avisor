@@ -375,3 +375,15 @@ make -f Makefile.tegra tegra-verify-package
 - 归档内五个交付文件必须通过清单中的 SHA-256 校验。
 
 该归档只用于离线传输和复核，不会写入启动介质，也不会修改目标板的 U-Boot 或 extlinux 配置。
+
+## 27. Phase 82：归档传输完整性
+
+`tegra-package` 在 tar 归档旁生成：
+
+```text
+bin_tegra/avisor-tegra234-deploy.tar.sha256
+```
+
+旁路清单只允许一条小写 SHA-256 记录，文件名必须精确指向 `avisor-tegra234-deploy.tar`，不得包含目录。`tegra-verify-package` 在打开 tar 并检查成员之前先验证该记录和整个归档的 SHA-256；归档被截断、替换或传输损坏时会立即失败。通过整体校验后，仍继续执行 Phase 81 的成员白名单、路径类型和归档内清单复核。
+
+该 SHA-256 文件用于发现传输错误和意外修改，不提供数字签名或来源认证。归档和旁路清单必须一起交付。

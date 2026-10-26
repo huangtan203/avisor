@@ -24,6 +24,7 @@ TEGRA_UBOOT_SCRIPT := $(TEGRA_DEPLOY_DIR)/boot/avisor/avisor-boot.cmd
 TEGRA_BOOT_CONTRACT := $(TEGRA_DEPLOY_DIR)/boot/avisor/boot-contract.txt
 TEGRA_MANIFEST := $(TEGRA_DEPLOY_DIR)/boot/avisor/manifest.sha256
 TEGRA_DEPLOY_ARCHIVE := $(OUTDIR)/avisor-tegra234-deploy.tar
+TEGRA_DEPLOY_ARCHIVE_SHA256 := $(TEGRA_DEPLOY_ARCHIVE).sha256
 
 include Makefile.virt
 
@@ -111,8 +112,12 @@ tegra-verify-deploy:
 
 tegra-package: tegra-preflight tegra-verify-deploy
 	@tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime='UTC 1970-01-01' -cf $(TEGRA_DEPLOY_ARCHIVE) -C $(TEGRA_DEPLOY_DIR) $(TEGRA_IMAGE_DEPLOY_REL) $(TEGRA_DTB_DEPLOY_REL) boot/avisor/avisor-boot.cmd boot/extlinux/avisor.conf.fragment boot/avisor/boot-contract.txt boot/avisor/manifest.sha256
+	@cd $(OUTDIR) && sha256sum $(notdir $(TEGRA_DEPLOY_ARCHIVE)) > $(notdir $(TEGRA_DEPLOY_ARCHIVE_SHA256))
 	@echo "Tegra deployment archive generated: $(TEGRA_DEPLOY_ARCHIVE)"
 
 tegra-verify-package:
 	@test -f "$(TEGRA_DEPLOY_ARCHIVE)" || { echo "error: deployment archive is missing; run tegra-package first"; exit 1; }
+	@test -f "$(TEGRA_DEPLOY_ARCHIVE_SHA256)" || { echo "error: archive checksum is missing; run tegra-package first"; exit 1; }
+	@python3 -c 'import pathlib,re; checksum=pathlib.Path("$(TEGRA_DEPLOY_ARCHIVE_SHA256)").read_text().splitlines(); assert len(checksum)==1, "archive checksum must contain exactly one entry"; match=re.fullmatch(r"([0-9a-f]{64})  ([^/]+)",checksum[0]); assert match and match.group(2)==pathlib.Path("$(TEGRA_DEPLOY_ARCHIVE)").name, "invalid archive checksum entry"'
+	@cd $(OUTDIR) && sha256sum -c $(notdir $(TEGRA_DEPLOY_ARCHIVE_SHA256))
 	@python3 -c 'import hashlib,pathlib,tarfile; archive=pathlib.Path("$(TEGRA_DEPLOY_ARCHIVE)"); expected={"$(TEGRA_IMAGE_DEPLOY_REL)","$(TEGRA_DTB_DEPLOY_REL)","boot/avisor/avisor-boot.cmd","boot/extlinux/avisor.conf.fragment","boot/avisor/boot-contract.txt","boot/avisor/manifest.sha256"}; tf=tarfile.open(archive); members=tf.getmembers(); names={m.name for m in members if m.isfile()}; assert names==expected, (names,expected); assert all(not pathlib.PurePosixPath(m.name).is_absolute() and ".." not in pathlib.PurePosixPath(m.name).parts for m in members), "unsafe archive path"; assert all(m.isfile() or m.isdir() for m in members), "archive contains unsupported member"; manifest=tf.extractfile("boot/avisor/manifest.sha256").read().decode().splitlines(); entries=dict(line.split("  ",1)[::-1] for line in manifest); assert set(entries)==expected-{"boot/avisor/manifest.sha256"}, (set(entries),expected); assert all(hashlib.sha256(tf.extractfile(name).read()).hexdigest()==digest for name,digest in entries.items()), "archive checksum mismatch"; print("Tegra deployment archive verified:",archive,"files=",len(names))'
