@@ -26,6 +26,15 @@ TEGRA_MANIFEST := $(TEGRA_DEPLOY_DIR)/boot/avisor/manifest.sha256
 TEGRA_DEPLOY_ARCHIVE := $(OUTDIR)/avisor-tegra234-deploy.tar
 TEGRA_DEPLOY_ARCHIVE_SHA256 := $(TEGRA_DEPLOY_ARCHIVE).sha256
 
+ifneq ($(findstring $$,$(value TEGRA_IMAGE_PATH)),)
+$(error TEGRA_IMAGE_PATH must not contain dollar signs)
+endif
+ifneq ($(findstring $$,$(value TEGRA_DTB_PATH)),)
+$(error TEGRA_DTB_PATH must not contain dollar signs)
+endif
+
+export TEGRA_DTB_PATH TEGRA_IMAGE_PATH
+
 include Makefile.virt
 
 .PHONY: tegra-image verify-layout tegra-dtb-check tegra-path-check tegra-uboot-args-check tegra-boot-contract tegra-boot-artifacts-check extlinux-package uboot-package tegra-preflight tegra-verify-deploy tegra-package tegra-verify-package
@@ -37,7 +46,7 @@ verify-layout: tegra-image
 	@python3 -c 'import pathlib,struct; p=pathlib.Path("$(OUTDIR)/Image"); d=p.read_bytes()[:64]; assert len(d)==64; off,size,flags=struct.unpack_from("<QQQ",d,8); magic=struct.unpack_from("<I",d,56)[0]; assert off==0x80000, hex(off); assert size>64 and size<=p.stat().st_size, (size,p.stat().st_size); assert flags==0, hex(flags); assert magic==0x644d5241, hex(magic); print("Tegra arm64 Image verified: entry=0x80080000 offset=0x%x size=%d" % (off,size))'
 
 tegra-path-check:
-	@python3 -c 'import pathlib; paths=[pathlib.PurePosixPath("$(TEGRA_IMAGE_PATH)"),pathlib.PurePosixPath("$(TEGRA_DTB_PATH)")]; assert all(p.is_absolute() for p in paths), "deployment paths must be absolute"; assert all(".." not in p.parts for p in paths), "deployment paths must not contain .."; assert len(set(paths))==2, "Image and DTB deployment paths must be distinct"; reserved={pathlib.PurePosixPath("/boot/avisor/avisor-boot.cmd"),pathlib.PurePosixPath("/boot/extlinux/avisor.conf.fragment")}; assert not any(p in reserved for p in paths), "deployment path conflicts with generated boot metadata"; print("Tegra deployment paths verified:", "$(TEGRA_IMAGE_PATH)", "$(TEGRA_DTB_PATH)")'
+	@python3 -c 'import os,pathlib,re; raw=[os.environ["TEGRA_IMAGE_PATH"],os.environ["TEGRA_DTB_PATH"]]; paths=[pathlib.PurePosixPath(value) for value in raw]; assert all(value.startswith("/") and value==path.as_posix() for value,path in zip(raw,paths)), "deployment paths must be canonical absolute POSIX paths"; assert all(len(path.parts)>1 and all(part not in {".",".."} for part in path.parts) for path in paths), "deployment paths must name files without dot components"; assert all(re.fullmatch(r"/[A-Za-z0-9._/+\-]+",value) for value in raw), "deployment paths contain unsafe boot-script characters"; assert len(set(paths))==2, "Image and DTB deployment paths must be distinct"; reserved={pathlib.PurePosixPath("/boot/avisor/avisor-boot.cmd"),pathlib.PurePosixPath("/boot/avisor/boot-contract.txt"),pathlib.PurePosixPath("/boot/avisor/manifest.sha256"),pathlib.PurePosixPath("/boot/extlinux/avisor.conf.fragment")}; assert not any(path in reserved for path in paths), "deployment path conflicts with generated boot metadata"; print("Tegra deployment paths verified:",*raw)'
 
 tegra-uboot-args-check:
 	@python3 -c 'import re; interface="$(TEGRA_UBOOT_INTERFACE)"; device="$(TEGRA_UBOOT_DEVICE)"; partition="$(TEGRA_UBOOT_PARTITION)"; assert interface in {"mmc","usb","nvme"}, "unsupported TEGRA_UBOOT_INTERFACE"; assert re.fullmatch(r"[0-9]+",device), "TEGRA_UBOOT_DEVICE must be a decimal number"; assert re.fullmatch(r"[0-9]+",partition), "TEGRA_UBOOT_PARTITION must be a decimal number"; assert int(device)>=0 and int(partition)>0, "invalid U-Boot device or partition"; print("Tegra U-Boot arguments verified:",interface,device+":"+partition)'

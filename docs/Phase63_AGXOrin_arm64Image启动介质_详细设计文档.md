@@ -387,3 +387,14 @@ bin_tegra/avisor-tegra234-deploy.tar.sha256
 旁路清单只允许一条小写 SHA-256 记录，文件名必须精确指向 `avisor-tegra234-deploy.tar`，不得包含目录。`tegra-verify-package` 在打开 tar 并检查成员之前先验证该记录和整个归档的 SHA-256；归档被截断、替换或传输损坏时会立即失败。通过整体校验后，仍继续执行 Phase 81 的成员白名单、路径类型和归档内清单复核。
 
 该 SHA-256 文件用于发现传输错误和意外修改，不提供数字签名或来源认证。归档和旁路清单必须一起交付。
+
+## 28. Phase 83：部署路径规范强化
+
+`tegra-path-check` 进一步收紧 `TEGRA_IMAGE_PATH` 和 `TEGRA_DTB_PATH`：
+
+- 必须是规范化的绝对 POSIX 路径，不能含有 `.`、`..`、重复斜杠或尾部斜杠；
+- 必须包含实际文件名，不能只是目录；
+- 只能使用可安全写入 U-Boot/extlinux 配置的 ASCII 路径字符；
+- 不能覆盖 `avisor-boot.cmd`、`boot-contract.txt`、`manifest.sha256` 或 extlinux 片段。
+
+这样自定义 Image/DTB 路径不会覆盖生成的部署元数据，也不会把空格、控制字符或 shell 特殊字符注入启动产物。
