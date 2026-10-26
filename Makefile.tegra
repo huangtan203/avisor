@@ -25,7 +25,7 @@ TEGRA_MANIFEST := $(TEGRA_DEPLOY_DIR)/boot/avisor/manifest.sha256
 
 include Makefile.virt
 
-.PHONY: tegra-image verify-layout tegra-dtb-check extlinux-package uboot-package tegra-preflight tegra-verify-deploy
+.PHONY: tegra-image verify-layout tegra-dtb-check tegra-path-check extlinux-package uboot-package tegra-preflight tegra-verify-deploy
 tegra-image: kernel8.img
 	cp $(OUTDIR)/kernel8.img $(OUTDIR)/Image
 
@@ -33,12 +33,15 @@ verify-layout: tegra-image
 	@test "$$($(GNU_TOOLS)-nm -n $(BUILD_DIR)/kernel8.elf | awk '$$3 == "_start" { print $$1 }')" = "0000000080080000"
 	@python3 -c 'import pathlib,struct; p=pathlib.Path("$(OUTDIR)/Image"); d=p.read_bytes()[:64]; assert len(d)==64; off,size,flags=struct.unpack_from("<QQQ",d,8); magic=struct.unpack_from("<I",d,56)[0]; assert off==0x80000, hex(off); assert size>64 and size<=p.stat().st_size, (size,p.stat().st_size); assert flags==0, hex(flags); assert magic==0x644d5241, hex(magic); print("Tegra arm64 Image verified: entry=0x80080000 offset=0x%x size=%d" % (off,size))'
 
+tegra-path-check:
+	@python3 -c 'import pathlib; paths=[pathlib.PurePosixPath("$(TEGRA_IMAGE_PATH)"),pathlib.PurePosixPath("$(TEGRA_DTB_PATH)")]; assert all(p.is_absolute() for p in paths), "deployment paths must be absolute"; assert all(".." not in p.parts for p in paths), "deployment paths must not contain .."; assert len(set(paths))==2, "Image and DTB deployment paths must be distinct"; reserved={pathlib.PurePosixPath("/boot/avisor/avisor-boot.cmd"),pathlib.PurePosixPath("/boot/extlinux/avisor.conf.fragment")}; assert not any(p in reserved for p in paths), "deployment path conflicts with generated boot metadata"; print("Tegra deployment paths verified:", "$(TEGRA_IMAGE_PATH)", "$(TEGRA_DTB_PATH)")'
+
 tegra-dtb-check:
 	@test -n "$(strip $(TEGRA_DTB_SOURCE))" || { echo "error: set TEGRA_DTB_SOURCE to the board DTB file"; exit 1; }
 	@test -f "$(TEGRA_DTB_SOURCE)" || { echo "error: DTB source does not exist: $(TEGRA_DTB_SOURCE)"; exit 1; }
 	@python3 -c 'import pathlib,struct; p=pathlib.Path("$(TEGRA_DTB_SOURCE)"); d=p.read_bytes(); assert len(d)>=40, "DTB is shorter than the FDT header"; magic,total,off_struct,off_strings,off_rsvmap,version,last,boot_cpuid,size_strings,size_struct=struct.unpack_from(">10I",d,0); assert magic==0xd00dfeed, hex(magic); assert 40<=total<=len(d), (total,len(d)); assert version>=17 and last<=version, (version,last); assert off_struct+size_struct<=total and off_strings+size_strings<=total; text=d[:total].decode("latin1","ignore"); required=("nvidia,tegra234","arm,gic-v3","arm,armv8-timer","nvidia,tegra194-hsuart"); missing=[item for item in required if item not in text]; assert not missing, "DTB missing compatible markers: "+", ".join(missing); assert "psci" in text, "DTB missing PSCI node"; print("Tegra234 DTB contract verified:",p,"bytes=",total)'
 
-extlinux-package: verify-layout tegra-dtb-check
+extlinux-package: verify-layout tegra-path-check tegra-dtb-check
 	@test -n "$(strip $(TEGRA_DTB_SOURCE))" || { echo "error: set TEGRA_DTB_SOURCE to the board DTB file"; exit 1; }
 	@case "$(TEGRA_DTB_PATH)" in /*) ;; *) echo "error: TEGRA_DTB_PATH must be an absolute target path"; exit 1;; esac
 	@case "$(TEGRA_IMAGE_PATH)" in /*) ;; *) echo "error: TEGRA_IMAGE_PATH must be an absolute target path"; exit 1;; esac
@@ -55,7 +58,7 @@ extlinux-package: verify-layout tegra-dtb-check
 	@python3 -c 'import pathlib; p=pathlib.Path("$(TEGRA_EXTLINUX_FRAGMENT)"); s=p.read_text(); assert "LINUX $(TEGRA_IMAGE_PATH)\n" in s; assert "FDT $(TEGRA_DTB_PATH)\n" in s; print("Tegra extlinux package verified:", p)'
 	@echo "Merge $(TEGRA_EXTLINUX_FRAGMENT) into the board extlinux.conf; preserve its recovery entry."
 
-uboot-package: verify-layout tegra-dtb-check
+uboot-package: verify-layout tegra-path-check tegra-dtb-check
 	@test -n "$(strip $(TEGRA_DTB_SOURCE))" || { echo "error: set TEGRA_DTB_SOURCE to the board DTB file"; exit 1; }
 	@test -f "$(TEGRA_DTB_SOURCE)" || { echo "error: DTB source does not exist: $(TEGRA_DTB_SOURCE)"; exit 1; }
 	@case "$(TEGRA_UBOOT_INTERFACE)" in mmc|usb|nvme) ;; *) echo "error: unsupported TEGRA_UBOOT_INTERFACE"; exit 1;; esac
@@ -73,7 +76,7 @@ uboot-package: verify-layout tegra-dtb-check
 	@python3 -c 'import pathlib; p=pathlib.Path("$(TEGRA_UBOOT_SCRIPT)"); s=p.read_text(); assert "fatload $(TEGRA_UBOOT_INTERFACE) $(TEGRA_UBOOT_DEVICE):$(TEGRA_UBOOT_PARTITION) $(TEGRA_IMAGE_LOAD_ADDR) $(TEGRA_IMAGE_PATH)\n" in s; assert "booti $(TEGRA_IMAGE_LOAD_ADDR) - $(TEGRA_DTB_LOAD_ADDR)\n" in s; print("U-Boot script verified:", p)'
 	@echo "Review $(TEGRA_UBOOT_SCRIPT) before executing it; keep a recovery boot entry."
 
-tegra-preflight: verify-layout tegra-dtb-check uboot-package extlinux-package
+tegra-preflight: verify-layout tegra-path-check tegra-dtb-check uboot-package extlinux-package
 	@python3 -c 'import pathlib; p=pathlib.Path("$(TEGRA_UBOOT_SCRIPT)"); s=p.read_text(); assert s.endswith("booti $(TEGRA_IMAGE_LOAD_ADDR) - $(TEGRA_DTB_LOAD_ADDR)\n"); print("Tegra preflight passed:"); print("  Image: $(OUTDIR)/Image"); print("  DTB: $(TEGRA_DTB_SOURCE) -> $(TEGRA_DTB_PATH)"); print("  entry: 0x80080000 (load $(TEGRA_IMAGE_LOAD_ADDR))"); print("  U-Boot: $(TEGRA_UBOOT_INTERFACE) $(TEGRA_UBOOT_DEVICE):$(TEGRA_UBOOT_PARTITION)")'
 	@python3 -c 'import hashlib,pathlib; root=pathlib.Path("$(TEGRA_DEPLOY_DIR)"); files=[pathlib.Path("$(TEGRA_IMAGE_DEPLOY_REL)"),pathlib.Path("$(TEGRA_DTB_DEPLOY_REL)"),pathlib.Path("boot/avisor/avisor-boot.cmd"),pathlib.Path("boot/extlinux/avisor.conf.fragment")]; assert len(set(files))==4, "deployment paths must be distinct"; out=pathlib.Path("$(TEGRA_MANIFEST)"); lines=[]; [lines.append("%s  %s" % (hashlib.sha256((root/f).read_bytes()).hexdigest(),f.as_posix())) for f in files]; out.write_text("\n".join(lines)+"\n"); print("Deployment manifest generated:",out)'
 	@echo "Review deployment files under $(TEGRA_DEPLOY_DIR) before copying them to the target."

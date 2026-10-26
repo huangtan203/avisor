@@ -315,3 +315,7 @@ make -f Makefile.tegra tegra-verify-deploy
 ## 19. Phase 74：自定义部署路径一致性
 
 `TEGRA_IMAGE_PATH` 和 `TEGRA_DTB_PATH` 可以覆盖目标系统中的默认路径。Phase 74 让部署文件的相对路径、SHA-256 清单和 `tegra-verify-deploy` 使用同一组配置，不再硬编码默认路径；同时拒绝 Image、DTB、U-Boot 脚本或 extlinux 片段使用重复的部署路径。
+
+## 20. Phase 75：部署路径遍历防护
+
+新增 `tegra-path-check`，统一要求 Image 和 DTB 目标路径为绝对 POSIX 路径、互不相同且不包含 `..`。同时拒绝与生成的 U-Boot 脚本和 extlinux 片段路径冲突，避免自定义参数将文件写出 `bin_tegra/deploy` 或覆盖启动元数据。
