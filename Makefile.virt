@@ -15,12 +15,13 @@ GNU_OBJDUMP = $(GNU_TOOLS)-objdump
 INC_DIR = include
 
 # 编译选项
-# -DPLATFORM_VIRT=1 标记当前构建的是 virt 平台
-C_OPS = -Wall -nostdlib -nostartfiles -ffreestanding -I$(INC_DIR) -mgeneral-regs-only -DPLATFORM_VIRT=1 -g
-ASM_OPS = -I$(INC_DIR) -DPLATFORM_VIRT=1 -g
+# PLATFORM_DEFINES 可由板级包装 Makefile 扩展。
+PLATFORM_DEFINES ?= -DPLATFORM_VIRT=1
+C_OPS = -Wall -nostdlib -nostartfiles -ffreestanding -I$(INC_DIR) -mgeneral-regs-only $(PLATFORM_DEFINES) -g
+ASM_OPS = -I$(INC_DIR) $(PLATFORM_DEFINES) -g
 
-BUILD_DIR = build_virt
-OUTDIR = bin_virt
+BUILD_DIR ?= build_virt
+OUTDIR ?= bin_virt
 QEMU_SERIAL_LOG ?= /tmp/avisor-qemu.log
 
 # Guest 镜像（Phase 2）
@@ -99,8 +100,8 @@ OBJ_FILES += $(ASM_FILES:%.S=$(BUILD_DIR)/%_s.o)
 DEP_FILES = $(OBJ_FILES:%.o=%.d)
 -include $(DEP_FILES)
 
-# 链接脚本
-LINKER_FILE = $(HV_DIR)/boards/virt/linker_virt.ld
+# 链接脚本（板级包装 Makefile 可覆盖）
+LINKER_FILE ?= $(HV_DIR)/boards/virt/linker_virt.ld
 
 # 构建镜像
 kernel8.img: $(LINKER_FILE) $(OBJ_FILES)

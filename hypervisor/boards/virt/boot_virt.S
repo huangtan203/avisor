@@ -54,13 +54,30 @@
 .section ".text.boot"
 .globl _start
 
+#ifdef PLATFORM_TEGRA
+/* arm64 Image header：供 U-Boot booti/extlinux 识别，入口分支跨过 64 字节头。 */
+_start:
+    b       .Lprimary_entry
+    .word   0
+    .quad   0x80000
+    .quad   image_payload_end - _start
+    .quad   0
+    .quad   0
+    .quad   0
+    .quad   0
+    .word   0x644d5241
+    .word   0
+.Lprimary_entry:
+#else
+_start:
+#endif
+
 /* C 语言中定义的 SMP 启动标志和 DTB 传递槽位 */
 .extern smp_boot_flag
 .extern platform_dtb_address
 .extern platform_dtb_address_alt
 .extern platform_cpu_mpidr
 
-_start:
     /* 兼容两种启动约定：部分固件把 DTB 放在 x0，AArch64 Linux/QEMU
      * 启动约定通常把 DTB 放在 x2。QEMU -kernel 未传 DTB 时两者均无效。 */
     mov x20, x0
@@ -382,11 +399,11 @@ __create_page_tables:
     orr x4, x4, #MM_TYPE_PAGE_TABLE
     str x4, [x1]               /* PUD[0] = MMIO PMD 基址 | TABLE */
 
-    /* ---- 建立 PUD[1] -> DRAM PMD 链接 ---- */
-    /* PUD[1] 对应 0x40000000 ~ 0x7FFFFFFF (1~2GB) */
+    /* ---- 建立 bootstrap DRAM 所在 PUD entry -> DRAM PMD 链接 ---- */
     mov x4, x2
     orr x4, x4, #MM_TYPE_PAGE_TABLE
-    str x4, [x1, #8]           /* PUD[1] = DRAM PMD 基址 | TABLE (每个 entry 8 字节) */
+    ldr x5, =(VIRT_DRAM_BASE >> PUD_SHIFT)
+    str x4, [x1, x5, lsl #3]
 
     /* ---- 填充 DRAM PMD 表 ---- */
     /* 虚拟地址范围：0x40000000 ~ 0x40000000 + PHYS_MEMORY_SIZE - 2MB

@@ -979,10 +979,12 @@ void platform_early_probe(void)
 				     VIRT_MMIO_SIZE);
 		if (platform_current.memory_config_valid && platform_current.mmio_config_valid) {
 			virt_uart_base = VA_START + platform_current.uart_base;
-			virt_gicd_base = VA_START + platform_current.gicd_base;
-			virt_gicr_base = VA_START + platform_current.gicr_base;
 			virt_gits_base = VA_START + platform_current.gits_base;
 		}
+	}
+	if (platform_current.interrupt_config_valid) {
+		virt_gicd_base = VA_START + platform_current.gicd_base;
+		virt_gicr_base = VA_START + platform_current.gicr_base;
 	}
 
 	if (!platform_runtime_config_valid()) {

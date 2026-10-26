@@ -1,0 +1,17 @@
+# Tegra234 / Jetson AGX Orin bring-up image.
+# This reuses the virt board drivers in a restricted, DTB-driven CPU0 mode.
+
+PLATFORM_DEFINES := -DPLATFORM_VIRT=1 -DPLATFORM_TEGRA=1
+BUILD_DIR := build_tegra
+OUTDIR := bin_tegra
+LINKER_FILE := hypervisor/boards/virt/linker_tegra.ld
+
+include Makefile.virt
+
+.PHONY: tegra-image verify-layout
+tegra-image: kernel8.img
+	cp $(OUTDIR)/kernel8.img $(OUTDIR)/Image
+
+verify-layout: tegra-image
+	@test "$$($(GNU_TOOLS)-nm -n $(BUILD_DIR)/kernel8.elf | awk '$$3 == "_start" { print $$1 }')" = "0000000080080000"
+	@python3 -c 'import pathlib,struct; p=pathlib.Path("$(OUTDIR)/Image"); d=p.read_bytes()[:64]; assert len(d)==64; off,size,flags=struct.unpack_from("<QQQ",d,8); magic=struct.unpack_from("<I",d,56)[0]; assert off==0x80000, hex(off); assert size>64 and size<=p.stat().st_size, (size,p.stat().st_size); assert flags==0, hex(flags); assert magic==0x644d5241, hex(magic); print("Tegra arm64 Image verified: entry=0x80080000 offset=0x%x size=%d" % (off,size))'

@@ -109,23 +109,42 @@ extern void secondary_psci_entry(void);
  */
 void hypervisor_main()
 {
-    /* 1. 先用 QEMU 兼容基址开启串口，保证探针可以输出诊断。 */
+    /* QEMU 可以先使用固定 PL011；Tegra 必须等 DTB 映射发布后再访问 UART。 */
+#ifndef PLATFORM_TEGRA
     uart_init();
+#endif
     /* 2. 探测平台并覆盖有效 DTB 提供的运行时基址。 */
     platform_early_probe();
     if (platform_apply_runtime_mappings() == 0)
         printf("[platform] stage1-map=dtb banks=%u tables=%u\n",
                platform_current.memory_bank_count,
                platform_current.runtime_table_count);
-    else
+    else {
+#ifndef PLATFORM_TEGRA
         printf("[platform] stage1-map=fixed-layout\n");
+#else
+        for (;;)
+            asm volatile("wfe");
+#endif
+    }
     uart_init();
     if (!platform_full_bringup_supported()) {
         printf("[platform] bring-up only: QEMU devices and guests are disabled\n");
-        printf("[platform] UART=%p DRAM-banks=%u tables=%u\n",
+        printf("[platform] UART=%p DRAM-banks=%u tables=%u irq-config=%s\n",
                (void *)platform_current.uart_base,
                platform_current.memory_bank_count,
-               platform_current.runtime_table_count);
+               platform_current.runtime_table_count,
+               platform_interrupt_config_valid() &&
+               platform_current.runtime_mapping_valid ? "valid" : "unavailable");
+        if (platform_interrupt_config_valid() &&
+            platform_current.runtime_mapping_valid) {
+            irq_vector_init();
+            gic_init();
+            printf("[platform] Tegra CPU0 GICv3 initialized\n");
+            timer_init();
+            printf("[platform] Tegra EL2 timer enabled; heartbeat active\n");
+            enable_irq();
+        }
         for (;;)
             asm volatile("wfe");
     }

@@ -97,8 +97,9 @@ void handle_timer_irq(void)
                hyp_tick_count[cpu], cpu);
     }
 
-    /* 调度器的 tick 函数（可能触发任务调度） */
-    timer_tick();
+    /* Tegra bring-up-only 尚未初始化调度器，只验证 EL2 timer 心跳。 */
+    if (platform_full_bringup_supported())
+        timer_tick();
 }
 
 /*

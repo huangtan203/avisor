@@ -30,8 +30,12 @@
 #define VIRT_RTC_BASE      0x09010000UL   /* PL031 RTC */
 #define VIRT_GPIO_BASE     0x09030000UL   /* PL061 GPIO */
 
-/* 主内存起始地址 */
+/* bootstrap 主内存起始地址；Tegra 独立镜像由固件加载到 0x80080000。 */
+#ifdef PLATFORM_TEGRA
+#define VIRT_DRAM_BASE     0x80000000UL
+#else
 #define VIRT_DRAM_BASE     0x40000000UL
+#endif
 
 /* MMIO 外设区域 */
 #define VIRT_MMIO_BASE     0x08000000UL   /* MMIO 外设起始物理地址 */
