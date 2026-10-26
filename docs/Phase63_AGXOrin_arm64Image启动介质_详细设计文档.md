@@ -196,3 +196,65 @@ booti 0x80000000 - 0x88000000
 ```
 
 该脚本只覆盖 `mmc`、`usb` 和 `nvme` 三类介质的命令模板；它不会自动执行 `saveenv`、不会写入启动分区，也不会替换恢复项。Image 加载地址 `0x80000000` 与 DTB 加载地址 `0x88000000` 是模板默认值，实际板卡必须确认没有覆盖固件、内核或其他保留内存。
+
+## 12. Phase 67：U-Boot 加载地址安全校验
+
+`uboot-package` 在生成命令前读取 arm64 Image header 中的 `text_offset` 和 `image_size`，计算实际占用区间：
+
+```text
+image_end = TEGRA_IMAGE_LOAD_ADDR + text_offset + image_size
+```
+
+构建期强制满足：
+
+- `TEGRA_IMAGE_LOAD_ADDR == 0x80000000`，保证 `booti` 按 `text_offset=0x80000` 将入口放到链接地址 `0x80080000`；
+- `TEGRA_DTB_LOAD_ADDR` 按 4KB 对齐；
+- `TEGRA_DTB_LOAD_ADDR >= image_end`，避免 DTB 与 Image 加载、展开后的运行区间重叠。
+
+不满足任一条件时，`uboot-package` 立即失败且不会生成新的启动脚本。该校验只覆盖 aVisor Image 与 DTB 之间的关系；目标板固件保留区、可信固件和其他动态分配仍需在实机启动前确认。
+
+## 13. Phase 68：Tegra234 DTB 平台契约预检
+
+新增 `tegra-dtb-check` 目标，对交付 DTB 执行 FDT header 边界检查，并要求 DTB 内容包含当前 CPU0 bring-up 所依赖的平台标记：
+
+```sh
+make -f Makefile.tegra tegra-dtb-check \\
+  TEGRA_DTB_SOURCE=/path/to/tegra234.dtb
+```
+
+预检要求：
+
+- FDT magic、版本、结构块和字符串块边界合法；
+- 包含 `nvidia,tegra234`；
+- 包含 `arm,gic-v3`；
+- 包含 `arm,armv8-timer`；
+- 包含 `nvidia,tegra194-hsuart`；
+- 包含 PSCI 节点标记。
+
+`extlinux-package` 和 `uboot-package` 都会自动依赖该预检。它只检查 DTB 的静态交付契约，不替代运行时对 `reg`、interrupt cells、GICR stride、PSCI method 和实际串口地址的解析；这些仍需使用真实 AGX Orin DTB 启动验证。
+
+## 14. Phase 69：CPU0 bring-up DTB 审计日志
+
+DTB 映射成功并启用 Tegra HSUART 后，bring-up-only 路径输出一组只读审计信息：
+
+- CPU 数量；
+- UART、GICD、GICR 基址和大小；
+- GICR stride；
+- hypervisor/virtual timer PPI；
+- PSCI 方法；
+- reserved-memory 数量；
+- page-pool candidate 是否安全。
+
+该日志不会启用 Guest、PCI、ITS、CPU1 或完整 scheduler 路径，也不会改变已有的 GIC/timer 门控。真实板卡首次启动时，应先保存这些审计行，再根据 `irq-config`、`runtime` 和 timer heartbeat 判断是否继续扩展硬件支持。
+
+## 15. Phase 70：固件交接诊断
+
+启动汇编现在记录 CPU0 进入入口时的异常级别，以及 DTB 参数来源：
+
+```text
+entry-el=2 source=x0
+entry-el=3 source=x0
+entry-el=2 source=x2
+```
+
+其中 `entry-el=3` 表示固件把 CPU0 交给 aVisor 时仍在 EL3，随后由入口代码降到 EL2；`entry-el=2` 表示直接从 EL2 进入。`source=x0` 是 AGX Orin 的正式 DTB 契约，`source=x2` 仅保留兼容诊断。DTB 无效时会显示 `source=none` 或 `fallback`，仍按现有平台安全路径处理，不会启用错误的 Tegra MMIO。

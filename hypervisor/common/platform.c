@@ -45,6 +45,8 @@ unsigned long virt_gicr_base = VA_START + VIRT_GICR_BASE;
 unsigned long virt_gits_base = VA_START + VIRT_GITS_BASE;
 unsigned long platform_dtb_address;
 unsigned long platform_dtb_address_alt;
+unsigned long platform_entry_el;
+unsigned long platform_dtb_source;
 unsigned long platform_cpu_mpidr[MAX_CPUS];
 
 extern char image_end[];
@@ -1007,8 +1009,12 @@ void platform_early_probe(void)
 		platform_current.timer_virt_ppi = 27;
 	}
 
-	printf("[platform] %s, dtb=%p (%s)\n", platform_current.name,
+	printf("[platform] %s, entry-el=%lu dtb=%p source=%s (%s)\n",
+	       platform_current.name,
+	       platform_entry_el,
 	       (void *)platform_current.dtb,
+	       platform_dtb_source == 0 ? "x0" :
+	       platform_dtb_source == 2 ? "x2" : "none",
 	       platform_current.dtb_valid ? "valid" : "fallback");
 	printf("[platform] cpu=%lu memory=%p+%luMB uart=%p gicd=%p gicr=%p\n",
 	       platform_current.cpu_count,

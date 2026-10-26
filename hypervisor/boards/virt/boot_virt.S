@@ -205,6 +205,7 @@ master:
      */
     mrs x0, CurrentEL
     lsr x0, x0, #2
+    mov x22, x0
     cmp x0, #3
     beq el3
     cmp x0, #2
@@ -254,6 +255,16 @@ el2_entry:
     str x20, [x0]
     adr x0, platform_dtb_address_alt
     str x21, [x0]
+    adr x0, platform_entry_el
+    str x22, [x0]
+    adr x0, platform_dtb_source
+    mov x1, #0
+    cbnz x20, .Ldtb_from_x0
+    mov x1, #2
+    cbnz x21, .Ldtb_from_x0
+    mov x1, #0
+.Ldtb_from_x0:
+    str x1, [x0]
 
     /* 保存主核完整物理 affinity，供 GICR_TYPER 匹配。 */
     adr x0, platform_cpu_mpidr

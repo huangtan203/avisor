@@ -130,6 +130,21 @@ void hypervisor_main()
     uart_init();
     if (!platform_full_bringup_supported()) {
         printf("[platform] bring-up only: QEMU devices and guests are disabled\n");
+        printf("[platform] DTB-audit cpu=%lu uart=%p+%p gicd=%p gicr=%p+%p stride=%p\n",
+               platform_current.cpu_count,
+               (void *)platform_current.uart_base,
+               (void *)platform_current.uart_size,
+               (void *)platform_current.gicd_base,
+               (void *)platform_current.gicr_base,
+               (void *)platform_current.gicr_size,
+               (void *)platform_current.gicr_stride);
+        printf("[platform] DTB-audit timer-ppi=%u/%u psci=%s reserved=%u pool=%s\n",
+               platform_current.timer_hyp_ppi,
+               platform_current.timer_virt_ppi,
+               platform_current.psci_method == PLATFORM_PSCI_SMC ? "smc" :
+               platform_current.psci_method == PLATFORM_PSCI_HVC ? "hvc" : "none",
+               platform_current.reserved_count,
+               platform_current.candidate_pool_safe ? "safe" : "unsafe");
         printf("[platform] UART=%p DRAM-banks=%u tables=%u irq-config=%s\n",
                (void *)platform_current.uart_base,
                platform_current.memory_bank_count,

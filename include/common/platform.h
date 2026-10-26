@@ -106,6 +106,8 @@ struct platform_info {
 extern struct platform_info platform_current;
 extern unsigned long platform_dtb_address;
 extern unsigned long platform_dtb_address_alt;
+extern unsigned long platform_entry_el;
+extern unsigned long platform_dtb_source;
 extern unsigned long platform_cpu_mpidr[];
 
 void platform_early_probe(void);
