@@ -26,18 +26,20 @@ TEGRA_MANIFEST := $(TEGRA_DEPLOY_DIR)/boot/avisor/manifest.sha256
 TEGRA_DEPLOY_ARCHIVE := $(OUTDIR)/avisor-tegra234-deploy.tar
 TEGRA_DEPLOY_ARCHIVE_SHA256 := $(TEGRA_DEPLOY_ARCHIVE).sha256
 
-ifneq ($(findstring $$,$(value TEGRA_IMAGE_PATH)),)
-$(error TEGRA_IMAGE_PATH must not contain dollar signs)
-endif
-ifneq ($(findstring $$,$(value TEGRA_DTB_PATH)),)
-$(error TEGRA_DTB_PATH must not contain dollar signs)
-endif
+TEGRA_INPUT_VARS := TEGRA_DTB_SOURCE TEGRA_DTB_PATH TEGRA_IMAGE_PATH TEGRA_UBOOT_INTERFACE TEGRA_UBOOT_DEVICE TEGRA_UBOOT_PARTITION TEGRA_IMAGE_LOAD_ADDR TEGRA_DTB_LOAD_ADDR
 
-export TEGRA_DTB_PATH TEGRA_IMAGE_PATH
+define reject_dollar
+ifneq ($(findstring $$$$,$(value $(1))),)
+$$(error $(1) must not contain dollar signs)
+endif
+endef
+$(foreach var,$(TEGRA_INPUT_VARS),$(eval $(call reject_dollar,$(var))))
+
+export $(TEGRA_INPUT_VARS)
 
 include Makefile.virt
 
-.PHONY: tegra-image verify-layout tegra-dtb-check tegra-path-check tegra-uboot-args-check tegra-boot-contract tegra-boot-artifacts-check extlinux-package uboot-package tegra-preflight tegra-verify-deploy tegra-package tegra-verify-package
+.PHONY: tegra-image verify-layout tegra-dtb-source-check tegra-dtb-check tegra-path-check tegra-uboot-args-check tegra-boot-contract tegra-boot-artifacts-check extlinux-package uboot-package tegra-preflight tegra-verify-deploy tegra-package tegra-verify-package
 tegra-image: kernel8.img
 	cp $(OUTDIR)/kernel8.img $(OUTDIR)/Image
 
@@ -49,10 +51,10 @@ tegra-path-check:
 	@python3 -c 'import os,pathlib,re; raw=[os.environ["TEGRA_IMAGE_PATH"],os.environ["TEGRA_DTB_PATH"]]; paths=[pathlib.PurePosixPath(value) for value in raw]; assert all(value.startswith("/") and value==path.as_posix() for value,path in zip(raw,paths)), "deployment paths must be canonical absolute POSIX paths"; assert all(len(path.parts)>1 and all(part not in {".",".."} for part in path.parts) for path in paths), "deployment paths must name files without dot components"; assert all(re.fullmatch(r"/[A-Za-z0-9._/+\-]+",value) for value in raw), "deployment paths contain unsafe boot-script characters"; assert len(set(paths))==2, "Image and DTB deployment paths must be distinct"; reserved={pathlib.PurePosixPath("/boot/avisor/avisor-boot.cmd"),pathlib.PurePosixPath("/boot/avisor/boot-contract.txt"),pathlib.PurePosixPath("/boot/avisor/manifest.sha256"),pathlib.PurePosixPath("/boot/extlinux/avisor.conf.fragment")}; assert not any(path in reserved for path in paths), "deployment path conflicts with generated boot metadata"; print("Tegra deployment paths verified:",*raw)'
 
 tegra-uboot-args-check:
-	@python3 -c 'import re; interface="$(TEGRA_UBOOT_INTERFACE)"; device="$(TEGRA_UBOOT_DEVICE)"; partition="$(TEGRA_UBOOT_PARTITION)"; assert interface in {"mmc","usb","nvme"}, "unsupported TEGRA_UBOOT_INTERFACE"; assert re.fullmatch(r"[0-9]+",device), "TEGRA_UBOOT_DEVICE must be a decimal number"; assert re.fullmatch(r"[0-9]+",partition), "TEGRA_UBOOT_PARTITION must be a decimal number"; assert int(device)>=0 and int(partition)>0, "invalid U-Boot device or partition"; print("Tegra U-Boot arguments verified:",interface,device+":"+partition)'
-	@python3 -c 'import re; values=["$(TEGRA_IMAGE_LOAD_ADDR)","$(TEGRA_DTB_LOAD_ADDR)"]; parsed=[int(value,0) for value in values]; assert all(value>0 and value%0x1000==0 for value in parsed), "U-Boot load addresses must be positive and 4K aligned"; assert parsed[0]==0x80000000, "Image load address must match the linked entry contract"; assert parsed[1]>=parsed[0], "DTB load address must not precede Image"; print("Tegra U-Boot load addresses verified:",*[hex(value) for value in parsed])'
+	@python3 -c 'import os,re; interface=os.environ["TEGRA_UBOOT_INTERFACE"]; device=os.environ["TEGRA_UBOOT_DEVICE"]; partition=os.environ["TEGRA_UBOOT_PARTITION"]; assert interface in {"mmc","usb","nvme"}, "unsupported TEGRA_UBOOT_INTERFACE"; assert re.fullmatch(r"[0-9]+",device), "TEGRA_UBOOT_DEVICE must be a decimal number"; assert re.fullmatch(r"[0-9]+",partition), "TEGRA_UBOOT_PARTITION must be a decimal number"; assert int(device)>=0 and int(partition)>0, "invalid U-Boot device or partition"; print("Tegra U-Boot arguments verified:",interface,device+":"+partition)'
+	@python3 -c 'import os,re; values=[os.environ["TEGRA_IMAGE_LOAD_ADDR"],os.environ["TEGRA_DTB_LOAD_ADDR"]]; assert all(re.fullmatch(r"0x[0-9A-Fa-f]+",value) for value in values), "U-Boot load addresses must be hexadecimal"; parsed=[int(value,16) for value in values]; assert all(value>0 and value%0x1000==0 for value in parsed), "U-Boot load addresses must be positive and 4K aligned"; assert parsed[0]==0x80000000, "Image load address must match the linked entry contract"; assert parsed[1]>=parsed[0], "DTB load address must not precede Image"; print("Tegra U-Boot load addresses verified:",*[hex(value) for value in parsed])'
 
-tegra-boot-contract:
+tegra-boot-contract: tegra-path-check tegra-uboot-args-check tegra-dtb-source-check
 	@printf '%s\n' \
 		'platform=tegra234' \
 		'entry=0x80080000' \
@@ -68,10 +70,11 @@ tegra-boot-contract:
 tegra-boot-artifacts-check: tegra-boot-contract
 	@python3 -c 'import pathlib; u=pathlib.Path("$(TEGRA_UBOOT_SCRIPT)").read_text().splitlines(); expected=["fatload $(TEGRA_UBOOT_INTERFACE) $(TEGRA_UBOOT_DEVICE):$(TEGRA_UBOOT_PARTITION) $(TEGRA_IMAGE_LOAD_ADDR) $(TEGRA_IMAGE_PATH)","fatload $(TEGRA_UBOOT_INTERFACE) $(TEGRA_UBOOT_DEVICE):$(TEGRA_UBOOT_PARTITION) $(TEGRA_DTB_LOAD_ADDR) $(TEGRA_DTB_PATH)","booti $(TEGRA_IMAGE_LOAD_ADDR) - $(TEGRA_DTB_LOAD_ADDR)"]; assert u==expected, (u,expected); e=pathlib.Path("$(TEGRA_EXTLINUX_FRAGMENT)").read_text().splitlines(); expected_ext=["LABEL avisor","      MENU LABEL aVisor Tegra234 EL2 bring-up","      LINUX $(TEGRA_IMAGE_PATH)","      FDT $(TEGRA_DTB_PATH)"]; assert e==expected_ext, (e,expected_ext); c=pathlib.Path("$(TEGRA_BOOT_CONTRACT)").read_text().splitlines(); assert c==["platform=tegra234","entry=0x80080000","image-load=$(TEGRA_IMAGE_LOAD_ADDR)","dtb-load=$(TEGRA_DTB_LOAD_ADDR)","image-path=$(TEGRA_IMAGE_PATH)","dtb-path=$(TEGRA_DTB_PATH)","uboot-interface=$(TEGRA_UBOOT_INTERFACE)","uboot-device=$(TEGRA_UBOOT_DEVICE)","uboot-partition=$(TEGRA_UBOOT_PARTITION)","dtb-source=$(TEGRA_DTB_SOURCE)"], c; print("Tegra boot artifacts whitelist verified")'
 
-tegra-dtb-check:
-	@test -n "$(strip $(TEGRA_DTB_SOURCE))" || { echo "error: set TEGRA_DTB_SOURCE to the board DTB file"; exit 1; }
-	@test -f "$(TEGRA_DTB_SOURCE)" || { echo "error: DTB source does not exist: $(TEGRA_DTB_SOURCE)"; exit 1; }
-	@python3 -c 'import pathlib,struct; p=pathlib.Path("$(TEGRA_DTB_SOURCE)"); d=p.read_bytes(); assert len(d)>=40, "DTB is shorter than the FDT header"; magic,total,off_struct,off_strings,off_rsvmap,version,last,boot_cpuid,size_strings,size_struct=struct.unpack_from(">10I",d,0); assert magic==0xd00dfeed, hex(magic); assert 40<=total<=len(d), (total,len(d)); assert version>=17 and last<=version, (version,last); assert off_struct+size_struct<=total and off_strings+size_strings<=total; text=d[:total].decode("latin1","ignore"); required=("nvidia,tegra234","arm,gic-v3","arm,armv8-timer","nvidia,tegra194-hsuart"); missing=[item for item in required if item not in text]; assert not missing, "DTB missing compatible markers: "+", ".join(missing); assert "psci" in text, "DTB missing PSCI node"; print("Tegra234 DTB contract verified:",p,"bytes=",total)'
+tegra-dtb-source-check:
+	@python3 -c 'import os,pathlib,re; raw=os.environ["TEGRA_DTB_SOURCE"]; assert raw, "set TEGRA_DTB_SOURCE to the board DTB file"; path=pathlib.Path(raw); assert path.is_absolute() and raw==path.as_posix(), "TEGRA_DTB_SOURCE must be a canonical absolute path"; assert re.fullmatch(r"/[A-Za-z0-9._/+\-]+",raw), "TEGRA_DTB_SOURCE contains unsafe characters"; assert path.is_file(), "DTB source does not exist: "+raw'
+
+tegra-dtb-check: tegra-dtb-source-check
+	@python3 -c 'import os,pathlib,struct; p=pathlib.Path(os.environ["TEGRA_DTB_SOURCE"]); d=p.read_bytes(); assert len(d)>=40, "DTB is shorter than the FDT header"; magic,total,off_struct,off_strings,off_rsvmap,version,last,boot_cpuid,size_strings,size_struct=struct.unpack_from(">10I",d,0); assert magic==0xd00dfeed, hex(magic); assert 40<=total<=len(d), (total,len(d)); assert version>=17 and last<=version, (version,last); assert off_struct+size_struct<=total and off_strings+size_strings<=total; text=d[:total].decode("latin1","ignore"); required=("nvidia,tegra234","arm,gic-v3","arm,armv8-timer","nvidia,tegra194-hsuart"); missing=[item for item in required if item not in text]; assert not missing, "DTB missing compatible markers: "+", ".join(missing); assert "psci" in text, "DTB missing PSCI node"; print("Tegra234 DTB contract verified:",p,"bytes=",total)'
 
 extlinux-package: verify-layout tegra-path-check tegra-dtb-check
 	@test -n "$(strip $(TEGRA_DTB_SOURCE))" || { echo "error: set TEGRA_DTB_SOURCE to the board DTB file"; exit 1; }

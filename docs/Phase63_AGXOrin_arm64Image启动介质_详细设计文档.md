@@ -398,3 +398,15 @@ bin_tegra/avisor-tegra234-deploy.tar.sha256
 - 不能覆盖 `avisor-boot.cmd`、`boot-contract.txt`、`manifest.sha256` 或 extlinux 片段。
 
 这样自定义 Image/DTB 路径不会覆盖生成的部署元数据，也不会把空格、控制字符或 shell 特殊字符注入启动产物。
+
+## 29. Phase 84：构建参数注入防护
+
+Tegra 构建入口统一登记 DTB 来源、目标路径、U-Boot 介质/设备/分区和加载地址参数，并在 GNU Make 解析阶段拒绝参数中的美元展开。参数校验器通过环境变量读取原始值，不再把未经验证的输入直接拼入 Python 命令文本。
+
+新增 `tegra-dtb-source-check`，要求 `TEGRA_DTB_SOURCE`：
+
+- 是存在的普通文件；
+- 使用规范化绝对路径；
+- 只包含安全 ASCII 路径字符。
+
+U-Boot 参数校验同样改为读取环境变量，并要求加载地址使用显式 `0x` 十六进制格式。`tegra-boot-contract` 在写入任何参数前依赖全部路径、DTB 来源和 U-Boot 参数检查，防止恶意或格式错误的 Make 命令行参数进入 shell、启动脚本和契约文件。
