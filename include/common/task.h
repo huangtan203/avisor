@@ -40,6 +40,8 @@ unsigned long task_stack_min_free(struct task_struct *);
 int task_stack_guard_valid(struct task_struct *);
 int create_task(loader_func_t, void *);
 int create_task_on_cpu(int cpu, loader_func_t, void *);
+int create_vcpu_on_cpu(unsigned long vmid, int vcpu_id, int cpu,
+                        loader_func_t loader, void *arg);
 void init_task_console(struct task_struct *);
 void destroy_task_aux(struct task_struct *);
 int reap_zombie_tasks(int cpu);

@@ -15,6 +15,7 @@
 #include "common/mm.h"
 #include "common/sched.h"
 #include "common/utils.h"
+#include "common/vm.h"
 
 /*
  * 平台相关的设备模型（board_ops）
@@ -158,8 +159,9 @@ static unsigned long next_vmid = 1;
 static int task_reaped_count[MAX_CPUS];
 static int task_reused_count[MAX_CPUS];
 
-/* 在指定 CPU 上创建任务（用于 SMP 场景） */
-int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
+/* 在指定 CPU 上创建 vCPU；legacy task API 由下面的 wrapper 提供。 */
+static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
+                                   int cpu, loader_func_t loader, void *arg)
 {
 	struct task_struct *p;
 	int pid;
@@ -208,8 +210,9 @@ int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 	p->priority = 1;  /* 默认优先级，和 idle task 一致 */
 	p->state = TASK_RUNNING;
 	p->counter = p->priority;
-	p->vmid = next_vmid++;  /* 全局唯一；多 vCPU VM 由调用方覆盖为相同值 */
-	p->vcpu_id = 0;
+	p->vmid = vmid;
+	p->vm = NULL;
+	p->vcpu_id = vcpu_id;
 	p->phys_cpu = cpu;
 	(void)strncpy(p->name, "VM", 36);
 
@@ -245,7 +248,28 @@ int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 		task_reused_count[cpu]++;
 	p->pid = pid;  /* pid 是 per-CPU 的，多核间可能重复 */
 
+	if (vm_attach_vcpu(p, vmid, vcpu_id) < 0) {
+		cpu_state[cpu].task[pid] = NULL;
+		while (cpu_state[cpu].nr_tasks > 1 &&
+		       !cpu_state[cpu].task[cpu_state[cpu].nr_tasks - 1])
+			cpu_state[cpu].nr_tasks--;
+		destroy_task_aux(p);
+		deallocate_page(p);
+		return -1;
+	}
+
 	return pid;
+}
+
+int create_vcpu_on_cpu(unsigned long vmid, int vcpu_id, int cpu,
+                       loader_func_t loader, void *arg)
+{
+	return create_vcpu_task_on_cpu(vmid, vcpu_id, cpu, loader, arg);
+}
+
+int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
+{
+	return create_vcpu_task_on_cpu(next_vmid++, 0, cpu, loader, arg);
 }
 
 void init_task_console(struct task_struct *tsk)
@@ -281,6 +305,7 @@ static int remove_task_slot(struct task_struct *tsk)
 		while (cpu_state[cpu].nr_tasks > 1 &&
 		       !cpu_state[cpu].task[cpu_state[cpu].nr_tasks - 1])
 			cpu_state[cpu].nr_tasks--;
+		vm_detach_vcpu(tsk);
 		destroy_task_aux(tsk);
 		deallocate_page(tsk);
 		task_reaped_count[cpu]++;

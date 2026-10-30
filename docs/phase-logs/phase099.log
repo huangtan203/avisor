@@ -1,0 +1,25 @@
+Phase 99 verification log
+=========================
+Base: 16d2796
+Branch: phase99-130-rebuild
+
+Build command:
+  make -f Makefile.virt clean
+  make -f Makefile.virt -j$(nproc)
+Result: PASS; bin_virt/kernel8.img linked successfully.
+
+Runtime command:
+  timeout 30 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase99.log
+Result: timeout exit 124 after 30 seconds; expected for the continuous hypervisor runtime.
+
+Observed checks:
+  - VM1 vCPU0/vCPU1, VM2 vCPU0/vCPU1 and dormant VM3 vCPU0 created.
+  - VM1 and VM2 virtio-net loopback tests passed.
+  - VM1 and VM2 ivshmem ping-pong tests passed.
+  - edu MSI and vITS tests passed.
+  - vSGI, vGICD/vGICR and Stage-2 guest tests passed.
+  - VM2 -> VM3 dual-vCPU live migration completed; source VM resources reclaimed.
+  - No PANIC, ASSERT or FAILED markers in the captured serial log.
+
+Baseline caveat:
+  Existing warnings in guests/el1_test/main.c and hypervisor/common/mm.c remain outside this phase's change scope.

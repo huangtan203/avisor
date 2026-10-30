@@ -22,6 +22,7 @@
 #include "common/migration.h"
 #include "common/utils.h"
 #include "common/task.h"
+#include "common/vm.h"
 #include "common/smp.h"
 #include "common/ksm.h"
 #include "common/debug.h"
@@ -510,7 +511,11 @@ int migration_finish(struct task_struct *src)
 	       sizeof(mig_saved_vcpu1_name));
 
 	/* 3. 准备切换 vCPU1 身份，但尚未提交事务。 */
-	vcpu1->vmid = mig_dst->vmid;
+	if (vm_rebind_vcpu(vcpu1, mig_dst->vmid, vcpu1->vcpu_id) < 0) {
+		mig_walk(src, MIG_OP_SET_AF);
+		smp_vm_txn_commit();
+		return -1;
+	}
 	vcpu1->mm = mig_dst->mm;
 	vcpu1->board_data = mig_dst->board_data;
 	(void)strncpy(vcpu1->name, "vm3-cpu1", 36);
@@ -521,7 +526,9 @@ int migration_finish(struct task_struct *src)
 	if (dirty < 0 || mig_fail_finish_once) {
 		mig_fail_finish_once = 0;
 		memcpy(&vcpu1->mm, &mig_saved_vcpu1_mm, sizeof(vcpu1->mm));
-		vcpu1->vmid = mig_saved_vcpu1_vmid;
+		if (vm_rebind_vcpu(vcpu1, mig_saved_vcpu1_vmid,
+		                   vcpu1->vcpu_id) < 0)
+			PANIC("migration: failed to restore vCPU registry");
 		vcpu1->board_data = mig_saved_vcpu1_board_data;
 		memcpy(vcpu1->name, mig_saved_vcpu1_name,
 		       sizeof(mig_saved_vcpu1_name));

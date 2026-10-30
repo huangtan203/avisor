@@ -265,13 +265,10 @@ void hypervisor_main()
         /* VM1 主 vCPU：创建在 CPU0，vmid=1, vcpu0 */
         struct task_struct *vm1_master = NULL;
         {
-            int pid = create_task_on_cpu(0, embedded_binary_loader, &global_guest_args);
+            int pid = create_vcpu_on_cpu(1, 0, 0, embedded_binary_loader,
+                                         &global_guest_args);
             if (pid < 0)
                 PANIC("failed to create VM1 vcpu0");
-            cpu0_tasks[pid]->vmid = 1;
-            cpu0_tasks[pid]->vcpu_id = 0;
-            cpu0_tasks[pid]->phys_cpu = 0;
-            cpu0_tasks[pid]->cpu_sysregs.mpidr_el1 = 0;
             /* 给 Guest 更高调度优先级 */
             cpu0_tasks[pid]->priority = 10;
             cpu0_tasks[pid]->counter = 10;
@@ -288,16 +285,10 @@ void hypervisor_main()
                 .master = vm1_master,
                 .entry_point = 0x40000000,
             };
-            int pid = create_task_on_cpu(1, shared_vm_loader, &global_vm1_shared_args);
+            int pid = create_vcpu_on_cpu(1, 1, 1, shared_vm_loader,
+                                         &global_vm1_shared_args);
             if (pid < 0)
                 PANIC("failed to create VM1 vcpu1");
-            cpu1_tasks[pid]->vmid = 1;
-            cpu1_tasks[pid]->vcpu_id = 1;
-            cpu1_tasks[pid]->phys_cpu = 1;
-            /* 同步虚拟 MPIDR（Guest 读 mpidr_el1 时返回这个值）
-             * 注意：create_task_on_cpu 内部已经用 vcpu_id=0 初始化了 mpidr，
-             * 这里改了 vcpu_id 必须同步改 mpidr，否则 Guest 读到的还是 0。 */
-            cpu1_tasks[pid]->cpu_sysregs.mpidr_el1 = 1;
             cpu1_tasks[pid]->priority = 10;
             cpu1_tasks[pid]->counter = 10;
             (void)strncpy(cpu1_tasks[pid]->name, "vm1-cpu1", 36);
@@ -309,13 +300,10 @@ void hypervisor_main()
         /* VM2 主 vCPU：创建在 CPU0，vmid=2, vcpu0 */
         struct task_struct *vm2_master = NULL;
         {
-            int pid = create_task_on_cpu(0, embedded_binary_loader, &global_guest_args);
+            int pid = create_vcpu_on_cpu(2, 0, 0, embedded_binary_loader,
+                                         &global_guest_args);
             if (pid < 0)
                 PANIC("failed to create VM2 vcpu0");
-            cpu0_tasks[pid]->vmid = 2;
-            cpu0_tasks[pid]->vcpu_id = 0;
-            cpu0_tasks[pid]->phys_cpu = 0;
-            cpu0_tasks[pid]->cpu_sysregs.mpidr_el1 = 0;
             cpu0_tasks[pid]->priority = 10;
             cpu0_tasks[pid]->counter = 10;
             (void)strncpy(cpu0_tasks[pid]->name, "vm2-cpu0", 36);
@@ -339,14 +327,10 @@ void hypervisor_main()
                 .master = vm2_master,
                 .entry_point = 0x40000000,
             };
-            int pid = create_task_on_cpu(1, shared_vm_loader, &global_vm2_shared_args);
+            int pid = create_vcpu_on_cpu(2, 1, 1, shared_vm_loader,
+                                         &global_vm2_shared_args);
             if (pid < 0)
                 PANIC("failed to create VM2 vcpu1");
-            cpu1_tasks[pid]->vmid = 2;
-            cpu1_tasks[pid]->vcpu_id = 1;
-            cpu1_tasks[pid]->phys_cpu = 1;
-            /* 同步虚拟 MPIDR（次 vCPU 返回 aff0=1） */
-            cpu1_tasks[pid]->cpu_sysregs.mpidr_el1 = 1;
             cpu1_tasks[pid]->priority = 10;
             cpu1_tasks[pid]->counter = 10;
             (void)strncpy(cpu1_tasks[pid]->name, "vm2-cpu1", 36);
@@ -357,13 +341,10 @@ void hypervisor_main()
 
         /* Phase 25: 创建 dormant 迁移目标 VM3（vmid=3，单 vCPU，等待迁移恢复） */
         {
-            int pid = create_task_on_cpu(0, migration_resume_loader, NULL);
+            int pid = create_vcpu_on_cpu(3, 0, 0, migration_resume_loader,
+                                         NULL);
             if (pid < 0)
                 PANIC("failed to create VM3 (migration target)");
-            cpu0_tasks[pid]->vmid = 3;
-            cpu0_tasks[pid]->vcpu_id = 0;
-            cpu0_tasks[pid]->phys_cpu = 0;
-            cpu0_tasks[pid]->cpu_sysregs.mpidr_el1 = 0;
             cpu0_tasks[pid]->priority = 10;
             cpu0_tasks[pid]->counter = 10;
             cpu0_tasks[pid]->state = TASK_WAITING;  /* dormant，直到迁移 FINISH 唤醒 */

@@ -32,6 +32,7 @@
 #define TASK_MM_READY 0x1
 
 struct board_ops;
+struct vm;
 
 struct cpu_context {
 	unsigned long x19;
@@ -214,6 +215,7 @@ struct task_struct {
 	long preempt_count;
 	long pid; // per-CPU 任务表内的索引
 	unsigned long vmid; // 全局 VMID（同一 VM 的多个 vCPU 共享，用于 VTTBR/TLB）
+	struct vm *vm;
 	unsigned long flags;
 	char name[36];
 	const struct board_ops *board_ops;

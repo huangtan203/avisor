@@ -29,6 +29,7 @@
 #include "boards/virt/base.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/mm.h"
+#include "common/vm.h"
 #include "common/types.h"
 #include "common/debug.h"
 #include "common/utils.h"
@@ -764,6 +765,10 @@ void virt_unregister_vcpu(int vmid, int vcpu_id)
 
 struct task_struct *virt_find_vcpu(int vmid, int vcpu_id)
 {
+    struct task_struct *vcpu = vm_find_vcpu((unsigned long)vmid, vcpu_id);
+
+    if (vcpu)
+        return vcpu;
     if (vmid < 1 || vmid > MAX_VMS_PER_BOARD ||
         vcpu_id < 0 || vcpu_id >= MAX_VCPUS_PER_VM)
         return NULL;
