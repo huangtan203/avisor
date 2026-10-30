@@ -229,6 +229,7 @@ struct task_struct {
 	unsigned long stack_low_water;
     int vcpu_id;    /* 虚拟 CPU ID（SMP VM 的第几个 vCPU） */
     int phys_cpu;   /* 绑定的物理 CPU ID */
+    unsigned long runtime_ticks; /* Phase 102：累计运行 tick */
 };
 
 _Static_assert(sizeof(struct task_struct) + TASK_STACK_GUARD_SIZE +
@@ -247,6 +248,9 @@ struct cpu_sched_state {
     int nr_tasks;        /* task[] 有效扫描上界；区间内允许存在 NULL 空槽 */
     int rr_start;       /* 轮转调度起点 */
     volatile unsigned int rq_lock;
+    unsigned long busy_ticks;       /* Phase 102：窗口内非 idle tick */
+    unsigned long idle_ticks;       /* Phase 102：窗口内 idle tick */
+    unsigned int load_percent;      /* Phase 102：最近窗口负载 */
     struct task_struct init_task;  /* 本核的 idle 任务 */
 };
 
@@ -311,6 +315,9 @@ struct task_struct *sched_find_vcpu(unsigned long vmid, int vcpu_id);
 int sched_runqueue_selftest(int cpu);
 int sched_migrate_current(int target_cpu);
 void sched_complete_migration(struct task_struct *tsk);
+void sched_balance_tick(int cpu);
+void sched_balance_safe_point(void);
+unsigned int sched_cpu_load(int cpu);
 extern void schedule(void);
 extern void timer_tick(void);
 extern void preempt_disable(void);
@@ -378,6 +385,7 @@ extern void sched_wait(void);
 			/* stat */ { 0 }, /* console */ { 0 },                 \
 			/* virt */ { 0 }, /* stack_low_water */ 0,             \
 			/* vcpu_id */ 0, /* phys_cpu */ 0,                     \
+			/* runtime_ticks */ 0,                                 \
 	}
 
 #endif

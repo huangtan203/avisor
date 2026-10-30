@@ -88,8 +88,9 @@ void handle_timer_irq(void)
      */
     WRITE_SYSREG(interval, CNTHP_TVAL_EL2);
 
-    /* 增加 tick 计数 */
+    /* 增加 tick 计数并采样当前 pCPU 的 busy/idle 运行时间。 */
     hyp_tick_count[cpu]++;
+    sched_balance_tick(cpu);
 
     /* 每秒打印一次（验证定时器中断在正常工作） */
     if (hyp_tick_count[cpu] % HYP_TIMER_HZ == 0) {

@@ -666,6 +666,8 @@ void handle_sync_exception(unsigned long esr, unsigned long elr,
 	case ESR_EL2_EC_HVC64:
 		current->stat.hvc_trap_count++;
 		handle_hvc64(hvc_nr);
+        if (current && current->state == TASK_RUNNING)
+            sched_balance_safe_point();
 		break;
 	case ESR_EL2_EC_TRAP_SYSTEM:
 		current->stat.sysreg_trap_count++;

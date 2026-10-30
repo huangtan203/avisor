@@ -18,6 +18,8 @@
 
 static struct task_struct init_task = INIT_TASK;
 struct cpu_sched_state cpu_state[MAX_CPUS];
+static volatile int balance_target[MAX_CPUS] = { -1, -1 };
+static unsigned int balance_cooldown[MAX_CPUS];
 
 static void rq_lock(int cpu)
 {
@@ -236,6 +238,72 @@ void sched_complete_migration(struct task_struct *tsk)
         return;
     __atomic_store_n(&tsk->state, TASK_RUNNING, __ATOMIC_RELEASE);
     smp_request_reschedule(tsk->phys_cpu);
+}
+
+unsigned int sched_cpu_load(int cpu)
+{
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return 0;
+    return __atomic_load_n(&cpu_state[cpu].load_percent, __ATOMIC_ACQUIRE);
+}
+
+void sched_balance_tick(int cpu)
+{
+    unsigned long busy;
+    unsigned long idle;
+    int other;
+    unsigned int local_load;
+    unsigned int remote_load;
+
+    if (cpu < 0 || cpu >= MAX_CPUS || !current)
+        return;
+
+    if (current->pid == 0)
+        cpu_state[cpu].idle_ticks++;
+    else {
+        cpu_state[cpu].busy_ticks++;
+        current->runtime_ticks++;
+    }
+
+    busy = cpu_state[cpu].busy_ticks;
+    idle = cpu_state[cpu].idle_ticks;
+    if (busy + idle < 100)
+        return;
+
+    local_load = (unsigned int)((busy * 100) / (busy + idle));
+    __atomic_store_n(&cpu_state[cpu].load_percent, local_load,
+                     __ATOMIC_RELEASE);
+    cpu_state[cpu].busy_ticks = 0;
+    cpu_state[cpu].idle_ticks = 0;
+
+    if (balance_cooldown[cpu]) {
+        balance_cooldown[cpu]--;
+        return;
+    }
+
+    other = cpu ^ 1;
+    if (other >= MAX_CPUS || !smp_online[other] || current->pid == 0)
+        return;
+
+    remote_load = sched_cpu_load(other);
+    if (local_load >= 75 && remote_load + 25 <= local_load &&
+        current->state == TASK_RUNNING) {
+        __atomic_store_n(&balance_target[cpu], other, __ATOMIC_RELEASE);
+        balance_cooldown[cpu] = 5;
+    }
+}
+
+void sched_balance_safe_point(void)
+{
+    int cpu = smp_processor_id();
+    int target = __atomic_load_n(&balance_target[cpu], __ATOMIC_ACQUIRE);
+
+    if (target < 0)
+        return;
+    __atomic_store_n(&balance_target[cpu], -1, __ATOMIC_RELEASE);
+    if (!current || current->pid == 0 || current->state != TASK_RUNNING ||
+        current->phys_cpu != cpu || sched_migrate_current(target) < 0)
+        balance_cooldown[cpu] = 1;
 }
 
 /* 初始化 CPU0 的调度器状态（在 hypervisor_main 早期调用） */
