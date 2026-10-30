@@ -707,6 +707,11 @@ void smp_send_ipi(int cpu, int sgi_id)
     gic_send_sgi(cpu, sgi_id);
 }
 
+void smp_request_reschedule(int cpu)
+{
+    smp_send_ipi(cpu, SGI_SCHED_RESCHEDULE);
+}
+
 static void smp_capture_freeze_context(struct task_struct *target,
                                        unsigned long generation)
 {
@@ -952,6 +957,10 @@ void smp_ipi_handle(int sgi_id)
          * 由 vgic_inject_virq_to_vm 在跨核注入时触发。
          */
         vgic_ipi_update_handle();
+        break;
+
+    case SGI_SCHED_RESCHEDULE:
+        current->counter = 0;
         break;
 
     default:

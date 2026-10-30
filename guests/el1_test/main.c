@@ -1566,6 +1566,19 @@ static void test_scheduler(void)
     /* 4. 恢复默认优先级 (2) */
     hvc_call(HVC_SCHED_SET_PRIO, 2);
 
+    /* Phase 101：VM1/vCPU0 做一次 CPU0 -> CPU1 -> CPU0 往返迁移。 */
+    if (guest_vmid() == 1 && vsgi_get_cpuid() == 0) {
+        u64 cpu = hvc_call(HVC_SCHED_GET_CPU, 0);
+        if (cpu != 0 || hvc_call(HVC_SCHED_MIGRATE_CPU, 1) != 0 ||
+            hvc_call(HVC_SCHED_GET_CPU, 0) != 1 ||
+            hvc_call(HVC_SCHED_MIGRATE_CPU, 0) != 0 ||
+            hvc_call(HVC_SCHED_GET_CPU, 0) != 0) {
+            guest_puts("sched: FAILED (vCPU migration)\n");
+            return;
+        }
+        guest_puts("sched: vCPU migration CPU0->CPU1->CPU0 PASSED\n");
+    }
+
     guest_puts("sched: PASSED\n");
 }
 

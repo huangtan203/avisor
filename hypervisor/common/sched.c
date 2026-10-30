@@ -12,6 +12,7 @@
 #include "common/debug.h"
 #include "common/irq.h"
 #include "common/mm.h"
+#include "common/smp.h"
 #include "common/task.h"
 #include "common/utils.h"
 
@@ -165,6 +166,76 @@ int sched_runqueue_selftest(int cpu)
     if (sched_dequeue_task(&probe) != 0)
         return -1;
     return 0;
+}
+
+int sched_migrate_current(int target_cpu)
+{
+    struct task_struct *tsk = current;
+    int source_cpu = smp_processor_id();
+    int first_cpu;
+    int second_cpu;
+    int source_slot = -1;
+    int target_slot = -1;
+    unsigned long daif;
+
+    if (!tsk || tsk->pid == 0 || target_cpu < 0 || target_cpu >= MAX_CPUS ||
+        target_cpu == source_cpu || !smp_online[target_cpu] ||
+        tsk->phys_cpu != source_cpu || tsk->state != TASK_RUNNING)
+        return -1;
+
+    first_cpu = source_cpu < target_cpu ? source_cpu : target_cpu;
+    second_cpu = source_cpu < target_cpu ? target_cpu : source_cpu;
+    daif = rq_irq_save();
+    rq_lock(first_cpu);
+    rq_lock(second_cpu);
+
+    for (int i = 1; i < cpu_state[source_cpu].nr_tasks; i++) {
+        if (cpu_state[source_cpu].task[i] == tsk) {
+            source_slot = i;
+            break;
+        }
+    }
+    for (int i = 1; i < cpu_state[target_cpu].nr_tasks; i++) {
+        if (!cpu_state[target_cpu].task[i]) {
+            target_slot = i;
+            break;
+        }
+    }
+    if (target_slot < 0 && cpu_state[target_cpu].nr_tasks < NR_TASKS)
+        target_slot = cpu_state[target_cpu].nr_tasks;
+
+    if (source_slot < 0 || target_slot < 0) {
+        rq_unlock(second_cpu);
+        rq_unlock(first_cpu);
+        rq_irq_restore(daif);
+        return -1;
+    }
+
+    tsk->state = TASK_MIGRATING;
+    cpu_state[source_cpu].task[source_slot] = NULL;
+    while (cpu_state[source_cpu].nr_tasks > 1 &&
+           !cpu_state[source_cpu].task[cpu_state[source_cpu].nr_tasks - 1])
+        cpu_state[source_cpu].nr_tasks--;
+
+    if (target_slot == cpu_state[target_cpu].nr_tasks)
+        cpu_state[target_cpu].nr_tasks++;
+    cpu_state[target_cpu].task[target_slot] = tsk;
+    tsk->pid = target_slot;
+    tsk->phys_cpu = target_cpu;
+
+    rq_unlock(second_cpu);
+    rq_unlock(first_cpu);
+    rq_irq_restore(daif);
+    schedule();
+    return 0;
+}
+
+void sched_complete_migration(struct task_struct *tsk)
+{
+    if (!tsk || tsk->state != TASK_MIGRATING)
+        return;
+    __atomic_store_n(&tsk->state, TASK_RUNNING, __ATOMIC_RELEASE);
+    smp_request_reschedule(tsk->phys_cpu);
 }
 
 /* 初始化 CPU0 的调度器状态（在 hypervisor_main 早期调用） */

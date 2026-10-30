@@ -300,7 +300,13 @@ static int remove_task_slot(struct task_struct *tsk)
 
 void task_reap_after_switch(struct task_struct *prev)
 {
-	if (prev && prev->state == TASK_ZOMBIE && prev != current)
+	if (!prev || prev == current)
+		return;
+	if (prev->state == TASK_MIGRATING) {
+		sched_complete_migration(prev);
+		return;
+	}
+	if (prev->state == TASK_ZOMBIE)
 		remove_task_slot(prev);
 }
 

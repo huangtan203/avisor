@@ -1,0 +1,37 @@
+Phase 101 verification log
+==========================
+Parent phase: v0.100.0-phase100-runqueue-locking (e7e44c3)
+Branch: phase99-130-rebuild
+
+Scope:
+  - Add TASK_MIGRATING and explicit current-vCPU migration.
+  - Move a task between source/target runqueues under ordered dual locks.
+  - Publish the migrated task only after the source context is switched out.
+  - Send SGI_SCHED_RESCHEDULE to prompt scheduling on the target CPU.
+  - Add HVC 74/75 and a VM1/vCPU0 CPU0 -> CPU1 -> CPU0 test.
+  - Preserve the Phase 100 runqueue selftest.
+
+Build:
+  make -f Makefile.virt -j$(nproc)
+Result: PASS; bin_virt/kernel8.img linked successfully (249416 bytes).
+
+Runtime:
+  timeout 30 make -f Makefile.virt run-log \
+      QEMU_SERIAL_LOG=/tmp/avisor-phase101.log
+Result: exit 124 after the expected 30-second timeout.
+
+Phase 101 checks:
+  - "sched: vCPU migration CPU0->CPU1->CPU0 PASSED" emitted by VM1/vCPU0.
+  - HVC return after each migration observed execution on the requested pCPU.
+  - No PANIC or ASSERT marker.
+
+Regression checks:
+  - VM1 and VM2 virtio-net loopback suites passed.
+  - VM1 and VM2 ivshmem ping-pong tests passed.
+  - vITS virtual LPI delivery passed.
+  - VM2 -> VM3 dual-vCPU Live Migration passed.
+
+Known unrelated baseline failure:
+  - The full guest suite emitted "FAIL: task 槽位未被实际复用" in the existing Phase 44 task-slot reuse test.
+  - first-pid and second-pid were both invalid. Phase 101 does not modify that HVC/test path.
+  - This log therefore records Phase 101 migration as PASS, but does not claim the complete historical guest suite is failure-free.

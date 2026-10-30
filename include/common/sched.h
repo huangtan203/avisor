@@ -23,9 +23,10 @@
 /* SMP 支持：最大 CPU 数 */
 #define MAX_CPUS 2
 
-#define TASK_RUNNING 0
-#define TASK_ZOMBIE  1
-#define TASK_WAITING 2   /* 等待状态（如等待 I/O、等待共享内存消息） */
+#define TASK_RUNNING   0
+#define TASK_ZOMBIE    1
+#define TASK_WAITING   2 /* 等待状态（如等待 I/O、等待共享内存消息） */
+#define TASK_MIGRATING 3 /* 已挂入目标 runqueue，等待源核完成上下文切出 */
 
 /* task_struct::flags：镜像加载完成（Stage 2 页表就绪）
  * 共享页表的次级 vCPU 依赖此标志判断主 vCPU 是否加载完毕 */
@@ -308,6 +309,8 @@ int sched_enqueue_task(int cpu, struct task_struct *tsk);
 int sched_dequeue_task(struct task_struct *tsk);
 struct task_struct *sched_find_vcpu(unsigned long vmid, int vcpu_id);
 int sched_runqueue_selftest(int cpu);
+int sched_migrate_current(int target_cpu);
+void sched_complete_migration(struct task_struct *tsk);
 extern void schedule(void);
 extern void timer_tick(void);
 extern void preempt_disable(void);

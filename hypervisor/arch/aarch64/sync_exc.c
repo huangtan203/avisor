@@ -155,6 +155,12 @@ void handle_hvc64(unsigned long hvc_nr)
 		regs->regs[0] = sched_set_priority(current, prio);
 		break;
 	}
+	case HVC_SCHED_MIGRATE_CPU:
+		regs->regs[0] = sched_migrate_current((int)regs->regs[0]);
+		break;
+	case HVC_SCHED_GET_CPU:
+		regs->regs[0] = smp_processor_id();
+		break;
 
 	/* Phase 10: 内存管理 hypercall */
 	case HVC_MEM_MAP: {

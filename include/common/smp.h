@@ -21,6 +21,7 @@ extern volatile int smp_online[MAX_CPUS];
 
 /* 向指定物理核发送核间中断（SGI） */
 void smp_send_ipi(int cpu, int sgi_id);
+void smp_request_reschedule(int cpu);
 
 /* 处理当前核收到的 SGI（在 irq.c 的 handle_irq 中分发调用） */
 void smp_ipi_handle(int sgi_id);
