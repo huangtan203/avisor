@@ -245,6 +245,7 @@ struct cpu_sched_state {
     struct task_struct *task[NR_TASKS];
     int nr_tasks;        /* task[] 有效扫描上界；区间内允许存在 NULL 空槽 */
     int rr_start;       /* 轮转调度起点 */
+    volatile unsigned int rq_lock;
     struct task_struct init_task;  /* 本核的 idle 任务 */
 };
 
@@ -303,6 +304,10 @@ static inline int get_cpu_nr_tasks(void)
 extern void sched_init(void);
 extern void sched_init_primary(void);
 extern void sched_init_secondary(int cpu);
+int sched_enqueue_task(int cpu, struct task_struct *tsk);
+int sched_dequeue_task(struct task_struct *tsk);
+struct task_struct *sched_find_vcpu(unsigned long vmid, int vcpu_id);
+int sched_runqueue_selftest(int cpu);
 extern void schedule(void);
 extern void timer_tick(void);
 extern void preempt_disable(void);
@@ -365,7 +370,7 @@ extern void sched_wait(void);
 	{                                                                      \
 		/* cpu_context */ { 0 }, /* freeze_context */ 0,              \
 		/* state etc */ 0, 0, 1, 0, 0,                                \
-			/* vmid */ 0, /* flags */ 0, "", 0, 0,                 \
+			/* vmid */ 0, /* vm */ 0, /* flags */ 0, "", 0, 0,     \
 			/* mm */ { 0 }, /* cpu_sysregs */ { 0 },               \
 			/* stat */ { 0 }, /* console */ { 0 },                 \
 			/* virt */ { 0 }, /* stack_low_water */ 0,             \

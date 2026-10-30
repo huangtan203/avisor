@@ -1,0 +1,32 @@
+Phase 100 verification log
+==========================
+Parent phase: v0.99.0-phase99-vm-vcpu-lifecycle (38a88aa)
+Branch: phase99-130-rebuild
+
+Scope:
+  - Add one runqueue lock per physical CPU.
+  - Route task insertion/removal through sched_enqueue_task/sched_dequeue_task.
+  - Protect scheduling selection, timeslice refill and rr_start updates.
+  - Add locked vCPU lookup and a non-destructive runqueue selftest.
+  - Fix INIT_TASK field alignment after Phase 99 added task_struct::vm.
+
+Clean build:
+  make -f Makefile.virt clean
+  make -f Makefile.virt -j$(nproc)
+Result: PASS; bin_virt/kernel8.img linked successfully (247264 bytes).
+
+Runtime:
+  timeout 30 make -f Makefile.virt run-log \
+      QEMU_SERIAL_LOG=/tmp/avisor-phase100.log
+Result: exit 124 after the expected 30-second timeout.
+
+Observed checks:
+  - "Phase 100 runqueue selftest PASSED" emitted during boot.
+  - VM1 and VM2 virtio-net loopback suites passed.
+  - VM1 and VM2 ivshmem ping-pong tests passed.
+  - vITS virtual LPI delivery passed.
+  - VM2 -> VM3 dual-vCPU Live Migration passed.
+  - No PANIC, ASSERT, FAILED or SOME tests FAILED markers.
+
+Known baseline warnings:
+  Existing guests/el1_test pointer-conversion, declaration and shift warnings remain outside Phase 100 scope. No Phase 100 source file introduced a build error.

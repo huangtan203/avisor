@@ -18,6 +18,155 @@
 static struct task_struct init_task = INIT_TASK;
 struct cpu_sched_state cpu_state[MAX_CPUS];
 
+static void rq_lock(int cpu)
+{
+    unsigned int value;
+    unsigned int failed;
+
+    for (;;) {
+        asm volatile("1: ldaxr %w0, [%2]\n"
+                     "cbnz %w0, 1b\n"
+                     "mov %w0, #1\n"
+                     "stxr %w1, %w0, [%2]\n"
+                     "cbnz %w1, 1b\n"
+                     : "=&r"(value), "=&r"(failed)
+                     : "r"(&cpu_state[cpu].rq_lock)
+                     : "memory");
+        return;
+    }
+}
+
+static void rq_unlock(int cpu)
+{
+    asm volatile("stlr wzr, [%0]"
+                 :: "r"(&cpu_state[cpu].rq_lock) : "memory");
+}
+
+static unsigned long rq_irq_save(void)
+{
+    unsigned long daif;
+
+    asm volatile("mrs %0, daif\n"
+                 "msr daifset, #2"
+                 : "=r"(daif) :: "memory");
+    return daif;
+}
+
+static void rq_irq_restore(unsigned long daif)
+{
+    asm volatile("msr daif, %0" :: "r"(daif) : "memory");
+}
+
+int sched_enqueue_task(int cpu, struct task_struct *tsk)
+{
+    unsigned long daif;
+    int slot = -1;
+
+    if (!tsk || cpu < 0 || cpu >= MAX_CPUS)
+        return -1;
+
+    daif = rq_irq_save();
+    rq_lock(cpu);
+    for (int i = 1; i < cpu_state[cpu].nr_tasks; i++) {
+        if (cpu_state[cpu].task[i] == tsk) {
+            slot = i;
+            goto out;
+        }
+    }
+    for (int i = 1; i < cpu_state[cpu].nr_tasks; i++) {
+        if (!cpu_state[cpu].task[i]) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0 && cpu_state[cpu].nr_tasks < NR_TASKS)
+        slot = cpu_state[cpu].nr_tasks++;
+    if (slot >= 0) {
+        cpu_state[cpu].task[slot] = tsk;
+        tsk->pid = slot;
+        tsk->phys_cpu = cpu;
+    }
+out:
+    rq_unlock(cpu);
+    rq_irq_restore(daif);
+    return slot;
+}
+
+int sched_dequeue_task(struct task_struct *tsk)
+{
+    unsigned long daif;
+    int cpu;
+    int removed = 0;
+
+    if (!tsk)
+        return -1;
+    cpu = tsk->phys_cpu;
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return -1;
+
+    daif = rq_irq_save();
+    rq_lock(cpu);
+    for (int i = 1; i < cpu_state[cpu].nr_tasks; i++) {
+        if (cpu_state[cpu].task[i] != tsk)
+            continue;
+        cpu_state[cpu].task[i] = NULL;
+        while (cpu_state[cpu].nr_tasks > 1 &&
+               !cpu_state[cpu].task[cpu_state[cpu].nr_tasks - 1])
+            cpu_state[cpu].nr_tasks--;
+        removed = 1;
+        break;
+    }
+    rq_unlock(cpu);
+    rq_irq_restore(daif);
+    return removed;
+}
+
+struct task_struct *sched_find_vcpu(unsigned long vmid, int vcpu_id)
+{
+    struct task_struct *result = NULL;
+    unsigned long daif = rq_irq_save();
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        rq_lock(cpu);
+        for (int i = 1; i < cpu_state[cpu].nr_tasks; i++) {
+            struct task_struct *tsk = cpu_state[cpu].task[i];
+
+            if (tsk && tsk->vmid == vmid && tsk->vcpu_id == vcpu_id &&
+                tsk->state != TASK_ZOMBIE) {
+                result = tsk;
+                break;
+            }
+        }
+        rq_unlock(cpu);
+        if (result)
+            break;
+    }
+    rq_irq_restore(daif);
+    return result;
+}
+
+int sched_runqueue_selftest(int cpu)
+{
+    struct task_struct probe = { 0 };
+    int first;
+    int duplicate;
+
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return -1;
+    probe.state = TASK_WAITING;
+    probe.phys_cpu = cpu;
+
+    first = sched_enqueue_task(cpu, &probe);
+    if (first < 1)
+        return -1;
+    duplicate = sched_enqueue_task(cpu, &probe);
+    if (duplicate != first || sched_dequeue_task(&probe) != 1)
+        return -1;
+    if (sched_dequeue_task(&probe) != 0)
+        return -1;
+    return 0;
+}
+
 /* 初始化 CPU0 的调度器状态（在 hypervisor_main 早期调用） */
 void sched_init_primary(void)
 {
@@ -61,49 +210,42 @@ void _schedule(void)
 {
 	int next, c;
 	struct task_struct *p;
+	struct task_struct *selected;
     int cpu = smp_processor_id();
-    int *rr_start = &cpu_state[cpu].rr_start;
+    int rr_start;
 
 	while (1) {
+		rq_lock(cpu);
 		c = -1;
 		next = 0;
+		rr_start = cpu_state[cpu].rr_start;
 
 		for (int i = 0; i < NR_TASKS; i++) {
-			int idx = (*rr_start + i) % NR_TASKS;
+			int idx = (rr_start + i) % NR_TASKS;
 			p = cpu_state[cpu].task[idx];
 
-			/*
-			 * Phase 10: 只考虑 RUNNING 状态的任务
-			 * （WAITING/ZOMBIE 不参与调度）
-			 */
 			if (p && p->state == TASK_RUNNING && p->counter > c) {
 				c = p->counter;
 				next = idx;
 			}
 		}
 
-		if (c)
+		if (c) {
+			selected = cpu_state[cpu].task[next];
+			cpu_state[cpu].rr_start = (next + 1) % NR_TASKS;
+			rq_unlock(cpu);
 			break;
+		}
 
-		/*
-		 * 所有 RUNNING 任务时间片都用完了，重新分配。
-		 * counter = (counter >> 1) + priority 的含义：
-		 *   - priority 越高，分到的基础时间片越多
-		 *   - 剩余时间 >> 1（衰减一半）让高优先级任务积累优势
-		 *   - 等价于"加权公平调度"的简化版
-		 */
 		for (int i = 0; i < NR_TASKS; i++) {
 			p = cpu_state[cpu].task[i];
-
 			if (p && p->state == TASK_RUNNING)
 				p->counter = (p->counter >> 1) + p->priority;
 		}
+		rq_unlock(cpu);
 	}
 
-	/* 下次扫描从本次选中者的下一个任务开始 */
-	*rr_start = (next + 1) % NR_TASKS;
-
-	switch_to(cpu_state[cpu].task[next]);
+	switch_to(selected);
 }
 
 void schedule(void)

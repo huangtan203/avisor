@@ -178,6 +178,9 @@ void hypervisor_main()
     sched_init_primary();
     init_initial_task();
     printf("[1] CPU0 scheduler initialized (idle task, name=HV)\n");
+    if (sched_runqueue_selftest(0) < 0)
+        PANIC("Phase 100 runqueue selftest failed");
+    printf("[1.1] Phase 100 runqueue selftest PASSED\n");
 
     /* 3. 设置异常向量表（VBAR_EL2） */
     irq_vector_init();

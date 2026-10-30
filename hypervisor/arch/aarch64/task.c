@@ -170,18 +170,8 @@ static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
 		return -1;
 
 	pid = -1;
-	for (int i = 1; i < cpu_state[cpu].nr_tasks; i++) {
-		if (!cpu_state[cpu].task[i]) {
-			pid = i;
-			break;
-		}
-	}
-	if (pid < 0 && cpu_state[cpu].nr_tasks < NR_TASKS)
-		pid = cpu_state[cpu].nr_tasks;
-	if (pid < 0)
+	if (cpu < 0 || cpu >= MAX_CPUS)
 		return -1;
-	if (pid < cpu_state[cpu].nr_tasks)
-		task_reused_count[cpu]++;
 
 	p = (struct task_struct *)allocate_page();
 	if (!p)
@@ -240,19 +230,17 @@ static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
 	p->cpu_context.sp = (unsigned long)childregs;
 	task_stack_init(p);
 
-	/* 添加到指定 CPU 的任务表；优先复用已回收的空槽位。 */
-	cpu_state[cpu].task[pid] = p;
-	if (pid == cpu_state[cpu].nr_tasks)
-		cpu_state[cpu].nr_tasks++;
-	else
+	pid = sched_enqueue_task(cpu, p);
+	if (pid < 0) {
+		destroy_task_aux(p);
+		deallocate_page(p);
+		return -1;
+	}
+	if (cpu_state[cpu].task[pid] == p && pid < cpu_state[cpu].nr_tasks - 1)
 		task_reused_count[cpu]++;
-	p->pid = pid;  /* pid 是 per-CPU 的，多核间可能重复 */
 
 	if (vm_attach_vcpu(p, vmid, vcpu_id) < 0) {
-		cpu_state[cpu].task[pid] = NULL;
-		while (cpu_state[cpu].nr_tasks > 1 &&
-		       !cpu_state[cpu].task[cpu_state[cpu].nr_tasks - 1])
-			cpu_state[cpu].nr_tasks--;
+		sched_dequeue_task(p);
 		destroy_task_aux(p);
 		deallocate_page(p);
 		return -1;
@@ -294,25 +282,20 @@ void destroy_task_aux(struct task_struct *tsk)
 
 static int remove_task_slot(struct task_struct *tsk)
 {
-	int cpu = smp_processor_id();
+	int cpu;
 
-	for (int i = 1; i < cpu_state[cpu].nr_tasks; i++) {
-		if (cpu_state[cpu].task[i] != tsk)
-			continue;
+	if (!tsk)
+		return 0;
+	cpu = tsk->phys_cpu;
+	if (cpu != smp_processor_id() || sched_dequeue_task(tsk) != 1)
+		return 0;
 
-		/* 先摘除槽位，之后其他扫描者不会再取得即将释放的指针。 */
-		cpu_state[cpu].task[i] = NULL;
-		while (cpu_state[cpu].nr_tasks > 1 &&
-		       !cpu_state[cpu].task[cpu_state[cpu].nr_tasks - 1])
-			cpu_state[cpu].nr_tasks--;
-		vm_detach_vcpu(tsk);
-		destroy_task_aux(tsk);
-		deallocate_page(tsk);
-		task_reaped_count[cpu]++;
-		return 1;
-	}
-
-	return 0;
+	/* 先从 runqueue 摘除，再解绑 registry，最后释放任务资源。 */
+	vm_detach_vcpu(tsk);
+	destroy_task_aux(tsk);
+	deallocate_page(tsk);
+	task_reaped_count[cpu]++;
+	return 1;
 }
 
 void task_reap_after_switch(struct task_struct *prev)
