@@ -1,0 +1,29 @@
+Phase 109 PCI enumeration and BAR passthrough hardening
+
+Build:
+- make -f Makefile.virt -j$(nproc): PASS
+- git diff --check: PASS
+
+Default QEMU topology:
+- Command: timeout 65 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase109-final-basic.log
+- edu enumerated at 00:02.0, BAR0=0x10100000 size=0x100000.
+- Guest PCI enumeration/BAR discovery: PASS.
+- vITS requester 16 accepted; requester 17 MAPD/MAPTI rejected as unowned.
+- vITS MSI delivery: PASS.
+- edu function reset + MSI reinit: PASS.
+
+Moved edu and nested bridge topology:
+- Command: timeout 75 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=off -cpu max -smp 2 -m 1G -device edu,bus=pcie.0,addr=0x3 -device pci-bridge,id=br1,bus=pcie.0,addr=0x4,chassis_nr=1 -device pci-bridge,id=br2,bus=br1,addr=0x1,chassis_nr=2 -device e1000,bus=br2,addr=0x2 -kernel bin_virt/kernel8.img -display none -monitor none -serial file:/tmp/avisor-phase109-final-nested.log
+- Enumeration: edu 00:03.0, bridges 00:04.0 and 01:01.0, e1000 02:02.0.
+- edu dynamic ECAM: 0x3f018000; requester ID: 24.
+- Guest PCI enumeration/BAR discovery: PASS.
+- vITS requester 24 accepted; requester 25 MAPD/MAPTI rejected as unowned.
+- vITS MSI delivery and reset + MSI reinit: PASS.
+- Both QEMU runs were terminated by timeout as expected.
+
+Known existing regression:
+- Guest logs contain `FAIL: task 槽位未被实际复用`, the existing Phase 44 task-slot reuse self-test failure already noted in Phase 108. No claim is made that the full guest self-test suite passes.
+
+Scope note:
+- Stage-2 passthrough checks existing leaf mappings and rolls back mappings created by the current attempt on conflict. `map_stage2_page()` returns void, so lower-level page-table allocation failure is not observable by this caller.
+- No SMMU/IOMMU abstraction was added; Phase 109 scope is PCI BAR transaction safety, per-VM resource query, dynamic requester/ECAM discovery, and precise Stage-2 mapping.

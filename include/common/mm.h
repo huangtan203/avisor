@@ -100,7 +100,8 @@ struct page_pool {
 };
 
 void map_stage2_page(struct task_struct *task, vaddr_t va, paddr_t page,
-		     uint64_t flags);
+		    uint64_t flags);
+int stage2_page_is_mapped(struct task_struct *task, vaddr_t va);
 int unmap_stage2_page(struct task_struct *task, vaddr_t va, int do_free);
 int mprotect_stage2_page(struct task_struct *task, vaddr_t va, uint64_t new_ap);
 

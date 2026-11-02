@@ -555,8 +555,8 @@ static void virt_initialize(struct task_struct *tsk)
      * 前提：main_virt.c 在创建任何 VM 之前已调用 pci_init()，
      * 因此这里 edu_found 已确定。
      */
-    if (tsk->vmid == 1)
-        pci_passthrough_map(tsk);
+    if (tsk->vmid == 1 && pci_passthrough_map(tsk) < 0)
+        PANIC("PCI: failed to map owned resources into VM%lu", tsk->vmid);
 }
 
 /*

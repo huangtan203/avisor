@@ -139,6 +139,25 @@ int pci_edu_owns_requester(unsigned int requester_id)
     return edu_found && requester_id == pci_edu_requester_id();
 }
 
+int pci_get_owned_config(struct task_struct *vm, unsigned int selector,
+                         uint64_t *ecam, uint64_t *bar0,
+                         uint64_t *bar0_size, unsigned int *requester_id)
+{
+    if (!vm || vm->vmid != 1 || selector != 0 || !edu_found ||
+        !edu_bar0 || !edu_bar0_size)
+        return -1;
+    if (ecam)
+        *ecam = VIRT_PCIE_ECAM_BASE + ((uint64_t)edu_bus << 20) +
+                ((uint64_t)edu_dev << 15) + ((uint64_t)edu_func << 12);
+    if (bar0)
+        *bar0 = edu_bar0;
+    if (bar0_size)
+        *bar0_size = edu_bar0_size;
+    if (requester_id)
+        *requester_id = pci_edu_requester_id();
+    return 0;
+}
+
 /*
  * edu INTx 的 GIC 全局中断号（运行时计算，pci_init 填充）。
  *
@@ -208,11 +227,20 @@ static uint32_t pci_allocate_io(uint32_t size)
     return aligned;
 }
 
-static void pci_probe_bars(struct pci_device_resource *resource,
-                           unsigned int bar_count)
+static int pci_probe_bars(struct pci_device_resource *resource,
+                          unsigned int bar_count)
 {
     uint32_t command = pci_config_read(resource->bus, resource->dev,
                                        resource->func, PCI_CFG_COMMAND);
+    uint32_t original_bars[PCI_MAX_BARS];
+    uint64_t saved_mmio_next = pci_mmio_next;
+    uint32_t saved_io_next = pci_io_next;
+    struct pci_bar_resource saved_resources[PCI_MAX_BARS];
+    for (unsigned int i = 0; i < bar_count; i++) {
+        original_bars[i] = pci_config_read(resource->bus, resource->dev,
+                                           resource->func, PCI_BAR0 + i * 4);
+        saved_resources[i] = resource->bars[i];
+    }
 
     pci_config_write(resource->bus, resource->dev, resource->func,
                      PCI_CFG_COMMAND, command & ~(PCI_CMD_IO | PCI_CMD_MEMORY));
@@ -240,8 +268,11 @@ static void pci_probe_bars(struct pci_device_resource *resource,
         if (is_64bit)
             pci_config_write(resource->bus, resource->dev, resource->func,
                              reg + 4, original_hi);
-        if (!mask || mask == 0xffffffff)
+        if (!mask || mask == 0xffffffff) {
+            if (original || (is_64bit && original_hi))
+                goto rollback;
             continue;
+        }
 
         struct pci_bar_resource *bar = &resource->bars[i];
         bar->flags = original & 0xf;
@@ -250,13 +281,13 @@ static void pci_probe_bars(struct pci_device_resource *resource,
         if (original & 1) {
             size = (uint32_t)(~(mask & ~3U) + 1U);
             if (!size || (size & (size - 1)))
-                continue;
+                goto rollback;
             uint32_t port = pci_allocate_io(size);
             if (port == 0xffffffff) {
                 WARN("PCI: I/O BAR allocation failed at %02x:%02x.%u BAR%u size=0x%lx",
                      resource->bus, resource->dev, resource->func, i,
                      (unsigned long)size);
-                continue;
+                goto rollback;
             }
             bar->address = VIRT_PCIE_IO_BASE + port;
             bar->size = size;
@@ -277,13 +308,13 @@ static void pci_probe_bars(struct pci_device_resource *resource,
             size = (uint32_t)(~(mask & ~0xfU) + 1U);
         }
         if (!size || (size & (size - 1)))
-            continue;
+            goto rollback;
         uint64_t assigned = pci_allocate_mmio(size);
         if (!assigned) {
             WARN("PCI: MMIO BAR allocation failed at %02x:%02x.%u BAR%u size=0x%lx",
                  resource->bus, resource->dev, resource->func, i,
                  (unsigned long)size);
-            continue;
+            goto rollback;
         }
         bar->address = assigned;
         bar->size = size;
@@ -301,6 +332,21 @@ static void pci_probe_bars(struct pci_device_resource *resource,
     }
     pci_config_write(resource->bus, resource->dev, resource->func,
                      PCI_CFG_COMMAND, command);
+    return 0;
+
+rollback:
+    for (unsigned int i = 0; i < bar_count; i++) {
+        pci_config_write(resource->bus, resource->dev, resource->func,
+                         PCI_BAR0 + i * 4, original_bars[i]);
+        resource->bars[i] = saved_resources[i];
+    }
+    pci_mmio_next = saved_mmio_next;
+    pci_io_next = saved_io_next;
+    pci_config_write(resource->bus, resource->dev, resource->func,
+                     PCI_CFG_COMMAND, command);
+    WARN("PCI: BAR transaction rolled back for %02x:%02x.%u",
+         resource->bus, resource->dev, resource->func);
+    return -1;
 }
 
 static int pci_scan_bus(unsigned int bus)
@@ -322,6 +368,7 @@ static int pci_scan_bus(unsigned int bus)
                 return -1;
             struct pci_device_resource *resource =
                 &pci_devices[pci_device_count++];
+            memzero(resource, sizeof(*resource));
             resource->vendor = vendor;
             resource->device = device;
             resource->bus = bus;
@@ -339,7 +386,8 @@ static int pci_scan_bus(unsigned int bus)
             INFO("PCI: enumerated %02x:%02x.%u id=%04x:%04x header=%u",
                  bus, dev, func, vendor, device, resource->header_type);
             if (resource->header_type == 0) {
-                pci_probe_bars(resource, PCI_MAX_BARS);
+                if (pci_probe_bars(resource, PCI_MAX_BARS) < 0)
+                    return -1;
             } else if (resource->header_type == PCI_HEADER_BRIDGE) {
                 if (pci_next_bus >= PCI_MAX_BUSES) {
                     WARN("PCI: no secondary bus available for %02x:%02x.%u",
@@ -801,21 +849,46 @@ int pci_edu_function_reset(struct task_struct *vm)
     return 0;
 }
 
-void pci_passthrough_map(struct task_struct *vm)
+int pci_passthrough_map(struct task_struct *vm)
 {
-    if (!edu_found)
-        return;
+    if (!vm || vm->vmid != 1 || !edu_found || !edu_bar0 ||
+        !edu_bar0_size || (edu_bar0 & (PAGE_SIZE - 1)) ||
+        (edu_bar0_size & (PAGE_SIZE - 1)) ||
+        edu_bar0 < VIRT_PCIE_MMIO_BASE || edu_bar0 > PCI_MMIO_ALLOC_END ||
+        edu_bar0_size > PCI_MMIO_ALLOC_END - edu_bar0)
+        return -1;
 
-    if (vm->vmid != 1)
-        return;
-    uint64_t ecam = ecam_addr(edu_bus, edu_dev, edu_func, 0) & ~(PAGE_SIZE - 1);
+    uint64_t ecam = ecam_addr(edu_bus, edu_dev, edu_func, 0) &
+                    ~(uint64_t)(PAGE_SIZE - 1);
+    if (ecam < VIRT_PCIE_ECAM_BASE ||
+        ecam >= VIRT_PCIE_ECAM_BASE + VIRT_PCIE_ECAM_SIZE)
+        return -1;
+
+    uint64_t mapped_bar_size = 0;
+    if (stage2_page_is_mapped(vm, ecam))
+        return -1;
     map_stage2_page(vm, ecam, ecam, MMU_STAGE2_DEVICE_PAGE_FLAGS);
-    for (uint64_t off = 0; off < edu_bar0_size; off += PAGE_SIZE)
-        map_stage2_page(vm, edu_bar0 + off, edu_bar0 + off,
-                        MMU_STAGE2_DEVICE_PAGE_FLAGS);
+    for (uint64_t off = 0; off < edu_bar0_size; off += PAGE_SIZE) {
+        uint64_t ipa = edu_bar0 + off;
+        if (stage2_page_is_mapped(vm, ipa))
+            goto rollback;
+        map_stage2_page(vm, ipa, ipa, MMU_STAGE2_DEVICE_PAGE_FLAGS);
+        mapped_bar_size += PAGE_SIZE;
+    }
     INFO("PCI: passthrough mapped into VM%lu (ECAM page=0x%lx BAR0=0x%lx/0x%lx)",
          (unsigned long)vm->vmid, (unsigned long)ecam,
          (unsigned long)edu_bar0, (unsigned long)edu_bar0_size);
+    return 0;
+
+rollback:
+    while (mapped_bar_size) {
+        mapped_bar_size -= PAGE_SIZE;
+        unmap_stage2_page(vm, edu_bar0 + mapped_bar_size, 0);
+    }
+    unmap_stage2_page(vm, ecam, 0);
+    WARN("PCI: passthrough mapping rolled back for VM%lu",
+         (unsigned long)vm->vmid);
+    return -1;
 }
 
 /*

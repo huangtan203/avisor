@@ -1441,8 +1441,8 @@ static volatile u32 vits_irq_intid = 0;
 /* 转换为虚拟 SPI 号（与 irq.c 公式一致：vSPI = 64 + (vLPI - 8192)） */
 #define VITS_TEST_VSPI        (64 + (VITS_TEST_VLPI - 8192))
 
-/* edu 设备在 PCI 总线上的 requester_id (bus 0, dev 2, func 0): (0<<8)|(2<<3)|0 = 16 */
-#define EDU_DEVID             16
+static u64 edu_ecam_base;
+static u64 edu_requester_id;
 
 /* ITT 表（给 vITS MAPD 用，分配一页） */
 static u64 vits_itt_buf[512];  /* 4KB */
@@ -1452,9 +1452,22 @@ static void edu_test(void)
     u32 id, live, fact;
     int timeout;
 
-    u64 ecam = 0x3f000000UL + ((u64)2 << 15);
+    u64 bar0_size;
+    u64 ecam = hvc_call_ret4(HVC_PCI_CONFIG, 0, &edu_bar0_base,
+                             &bar0_size, &edu_requester_id);
+    if (ecam == (u64)-1 || !bar0_size) {
+        guest_puts("PCI enumeration/BAR discovery FAILED\n");
+        return;
+    }
+    edu_ecam_base = ecam;
+    id = mmio_read32(ecam);
     u32 bar0 = mmio_read32(ecam + 0x10);
-    edu_bar0_base = bar0 & ~0xfU;
+    edu_bar0_base &= ~0xfULL;
+    if ((id & 0xffff) != 0x1234 || (id >> 16) != 0x11e8 ||
+        (bar0 & ~0xfU) != edu_bar0_base) {
+        guest_puts("PCI enumeration/BAR discovery FAILED (resource mismatch)\n");
+        return;
+    }
     guest_puts("edu: discovered BAR0=0x");
     puts_hex(edu_bar0_base, 8);
     guest_puts("\n");
@@ -3935,16 +3948,16 @@ static void vits_test(void)
     /* 2. MAPC: collection 0 -> procnum 0 */
     vits_mapc(0, 0);
 
-    /* 3. MAPD: devid=EDU_DEVID -> ITT */
-    vits_mapd(EDU_DEVID, (u64)vits_itt_buf, 3);  /* size=3 -> 16 events */
+    /* 3. MAPD: requester ID 由 hypervisor ownership 查询返回。 */
+    vits_mapd((u32)edu_requester_id, (u64)vits_itt_buf, 3);
 
     /* 未拥有的 requester 不得创建设备到 LPI 映射。 */
-    vits_mapd(EDU_DEVID + 1, (u64)vits_itt_buf, 3);
-    vits_mapti(EDU_DEVID + 1, 1, VITS_TEST_VLPI + 1, 0);
+    vits_mapd((u32)edu_requester_id + 1, (u64)vits_itt_buf, 3);
+    vits_mapti((u32)edu_requester_id + 1, 1, VITS_TEST_VLPI + 1, 0);
 
     /* 4. MAPTI: eventid=1 -> vLPI=VITS_TEST_VLPI, icid=0
      * 用 eventid=1 避免和 Phase 8 已配置的 eventid=0 冲突 */
-    vits_mapti(EDU_DEVID, 1, VITS_TEST_VLPI, 0);
+    vits_mapti((u32)edu_requester_id, 1, VITS_TEST_VLPI, 0);
 
     vits_sync();
 
@@ -3955,13 +3968,11 @@ static void vits_test(void)
      * 简化：从 Cap Pointer 开始遍历，找到 MSI Capability。
      */
     {
-        #define PCIE_ECAM_BASE   0x3F000000UL
         #define PCI_CFG_CAP_PTR  0x34
-        #define PCI_CFG_STATUS   0x06
         #define PCI_CAP_ID_MSI   0x05
         #define PCI_MSI_DATA_OFF 0x0C  /* 32-bit 地址模式下 data 寄存器偏移 */
 
-        u32 ecam_addr = 0x3F000000 + (0 << 20) + (2 << 15) + (0 << 12);
+        u64 ecam_addr = edu_ecam_base;
         u8 cap_ptr = (u8)mmio_read32(ecam_addr + PCI_CFG_CAP_PTR);
         u8 msi_cap_off = 0;
 
@@ -4057,7 +4068,7 @@ static void vits_test(void)
                 return;
             }
             guest_puts("vITS: edu reset identity/state PASSED\n");
-            vits_mapti(EDU_DEVID, 1, VITS_TEST_VLPI, 0);
+            vits_mapti((u32)edu_requester_id, 1, VITS_TEST_VLPI, 0);
             vits_sync();
             mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF,
                          (msi_data & 0xFFFF0000) | 1);
@@ -4243,6 +4254,15 @@ void guest_main(void)
     }
 
     /* 以下是主核路径 */
+
+    if (vmid != 1) {
+        u64 denied = hvc_call_ret4(HVC_PCI_CONFIG, 0, (u64 *)0, (u64 *)0, (u64 *)0);
+        u64 invalid_selector = hvc_call_ret4(HVC_PCI_CONFIG, 1, (u64 *)0, (u64 *)0, (u64 *)0);
+        if (denied != (u64)-1 || invalid_selector != (u64)-1)
+            guest_puts("PCI ownership isolation FAILED\n");
+        else
+            guest_puts("PCI ownership isolation PASSED\n");
+    }
 
     /* 先初始化 MMU（开启 cache，解决与 hypervisor 的 cache 一致性问题） */
     mmu_init();

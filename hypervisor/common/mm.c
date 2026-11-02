@@ -325,6 +325,29 @@ static int page_table_empty(paddr_t table_pa)
 	return 1;
 }
 
+int stage2_page_is_mapped(struct task_struct *task, vaddr_t va)
+{
+	paddr_t table_pa;
+	uint64_t entry;
+
+	if (!task || !task->mm.first_table)
+		return 0;
+	table_pa = task->mm.first_table;
+	entry = ((uint64_t *)TO_VADDR(table_pa))[
+		(va >> LV1_SHIFT) & (PTRS_PER_TABLE - 1)];
+	if ((entry & 0x3) != 3)
+		return 0;
+	table_pa = entry & PAGE_MASK;
+	entry = ((uint64_t *)TO_VADDR(table_pa))[
+		(va >> LV2_SHIFT) & (PTRS_PER_TABLE - 1)];
+	if ((entry & 0x3) != 3)
+		return 0;
+	table_pa = entry & PAGE_MASK;
+	entry = ((uint64_t *)TO_VADDR(table_pa))[
+		(va >> PAGE_SHIFT) & (PTRS_PER_TABLE - 1)];
+	return (entry & 0x3) == 3;
+}
+
 /*
  * Phase 20: 通用 Stage-2 单页取消映射
  *

@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <stdint.h>
+
 struct task_struct;
 
 /* 初始化 PCI：枚举 edu、编程 BAR0、使能 memory/bus master、路由并使能 INTx */
@@ -30,11 +32,14 @@ extern unsigned int pci_edu_intx_irq;
 extern unsigned int pci_edu_lpi_base;
 extern unsigned int pci_edu_msi_enabled;
 int pci_edu_owns_requester(unsigned int requester_id);
+int pci_get_owned_config(struct task_struct *vm, unsigned int selector,
+                         uint64_t *ecam, uint64_t *bar0,
+                         uint64_t *bar0_size, unsigned int *requester_id);
 int pci_edu_vm_reset(struct task_struct *vm);
 int pci_edu_function_reset(struct task_struct *vm);
 
 /* 把 edu 的 ECAM + BAR0 映射进指定 VM 的 Stage 2（MMIO 直通） */
-void pci_passthrough_map(struct task_struct *vm);
+int pci_passthrough_map(struct task_struct *vm);
 
 /* 调试：dump PCI 直通中断链路状态（HVC_PCI_DEBUG 触发） */
 void pci_debug_dump(void);

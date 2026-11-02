@@ -142,6 +142,21 @@ void handle_hvc64(unsigned long hvc_nr)
 		/* PCI 直通中断链路诊断 dump（Phase 7 调试用） */
 		pci_debug_dump();
 		break;
+	case HVC_PCI_CONFIG: {
+		uint64_t ecam, bar0, bar0_size;
+		unsigned int requester_id;
+		uint64_t selector = regs->regs[0];
+		if (pci_get_owned_config(current, selector, &ecam, &bar0,
+					 &bar0_size, &requester_id) < 0) {
+			regs->regs[0] = -1;
+			break;
+		}
+		regs->regs[0] = ecam;
+		regs->regs[1] = bar0;
+		regs->regs[2] = bar0_size;
+		regs->regs[3] = requester_id;
+		break;
+	}
 	case HVC_PCI_RESET:
 		if (current->vmid != 1 || current->vcpu_id != 0) {
 			regs->regs[0] = -1;

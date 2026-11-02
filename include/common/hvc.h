@@ -24,6 +24,7 @@
 #define HVC_GET_VMID 3 /* 返回值 x0 = 当前 VM 的 ID（pid，Phase 3） */
 #define HVC_PCI_DEBUG 4 /* PCI 直通中断链路诊断 dump（Phase 7 调试用） */
 #define HVC_PCI_RESET 5 /* VM1 PCI edu function reset */
+#define HVC_PCI_CONFIG 6 /* x0=owned PCI function selector, returns x0..x3 resource */
 
 /* Phase 10: 新增 hypercall */
 #define HVC_SCHED_YIELD     10  /* 主动让出 CPU，返回 0 */

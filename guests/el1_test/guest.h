@@ -46,6 +46,7 @@ typedef int bool;
 #define HVC_GET_VMID       3
 #define HVC_PCI_DEBUG      4
 #define HVC_PCI_RESET      5
+#define HVC_PCI_CONFIG     6
 
 /* Phase 10: 新增 hypercall */
 #define HVC_SCHED_YIELD     10
@@ -183,7 +184,6 @@ static inline u64 hvc_call(u64 nr, u64 arg)
 	return x0;
 }
 
-/* 两参数版本的 hvc_call（x0, x1） */
 static inline u64 hvc_call2(u64 nr, u64 arg0, u64 arg1)
 {
 	register u64 x0 __asm__("x0") = arg0;
