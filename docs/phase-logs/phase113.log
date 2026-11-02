@@ -1,0 +1,27 @@
+Phase 113 PCI BAR descending allocation and bridge rollback
+
+Build:
+- Command: make -f Makefile.virt -j$(nproc)
+- Result: PASS; kernel linked successfully.
+
+Default QEMU topology:
+- Command: timeout 65 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase113-basic.log
+- virtio-net BAR4 0x4000 allocated before BAR1 0x1000; BAR0 I/O size 0x20 follows in allocator order.
+- edu BAR0 0x100000 allocated; vMSI capability initialization succeeded.
+- edu liveness and factorial(10)=3628800: PASS.
+- vITS eventID 1 delivered as vSPI 72 / vLPI 8200: PASS.
+- edu function reset and MSI reinit: PASS.
+- QEMU exited by timeout as expected.
+
+Nested bridge topology:
+- Command: timeout 75 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=off -cpu max -smp 2 -m 1G -device edu,bus=pcie.0,addr=0x3 -device pci-bridge,id=br1,bus=pcie.0,addr=0x4,chassis_nr=1 -device pci-bridge,id=br2,bus=br1,addr=0x1,chassis_nr=2 -device e1000,bus=br2,addr=0x2 -kernel bin_virt/kernel8.img -display none -monitor none -serial file:/tmp/avisor-phase113-nested.log
+- Recursive enumeration reached bus 2 and discovered both bridges plus e1000 at 02:02.0.
+- e1000 BAR0 MMIO size 0x20000 allocated before BAR1 I/O size 0x40.
+- Both bridges configured memory and I/O windows; I/O upper register verification emitted no mismatch warning.
+- edu liveness, factorial, vITS eventID delivery and reset/reinit: PASS.
+- QEMU exited by timeout as expected.
+
+Checks and scope limits:
+- No PANIC, ASSERT, BAR allocation failure, rollback warning or Stage-2 mapping failure observed.
+- Normal topology tests do not inject allocation exhaustion or recursive scan errors. BAR/bridge rollback paths were not runtime fault-injection tested.
+- Allocators remain linear; prefetchable windows, a separate 64-bit MMIO aperture, and DMA SMMU/IOMMU isolation are not implemented.
