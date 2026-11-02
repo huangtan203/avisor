@@ -283,7 +283,8 @@ static int pool_alloc(struct pci_resource_pool *pool, uint64_t size,
                       uint64_t *address)
 {
     if (!pool || !address || !size || (size & (size - 1)) ||
-        pool->count > PCI_FREE_LIST_MAX)
+        pool->count > PCI_FREE_LIST_MAX ||
+        !pool_range_valid(pool, pool->base, pool->size))
         return -1;
     int best = -1;
     uint64_t best_waste = UINT64_MAX;
@@ -342,12 +343,77 @@ static int pool_alloc(struct pci_resource_pool *pool, uint64_t size,
     return 0;
 }
 
+static int pool_alloc_high(struct pci_resource_pool *pool, uint64_t size,
+                           uint64_t *address)
+{
+    if (!pool || !address || !size || (size & (size - 1)) ||
+        pool->count > PCI_FREE_LIST_MAX ||
+        !pool_range_valid(pool, pool->base, pool->size))
+        return -1;
+    int best = -1;
+    uint64_t best_waste = UINT64_MAX;
+    uint64_t best_base = 0;
+    for (unsigned int i = 0; i < pool->count; i++) {
+        struct pci_free_range *range = &pool->ranges[i];
+        if (!pool_range_valid(pool, range->base, range->size))
+            return -1;
+        uint64_t end = range->base + range->size;
+        if (size > end)
+            continue;
+        uint64_t candidate = (end - size) & ~(size - 1);
+        if (candidate < range->base || candidate > UINT64_MAX - size ||
+            size > end - candidate)
+            continue;
+        uint64_t waste = range->size - size;
+        if (waste < best_waste) {
+            best = i;
+            best_waste = waste;
+            best_base = candidate;
+        }
+    }
+    if (best < 0)
+        return -1;
+
+    struct pci_free_range range = pool->ranges[best];
+    uint64_t end = range.base + range.size;
+    uint64_t alloc_end = best_base + size;
+    struct pci_free_range left = { range.base, best_base - range.base };
+    struct pci_free_range right = { alloc_end, end - alloc_end };
+    unsigned int pieces = !!left.size + !!right.size;
+    if (pool->count - 1 + pieces > PCI_FREE_LIST_MAX)
+        return -1;
+    for (unsigned int i = (unsigned int)best; i + 1 < pool->count; i++)
+        pool->ranges[i] = pool->ranges[i + 1];
+    pool->count--;
+    struct pci_free_range pieces_to_insert[2] = { left, right };
+    for (unsigned int p = 0; p < 2; p++) {
+        struct pci_free_range piece = pieces_to_insert[p];
+        if (!piece.size)
+            continue;
+        unsigned int pos = 0;
+        while (pos < pool->count && pool->ranges[pos].base < piece.base)
+            pos++;
+        for (unsigned int i = pool->count; i > pos; i--)
+            pool->ranges[i] = pool->ranges[i - 1];
+        pool->ranges[pos] = piece;
+        pool->count++;
+    }
+    *address = best_base;
+    return 0;
+}
+
 static int pool_free(struct pci_resource_pool *pool, uint64_t base,
                      uint64_t size)
 {
     if (!pool_range_valid(pool, base, size) ||
         pool->count > PCI_FREE_LIST_MAX)
         return -1;
+    for (unsigned int i = 0; i < pool->count; i++)
+        if (!pool_range_valid(pool, pool->ranges[i].base,
+                              pool->ranges[i].size) ||
+            (i && pool->ranges[i - 1].base + pool->ranges[i - 1].size >=
+                  pool->ranges[i].base))
+            return -1;
     uint64_t end = base + size;
     unsigned int pos = 0;
     while (pos < pool->count && pool->ranges[pos].base < base) {
@@ -392,10 +458,8 @@ static int pool_reserve_range(struct pci_resource_pool *pool, uint64_t base,
     for (unsigned int i = 0; i < pool->count;) {
         struct pci_free_range *range = &pool->ranges[i];
         uint64_t range_end;
-        if (!range->size || range->base > UINT64_MAX - range->size) {
-            i++;
-            continue;
-        }
+        if (!range->size || range->base > UINT64_MAX - range->size)
+            return -1;
         range_end = range->base + range->size;
         if (range_end <= base) {
             i++;
@@ -439,8 +503,14 @@ static uint64_t pool_used(const struct pci_resource_pool *pool)
     uint64_t free_size = 0;
     if (!pool || pool->count > PCI_FREE_LIST_MAX)
         return 0;
-    for (unsigned int i = 0; i < pool->count; i++)
+    for (unsigned int i = 0; i < pool->count; i++) {
+        if (!pool_range_valid(pool, pool->ranges[i].base,
+                              pool->ranges[i].size))
+            return 0;
         free_size += pool->ranges[i].size;
+    }
+    if (free_size > pool->size)
+        return 0;
     return pool->size - free_size;
 }
 
@@ -462,6 +532,14 @@ static int pool_selftest(void)
     if (pool_reserve_range(&pool, 0x2000, 0x6000) < 0 || pool.count != 2 ||
         pool.ranges[0].base != 0x1000 || pool.ranges[0].size != 0x1000 ||
         pool.ranges[1].base != 0x8000 || pool.ranges[1].size != 0x9000)
+        return -1;
+
+    pool_init(&pool, 0x1000, 0x10000);
+    if (pool_alloc_high(&pool, 0x1000, &first) < 0 ||
+        first != 0x10000 || pool.count != 1 ||
+        pool.ranges[0].base != 0x1000 || pool.ranges[0].size != 0xf000 ||
+        pool_free(&pool, first, 0x1000) < 0 || pool.count != 1 ||
+        pool.ranges[0].base != 0x1000 || pool.ranges[0].size != 0x10000)
         return -1;
     return 0;
 }
@@ -488,8 +566,11 @@ static void pool_dump_stats(const char *name,
          (unsigned long)pool->base);
 }
 
-static int pci_allocate_mmio(uint64_t size, uint64_t *address)
+static int pci_allocate_mmio(uint64_t size, int is_64bit,
+                             uint64_t *address)
 {
+    if (is_64bit)
+        return pool_alloc_high(&mmio_pool, size, address);
     return pool_alloc(&mmio_pool, size, address);
 }
 
@@ -636,7 +717,7 @@ static int pci_probe_bars(struct pci_device_resource *resource,
             continue;
         }
         uint64_t assigned;
-        if (pci_allocate_mmio(probe->size, &assigned) < 0) {
+        if (pci_allocate_mmio(probe->size, probe->is_64bit, &assigned) < 0) {
             WARN("PCI: MMIO BAR allocation failed at %02x:%02x.%u BAR%u size=0x%lx",
                  resource->bus, resource->dev, resource->func, i,
                  (unsigned long)probe->size);

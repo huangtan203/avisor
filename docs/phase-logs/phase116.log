@@ -1,0 +1,25 @@
+Phase 116: PCI 64-bit BAR high-address allocation and nested bridge validation
+Date: 2026-11-02
+
+Changes:
+- Added pool_alloc_high() with best-fit range selection and high-end aligned allocation.
+- Routed 64-bit MMIO BARs to high allocation; 32-bit BARs continue using low allocation.
+- Extended resource pool selftest to check high-end allocation and free-range coalescing.
+
+Build:
+- Command: make -f Makefile.virt -j2
+- Result: PASS (compile, link, image generation)
+
+Nested bridge test:
+- Command: timeout 75 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=off -cpu max -smp 2 -m 1G -device edu,bus=pcie.0,addr=0x3 -device pci-bridge,id=br1,bus=pcie.0,addr=0x4,chassis_nr=1 -device pci-bridge,id=br2,bus=br1,addr=0x1,chassis_nr=2 -device e1000,bus=br2,addr=0x2 -kernel bin_virt/kernel8.img -display none -monitor none -serial file:/tmp/avisor-phase116-nested.log
+- QEMU ran until timeout (expected for the scheduler loop).
+- PCI pool selftest passed.
+- virtio-net 64-bit BAR4: 0x3efec000/0x4000.
+- virtio-net 32-bit BAR1: 0x10000000/0x1000; edu BAR0: 0x10100000/0x100000.
+- Nested e1000 discovered at 02:02.0; BAR0: 0x10020000/0x20000.
+- Bridges 01:01.0 and 00:04.0 both configured with MMIO window 0x10000000-0x100fffff; subordinate bus reaches 2 through recursive enumeration.
+- No PANIC, ASSERT, or BAR allocation failure in captured output. Full completion of all guest tests was not asserted.
+
+Limitations:
+- Current QEMU virt MMIO aperture does not test placement above 4 GiB.
+- No stress test for deeper bridge chains or free-range list capacity.
