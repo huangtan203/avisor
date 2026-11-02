@@ -1,0 +1,28 @@
+Phase 117: PCI allocation policy framework and bridge hotplug reserve
+Date: 2026-11-02
+
+Changes:
+- Unified pool allocation under pool_alloc() with first-fit, best-fit, worst-fit, and high-best policies.
+- Added shared pool_split() and configured MMIO best-fit and I/O first-fit defaults; 64-bit MMIO BARs temporarily use high-best.
+- Added policy reporting and pool selftests for all four policy choices, high-end allocation, and range coalescing.
+- Reserved up to four subordinate bus numbers per bridge, bounded by PCI_MAX_BUSES.
+- Expanded bridge MMIO/prefetch windows by at least 1 MiB and I/O windows by at least 1 KiB, when adjacent pool capacity is available; reserved those windows from the global pools.
+
+Build:
+- Command: make -f Makefile.virt -j2
+- Result: PASS, no compiler warnings.
+
+QEMU:
+- Default topology: timeout qemu-system-aarch64 ... -device edu ...
+- Nested topology: timeout qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=off -cpu max -smp 2 -m 1G -device edu,bus=pcie.0,addr=0x3 -device pci-bridge,id=br1,bus=pcie.0,addr=0x4,chassis_nr=1 -device pci-bridge,id=br2,bus=br1,addr=0x1,chassis_nr=2 -device e1000,bus=br2,addr=0x2 -kernel bin_virt/kernel8.img -display none -monitor none -serial file:/tmp/avisor-phase117-final.log
+- Pool selftest passed.
+- 64-bit virtio-net BAR4 remained at 0x3efec000/0x4000.
+- Nested e1000 discovered on bus 2.
+- Both bridge MMIO windows: 0x10000000-0x101fffff; I/O windows: 0x0-0x1fff.
+- Stats report MMIO policy=best-fit and I/O policy=first-fit.
+- Captured output had no PANIC, ASSERT, BAR allocation failure, or reservation failure. QEMU was stopped by timeout as expected; full guest suite completion is not claimed.
+
+Limitations:
+- Runtime bus-number register readback was not added; reserve arithmetic is bounded by PCI_MAX_BUSES.
+- No dynamic hotplug or resource exhaustion/rollback fault injection was performed.
+- No >4 GiB prefetch aperture test.
