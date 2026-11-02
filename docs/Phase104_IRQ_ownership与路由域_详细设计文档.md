@@ -1,142 +1,170 @@
-# aVisor Hypervisor Phase 104 详细设计文档：IRQ ownership 与路由域
+# aVisor Phase 104 详细设计：IRQ Ownership 与路由域
 
-> 版本：Phase 104
-> 平台：QEMU virt（AArch64、EL2、GICv3）
-> 主题：物理中断独占 ownership、设备 requester 校验与 VM 路由
+> 平台：QEMU virt / AArch64 EL2 / GICv3 / ITS
+> 前置阶段：Phase 103 vGIC LR 溢出队列
+> 本阶段边界：建立物理 IRQ 所有权与软件路由权威源，不实现完整物理 affinity 迁移
 
-## 1. 概述
+## 1. 背景与目标
 
-Phase 104 建立统一的物理 IRQ ownership/routing domain。每条登记包含物理 INTID、VMID、目标 vCPU、虚拟 INTID、目标 CPU 元数据、owner 和启用状态。Hypervisor 保留的中断在启动时预先登记；VM 设备中断必须经登记后才能由物理中断处理路径注入。物理 INTID 是唯一键，不同 owner 或 VM 不能重复登记、抢占该 INTID。
+此前 PCI INTx、MSI LPI 和 vITS LPI 的目标 VM 分散在调用点或隐式常量中，无法统一拒绝重复分配和越权 requester。Phase 104 引入固定容量 IRQ domain，以物理 INTID 为唯一键，统一描述 Hypervisor 保留中断和 VM-owned 中断。
 
-本阶段覆盖当前 QEMU virt PCI edu 直通设备和 VM1/vCPU0，不提供通用 PCI 多设备分配器。vITS MAPD/MAPTI 在接受请求前校验 VM 与 requester ID；非设备所有者请求被拒绝。
+目标：
 
-## 2. 目标与边界
+1. 物理 INTID 只能属于一个 owner；跨 owner、跨 VM 重复登记必须失败。
+2. LPI/INTx 分发只信任 route，不再使用无 ownership 的硬编码 fallback。
+3. vITS MAPD/MAPTI 在创建映射前验证 requester ownership。
+4. vCPU 迁移更新 route 的 `target_cpu` 软件元数据。
+5. 启动自测覆盖注册、冲突、查询、更新和注销。
 
-- 以固定容量 route 表统一管理物理 IRQ ownership 和路由信息。
-- 启动时登记 Hypervisor 的 SGI、PPI、物理 timer IRQ 与 UART IRQ，避免 VM 取得保留中断。
-- PCI edu INTx、MSI LPI 和 vITS 分配的物理 LPI 均通过 domain 登记。
-- 物理 LPI 分发必须查询 domain；无有效 VM route 时丢弃并结束物理中断，不再回退到硬编码 VM1 路由。
-- 在 Guest 中验证未授权 requester 被拒绝，合法 requester 仍能完成 vITS LPI 投递。
-- 调度迁移仅更新 route 中的 `target_cpu` 软件元数据。本阶段不修改 GICD IROUTER，也不实现 MSI LPI 的物理 affinity 迁移。
-- 未将 QEMU maintenance PPI 注册或行为列为已实现能力。
+## 2. 总体架构
 
-## 3. 数据模型与并发
+```mermaid
+flowchart LR
+    Boot[main_virt 启动] --> Domain[IRQ Domain]
+    PCI[PCI INTx/MSI 初始化] --> Domain
+    VITS[vITS MAPD/MAPTI] --> Owner[Requester ownership]
+    Owner --> Domain
+    IRQ[物理 IRQ handler] --> Domain
+    Domain --> VGIC[vGIC 注入]
+    Sched[vCPU migration] --> Domain
 
-`struct irq_route` 保存 `pintid`、`vmid`、`vcpu_id`、`vintid`、`target_cpu`、`owner` 和 `enabled`。表容量为 64；VM route 的 owner 为 `IRQ_DOMAIN_OWNER_VM`，Hypervisor 保留 route 使用 `IRQ_DOMAIN_OWNER_HYP`。
+    Domain --- Table[(irq_route[64])]
+    PCI --> ITS[物理 ITS]
+    ITS --> IRQ
+```
 
-注册接口验证 VMID、vCPU 和物理/虚拟 INTID 范围。SPI 范围为 32..1019，LPI 范围为 8192..16383；vLPI 必须保留其原始 INTID，以供后续映射为虚拟 SPI。相同 pINTID 仅允许同 owner、同 VM 的更新；跨 owner 或 VM 冲突返回错误。
+IRQ domain 是软件 ownership 和投递目标的权威源；物理 GIC/ITS 仍负责中断产生和翻译，vGIC 负责向目标 vCPU 注入。
 
-route 表由短临界区保护：获取锁前保存 DAIF 并屏蔽 IRQ，使用 `LDAXR`/`STXR` 获取自旋锁，释放时以 `STLR` 释放并恢复原 DAIF。查找返回 route 结构副本，避免调用方持锁访问表项。
+## 3. 数据结构与不变量
 
-## 4. 架构与调用关系
+`struct irq_route` 字段如下：
 
-### 4.1 启动隔离
+| 字段 | 语义 |
+|---|---|
+| `pintid` | 物理 SPI/LPI INTID，route 唯一键 |
+| `vintid` | Guest 可见虚拟 INTID；vLPI 可保留 8192 以上编号 |
+| `vmid` / `vcpu_id` | 目标虚拟机与 vCPU |
+| `target_cpu` | 当前目标 pCPU 软件元数据 |
+| `owner` | `IRQ_DOMAIN_OWNER_HYP` 或 `IRQ_DOMAIN_OWNER_VM` |
+| `enabled` | 表项有效位 |
+
+核心不变量：
+
+- VMID、vCPU、物理/虚拟 INTID 必须在有效范围内。
+- SPI 范围为 32–1019，LPI 范围为 8192–16383。
+- 同一 `pintid` 仅允许同 owner、同 VM 更新；其他冲突返回失败。
+- `irq_domain_unregister()` 只能删除 VM-owned route，不能撤销 Hypervisor 保留项。
+- lookup 返回结构副本，不把表内指针暴露到锁外。
+
+## 4. 并发设计
+
+route 表由短临界区自旋锁保护。`domain_lock()` 保存 DAIF、屏蔽 IRQ，并使用 `LDAXR/STXR` 获取锁；`domain_unlock()` 用 `STLR` 释放并恢复 DAIF。锁内只做表扫描和结构复制，不执行 GIC MMIO 或 vGIC 注入。
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant L as route_lock
+    participant T as routes[]
+    C->>L: 保存 DAIF，屏蔽 IRQ，LDAXR/STXR
+    L-->>C: lock acquired
+    C->>T: validate / scan / copy or update
+    T-->>C: result
+    C->>L: STLR unlock，恢复 DAIF
+```
+
+## 5. 关键流程
+
+### 5.1 启动与隔离自测
 
 ```mermaid
 flowchart TD
     A[hypervisor_main] --> B[irq_domain_init]
-    B --> C[register_route: Hypervisor SGI/PPI]
-    B --> D[register_route: timer 42/43 与 UART 65]
-    A --> E[irq_domain_selftest]
-    E --> F{合法登记、冲突、查找、迁移元数据、注销}
-    F -->|通过| G[gic_init]
-    F -->|失败| H[PANIC]
+    B --> C[登记 Hypervisor SGI/PPI/timer/UART]
+    C --> D[irq_domain_selftest]
+    D --> E{注册/冲突/lookup/affinity/unregister}
+    E -->|通过| F[gic_init]
+    E -->|失败| G[PANIC]
 ```
 
-自测在 GIC 初始化前运行，覆盖合法 LPI route、跨 VM 冲突、Hypervisor IRQ 冲突、非法 vCPU、lookup、目标 CPU 元数据更新及注销。
-
-### 4.2 PCI 与 vITS ownership
+### 5.2 PCI/vITS ownership 建立
 
 ```mermaid
 flowchart TD
-    A[pci_init] --> B[发现 edu INTx]
-    B --> C[irq_domain_register: VM1/vCPU0/VIRQ_PCI_EDU]
+    A[pci_init] --> B[计算 edu INTx]
+    B --> C[irq_domain_register]
     A --> D[its_setup_pci_msi]
-    D --> E[irq_domain_register: edu MSI LPI routes]
-    F[vITS command processor] --> G[vits_cmd_mapd 或 vits_cmd_mapti]
-    G --> H{VMID 为 1 且 requester 属于 edu?}
-    H -->|否| I[拒绝并记录 WARN]
-    H -->|是| J[分配物理 LPI]
-    J --> K[irq_domain_register]
-    K --> L[更新 vITS 映射并配置物理 ITS]
+    D --> E[登记 MSI LPI routes]
+    F[vits_cmd_mapd/mapti] --> G{VM1 且 requester 属于 edu?}
+    G -->|否| H[拒绝命令并 WARN]
+    G -->|是| I[建立物理 ITS 映射]
+    I --> J[irq_domain_register]
 ```
 
-Requester ID 按 PCI 编码 `(bus << 8) | (device << 3) | function` 计算。当前 edu 测试设备 requester ID 为 16；负向用例使用 17。物理 LPI 登记失败时不继续写 vITS 映射。
+Requester ID 使用 `(bus << 8) | (device << 3) | function`。当前 ownership policy 只授权 VM1 的 edu function。
 
-### 4.3 物理中断分发与迁移元数据
+### 5.3 物理 IRQ 分发
 
 ```mermaid
 flowchart TD
-    A[handle_irq] --> B{LPI 或 edu INTx?}
+    A[handle_irq / gic_ack_irq] --> B{INTID 类型}
     B -->|LPI| C[irq_domain_lookup]
-    C --> D{VM-owned route 存在?}
-    D -->|是| E[按 VMID/vCPU 查找目标 task]
-    E --> F[转换 vLPI 为虚拟 SPI（需要时）]
+    C --> D{VM route 存在?}
+    D -->|是| E[查找 vmid/vcpu task]
+    E --> F[必要时 vLPI 转 vSPI]
     F --> G[vgic_inject_virq_to_vm]
-    D -->|否| H[WARN 并丢弃]
-    B -->|edu INTx| I[irq_domain_lookup]
-    I --> J{当前 VM/vCPU 是 route 目标?}
+    D -->|否| H[WARN + drop + EOI]
+    B -->|edu INTx| I[lookup route]
+    I --> J{当前上下文是目标?}
     J -->|是| K[vgic_inject_virq_hw_eoi]
-    J -->|否| L[DIR 与 EOI]
-    M[sched_migrate_current] --> N[irq_domain_update_vcpu_affinity]
-    N --> O[更新 target_cpu 元数据]
+    J -->|否| L[DIR + EOI]
 ```
 
-LPI 注入目标来自 route 的 VMID/vCPU/vINTID。vLPI 8200 在当前 vGIC 路径中转换为 vSPI 72。INTx 仍依赖当前上下文匹配目标 VM/vCPU；本阶段不增加远程物理中断转发机制。
+## 6. 函数调用关系
 
-## 5. 代码映射
+```mermaid
+flowchart LR
+    irq_domain_init --> register_route
+    irq_domain_register --> register_route
+    pci_init --> irq_domain_register
+    vits_cmd_mapti --> irq_domain_register
+    handle_irq --> irq_domain_lookup
+    irq_domain_lookup --> vgic_inject_virq_to_vm
+    sched_migrate_current --> irq_domain_update_vcpu_affinity
+    irq_domain_selftest --> irq_domain_register
+    irq_domain_selftest --> irq_domain_lookup
+    irq_domain_selftest --> irq_domain_unregister
+```
 
-| 文件 | 变更 |
+## 7. 接口与代码映射
+
+| 文件 | 主要职责 |
 |---|---|
-| `include/boards/virt/irq_domain.h`、`hypervisor/boards/virt/irq_domain.c` | route 数据结构、独占注册/查询/注销、VM 批量注销、迁移元数据更新、启动自测 |
-| `hypervisor/boards/virt/main_virt.c` | GIC 初始化前初始化 domain 并运行隔离自测 |
-| `hypervisor/boards/virt/pci.c`、`include/boards/virt/pci.h` | edu requester ID 判定；登记 INTx 与 MSI LPI |
-| `hypervisor/boards/virt/vits.c` | MAPD/MAPTI requester 与 VM ownership 校验；登记物理 LPI；通过 domain 查询映射 |
-| `hypervisor/boards/virt/irq.c` | 按 route 分发 LPI/INTx，移除无 route 的硬编码 LPI fallback |
-| `hypervisor/common/sched.c` | vCPU 迁移时更新软件 `target_cpu` 元数据 |
-| `guests/el1_test/main.c` | 增加 requester 17 的非法 MAPD/MAPTI 负向用例 |
+| `include/boards/virt/irq_domain.h` | route 模型与公共 API |
+| `hypervisor/boards/virt/irq_domain.c` | 表管理、并发保护、自测 |
+| `hypervisor/boards/virt/main_virt.c` | GIC 初始化前建立 domain |
+| `hypervisor/boards/virt/pci.c` | edu INTx/MSI ownership 登记 |
+| `hypervisor/boards/virt/vits.c` | requester 校验与 LPI route 建立 |
+| `hypervisor/boards/virt/irq.c` | route 驱动的 LPI/INTx 分发 |
+| `hypervisor/common/sched.c` | 迁移时更新目标 CPU 元数据 |
+| `guests/el1_test/main.c` | 非 owner requester 负向测试 |
 
-## 6. 验证
+## 8. 错误处理与安全属性
 
-构建命令：
+- 表满、参数越界和 ownership 冲突均返回 `-1`。
+- 未登记 LPI 被明确丢弃并 EOI，不回退到 VM1。
+- MAPD/MAPTI requester 校验失败时不分配物理 LPI，不修改 route。
+- Hypervisor 保留 INTID 不能通过 VM unregister 接口删除。
 
-```sh
-make -f Makefile.virt -j$(nproc)
-```
+## 9. 验证
 
-结果：PASS；kernel 镜像大小 248464 bytes。
+- `make -f Makefile.virt -j$(nproc)`：PASS，镜像 248464 bytes。
+- QEMU：`timeout 45 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase104-final.log`，由 timeout 结束。
+- 观察到 domain selftest PASS；requester 17 的 MAPD/MAPTI 被拒绝；合法 requester 完成 vLPI 8200 → vSPI 72 投递；迁移、LR overflow、virtio-net、ivshmem 和 VM2→VM3 migration 相关标记通过。
+- 日志未发现 PANIC、ASSERT、FAILED、Unknown IRQ 或 no-ownership drop。
 
-QEMU 回归命令：
+## 10. 限制
 
-```sh
-timeout 45 make -f Makefile.virt run-log \\
-  QEMU_SERIAL_LOG=/tmp/avisor-phase104-final.log
-```
-
-QEMU 以退出码 124 被 timeout 终止，符合该持续运行 guest 测试的预期。最终串口日志大小 116796 bytes，关键结果：
-
-```text
-IRQ domain: ownership/routing isolation selftest PASSED
-[vm1] virtio-net: ALL loopback tests PASSED!
-[vm2] virtio-net: ALL loopback tests PASSED!
-[vm2] ivshmem: ping-pong test PASSED
-[vm1] ivshmem: ping-pong test PASSED
-WARN[1]: vITS: MAPD rejected for unowned requester 17
-WARN[1]: vITS: MAPTI rejected for unowned requester 17
-[vm1] vITS: PASSED! Received vSPI 72 (vLPI 8200)
-[vm1] sched: vCPU migration CPU0->CPU1->CPU0 PASSED
-[vm2] gicd: LR overflow queue delivered all 4 interrupts PASSED
-[vm1] gicd: LR overflow queue delivered all 4 interrupts PASSED
-[vm3] PASSED: 双 vCPU Live Migration 成功（VM2 -> VM3）
-```
-
-最终日志未发现 `PANIC`、`ASSERT`、`FAILED`、`SOME tests FAILED`、`Unknown IRQ` 或 `no ownership route` 丢弃标记。日志记录和逐项结果见 `docs/phase-logs/phase104.log`。
-
-## 7. 限制
-
-- 所有 route 共用 64 项静态表；edu MSI route 最多登记 16 个向量。
-- PCI requester/VM ownership 当前仅覆盖 VM1 上的 edu 设备，不能推导为通用多设备隔离实现。
-- vITS 仍维护内部 `lpi_map` 状态；物理 LPI 的 ownership 与 IRQ 分发查询以 IRQ domain 为权威来源。
-- 迁移更新 `target_cpu` 软件元数据，不改变设备 IRQ 的 GICD IROUTER，也未实现 MSI LPI affinity 迁移。
-- edu INTx 的注入仅在目标 VM/vCPU 当前执行时进行；本阶段未实现远端转发。
-- 未登记或验证 maintenance PPI；domain 启动保留项为 SGI、PPI、timer INTID 42/43 和 UART INTID 65。
+- route 表固定 64 项。
+- ownership policy 只覆盖 VM1 edu，不是通用 PCI 分配器。
+- 本阶段 `target_cpu` 只是软件元数据；SPI IROUTER 同步由 Phase 105 增加，LPI collection affinity 仍未迁移。
+- INTx 仅在目标 VM/vCPU 当前运行时注入，不提供远程 INTx 转发。
