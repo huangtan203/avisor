@@ -1,90 +1,115 @@
-# aVisor Hypervisor Phase 111 详细设计文档：vMSI 与 MSI 写拦截
+# aVisor Phase 111 详细设计：edu vMSI 与 MSI 配置写拦截
 
-> 阶段：Phase 111
-> 平台：QEMU virt（AArch64、EL2、GICv3、ITS）
-> 前置阶段：Phase 110 PCI ECAM trap-and-emulate
+> 平台：QEMU virt / AArch64 EL2 / PCI ECAM emulation / ITS
+> 前置阶段：Phase 110 ECAM trap-and-emulate
+> 范围：VM1 edu 的 MSI capability 虚拟化；不含 MSI-X
 
-## 1. 目标
+## 1. 安全目标
 
-Phase 111 在 Phase 110 的 ECAM 模拟上为 owner VM1 的 edu PCI function 增加虚拟 MSI 状态。Guest 可以读取和更新虚拟 Message Address、Message Data、MSI Enable、MME 和可选 Mask Bits，但不能通过配置空间把物理 MSI doorbell 改到 ITS 之外。物理 Message Address 始终由 Hypervisor 设置为 ITS Translator 地址；Guest 选择的 Message Data 同步到物理设备，作为 ITS eventID。
+Guest 需要控制 MSI Message Data/eventID，但不能改变物理 MSI doorbell，使设备向 Hypervisor ITS 之外任意地址写入。Phase 111 在 ECAM emulator 中加入 edu vMSI shadow state：Guest 写虚拟地址只影响 guest-visible 状态；物理地址始终由 Hypervisor 固定为 ITS Translator，eventID 经 owner/requester 校验后路由。
 
-目前实现只覆盖 edu 单设备 MSI。MSI-X、其他 PCI function 的 MSI capability 和 PCI DMA/IOMMU 不属于本阶段范围。
+## 2. 数据模型
 
-## 2. 流程
+阶段实现使用 edu 专属 vMSI 状态，包含：
+
+| 状态 | 语义 |
+|---|---|
+| capability offset/layout | MSI capability 位置、32/64-bit 地址和可选 mask 布局 |
+| virtual control | Guest-visible Enable/MME；MMC/能力位只读 |
+| virtual address | Guest 对配置空间读写看到的地址状态 |
+| virtual data | Guest eventID，更新时同步物理 Message Data |
+| mask/pending | 软件 Mask/Pending shadow；Pending 只读 |
+| physical address | 固定 ITS Translator PA，不由 Guest 提供 |
+
+MME 不超过 MMC。物理设备 MSI Enable 保持 Hypervisor 控制，物理 MME 固定单向量，Guest 不能要求未分配物理 vector。
+
+## 3. 配置访问架构
+
+```mermaid
+flowchart LR
+    Guest[ECAM load/store] --> Abort[Stage-2 abort decode]
+    Abort --> PCI[pci_mmio_access]
+    PCI --> Owner{owner edu + MSI capability?}
+    Owner -->|no| Generic[Phase 110 config policy]
+    Owner -->|yes| VMSI[vMSI byte-lane handler]
+    VMSI --> Shadow[(virtual MSI state)]
+    VMSI -->|permitted data only| Device[physical MSI capability]
+    Device --> ITS[fixed physical ITS doorbell]
+    ITS --> LPI[requester/event route]
+```
+
+## 4. Byte-lane 写入策略
 
 ```mermaid
 flowchart TD
-    A[Guest ECAM access] --> B[Stage-2 abort / pci_mmio_access]
-    B --> C{owner edu 且访问落在 MSI capability?}
-    C -->|否| D[Phase 110 PCI config policy]
-    C -->|是 read| E[从 vMSI control/address/data/mask/pending 返回字节]
-    C -->|是 write| F[按 capability 布局拆分访问字节]
-    F --> G{字段类型}
-    G -->|Control| H[只更新虚拟 Enable/MME，MMC/能力只读]
-    G -->|Address| I[只更新虚拟地址，不写物理设备]
-    G -->|Data| J[更新虚拟数据并同步物理 Message Data]
-    G -->|Mask| K[更新软件 Mask 状态]
-    G -->|Pending/只读| L[忽略写]
-    H --> M[物理 MSI Enable 保持开启，物理 MME 固定为 0]
-    I --> N[物理 Message Address 保持 ITS doorbell]
-    J --> O[设备发 MSI，ITS 以 requester ID + eventID 路由]
-    P[edu reset/reinit] --> Q[重建 doorbell、eventID=0 与 vMSI control 状态]
+    A[pci_vmsi_access] --> B[map each byte to capability field]
+    B --> C{field}
+    C -->|Message Control| D[keep MMC/64bit/mask capability; update Enable/MME only]
+    C -->|Message Address| E[update virtual address only]
+    C -->|Message Data| F[update shadow and physical eventID]
+    C -->|Mask Bits| G[update software mask; sync supported physical mask]
+    C -->|Pending Bits/RO| H[ignore write]
+    D --> I[physical control remains protected]
+    E --> J[physical doorbell remains ITS translator]
 ```
+
+32-bit/64-bit MSI capability的 Message Data、Mask、Pending offset 按 control 的 64-bit bit 计算。每个访问字节单独合并，确保跨 lane 写不会改动保留字段。
+
+## 5. MSI 投递时序
 
 ```mermaid
 sequenceDiagram
-    participant VM as Guest VM1
-    participant ECAM as Phase 110 ECAM emulator
-    participant vMSI as edu vMSI state
-    participant Dev as QEMU edu device
-    participant ITS as Physical ITS
-    VM->>ECAM: write Message Address = attacker-selected address
-    ECAM->>vMSI: update virtual address only
-    VM->>ECAM: read Message Address
-    ECAM->>vMSI: return virtual address
-    Note over Dev,ITS: physical address remains the Hypervisor ITS doorbell
-    VM->>ECAM: write Message Data = eventID 1
-    ECAM->>vMSI: update virtual data
-    ECAM->>Dev: synchronize Message Data
-    VM->>Dev: trigger device interrupt
-    Dev->>ITS: MSI write to protected ITS doorbell, data=1
-    ITS-->>VM: requester/event mapping injects guest LPI
+    participant G as Guest
+    participant E as ECAM emulator
+    participant V as vMSI shadow
+    participant D as edu device
+    participant I as Physical ITS/vITS
+    G->>E: write attacker address
+    E->>V: save guest-visible address
+    Note over D,I: physical doorbell remains ITS Translator
+    G->>E: write Message Data = eventID
+    E->>V: update virtual data
+    E->>D: update physical MSI data only
+    G->>D: trigger edu IRQ
+    D->>I: ITS doorbell + requester + eventID
+    I->>I: validate owner and lookup ITT mapping
+    I-->>G: mapped Guest LPI
 ```
 
-## 3. MSI capability 状态与布局
+## 6. Reset/reinit
 
-- `edu_vmsi_ctrl` 保存 Guest-visible Message Control。MMC、64-bit capability 和 Per-vector Masking capability 来自探测到的硬件能力，不接受 Guest 修改；Guest 仅能写 MSI Enable 与 MME。MME 不得超过 MMC。
-- `edu_vmsi_addr` 保存 Guest 的虚拟 Message Address。物理 MSI 地址不由该字段驱动；设备启用 MSI 时 Guest read 返回 Hypervisor ITS doorbell，Guest 对地址的 write 只改虚拟字段。
-- `edu_vmsi_data` 保存 Guest-visible Message Data，并在每次更新后同步至设备的 Message Data 字段，使 ITS 能以 Guest 选定 eventID 查找 ITT。
-- `edu_vmsi_mask` 保存可选 Per-vector Mask Bits；`edu_vmsi_pending` 保存只读 Pending Bits 软件状态。
-- 32-bit/64-bit MSI 按 capability control 的 64-bit 位计算 Message Data、Mask、Pending 偏移和 capability 长度。未实现 Mask capability 时，不暴露其后续字节。
-- MSI Control 的物理 Enable 始终保持开启，物理 MME 固定为 0（一个硬件向量）。Guest-visible Enable/MME 是虚拟状态；避免 Guest 关闭物理 MSI 或要求设备发送未经 Hypervisor 分配的多个物理向量。
+edu reset 先 quiesce 并撤销旧 MSI mapping；重新初始化时重建 ITS route、恢复物理 doorbell/eventID 0 和受控物理 control。Guest-visible Enable 恢复到可用状态，software Mask/Pending 清零。Guest 后续可写入有 vITS event mapping 的 eventID。
 
-## 4. Reset
+## 7. 函数调用关系与文件职责
 
-edu quiesce 阶段使 Guest-visible MSI Enable 清零，但物理 MSI 保持启用以维持受控的中断通路。function reset 后重新建立 ITS mapping，恢复 ITS doorbell 与 eventID 0，设置 vMSI Enable 并清空软件 Mask/Pending 状态。Guest 之后仍可通过 MSI data 写入选择已在 vITS 中映射的 eventID。
+```mermaid
+flowchart LR
+    pci_mmio_access --> pci_vmsi_access
+    pci_vmsi_access --> pci_vmsi_write_byte
+    pci_vmsi_access --> pci_config_read
+    pci_vmsi_access --> pci_config_write
+    pci_edu_function_reset --> pci_edu_reinit_msi
+    pci_edu_reinit_msi --> its_setup_pci_msi
+    its_setup_pci_msi --> irq_domain_register
+    guest_vits_test --> ECAM_MSI_data_write
+```
 
-## 5. 代码映射
-
-| 文件 | 变更 |
+| 文件 | 职责 |
 |---|---|
-| `hypervisor/boards/virt/pci.c` | edu vMSI 状态、32/64-bit capability byte access、物理 MSI address/data/control 策略、reset/reinit 同步 |
-| `guests/el1_test/main.c` | 验证虚拟/物理隔离的 Message Address、只读控制能力位、eventID 路由及 reset 后 MSI |
+| `hypervisor/boards/virt/pci.c` | edu vMSI shadow、capability layout、物理 MSI policy、reset reinit |
+| `guests/el1_test/main.c` | 虚拟/物理地址保护、eventID 投递和 reset 回归 |
 
-## 6. 验证
+## 8. 验证
 
-构建：`make -f Makefile.virt -j$(nproc)`，通过。
+- `make -f Makefile.virt -j$(nproc)`：PASS。
+- 默认拓扑确认 64-bit MSI；Guest 写入 `0xdead0000` 后物理地址保持 ITS doorbell `0x08090040`；Message Data=1 后收到 vSPI 72/vLPI 8200；reset/reinit 后再次投递通过。
+- nested bridge 下 edu requester 24，MSI protection、eventID delivery、reset recovery 通过。
+- 日志无 PANIC/ASSERT/Data Abort；已有 task-slot reuse FAIL 不纳入本阶段通过项。
 
-基础拓扑日志：`/tmp/avisor-phase111-basic.log`。验证 MSI capability 为 64-bit、Guest-visible Enable/Mask capability 保留；Guest 写入 `0xdead0000` 后读回仍为物理 ITS doorbell `0x08090040`；Guest 写 Message Data=1 后 vITS 收到 vSPI 72（vLPI 8200）；edu function reset 后 MSI reinit 和再次 eventID 路由通过。
+## 9. 限制
 
-嵌套桥拓扑日志：`/tmp/avisor-phase111-nested.log`。edu requester ID 为 24，两级桥及下挂 e1000 枚举后，同一组 vMSI address protection、eventID delivery 和 reset recovery 测试通过。
-
-全量 Guest 输出仍有已知 `FAIL: task 槽位未被实际复用`，与 vMSI 无关；不宣称全量回归全部通过。未发现 PANIC、ASSERT 或 Data Abort。
-
-## 7. 限制
-
-- vMSI 只虚拟化 owner VM1 的 edu；其他设备 MSI 仍按现有 config policy 处理。
-- MSI-X 尚未模拟。
-- Mask/Pending 为软件状态，未同步设备物理 mask；Guest mask 向量不保证阻止设备发 MSI。
-- MSI Data 是 eventID。Guest 只能成功路由至 vITS 中存在且 requester owner 合法的 event 映射；无映射 event 不会得到有效 Guest LPI。
-- PCI DMA 尚无 SMMU/IOMMU 隔离。
+- 只覆盖 owner edu，不是通用 per-function capability state。
+- MSI-X 未实现。
+- Mask/Pending 是软件状态；硬件 mask 同步不保证所有设备都遵循虚拟 mask 语义。
+- Guest eventID 必须有合法 requester/vITS 映射，否则不会得到有效 Guest LPI。
+- 无 SMMU/IOMMU DMA 隔离。
