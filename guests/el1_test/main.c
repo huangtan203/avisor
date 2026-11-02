@@ -4026,10 +4026,47 @@ static void vits_test(void)
         mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF, msi_data);
         guest_puts("vITS: MSI data restored\n");
 
-        if (hvc_call(HVC_PCI_IRQ_TEARDOWN_TEST, 0) == 0)
-            guest_puts("vITS: edu IRQ teardown PASSED\n");
-        else
-            guest_puts("vITS: edu IRQ teardown FAILED\n");
+        if (hvc_call(HVC_PCI_RESET, 0) == 0) {
+            u32 pci_id = mmio_read32(ecam_addr);
+            u32 bar0 = mmio_read32(ecam_addr + 0x10);
+            u32 reset_id = mmio_read32(EDU_BAR0_BASE + EDU_ID_REG);
+            u32 reset_live = mmio_read32(EDU_BAR0_BASE + EDU_LIVENESS_REG);
+            u32 reset_fact = mmio_read32(EDU_BAR0_BASE + EDU_FACTORIAL_REG);
+            if ((pci_id & 0xffffffff) != 0x11e81234 ||
+                bar0 != EDU_BAR0_BASE || reset_id != 0x010000ed ||
+                reset_live != 0xffffffff || reset_fact != 1) {
+                guest_puts("vITS: edu reset identity/state FAILED (pci=0x");
+                puts_hex(pci_id, 8);
+                guest_puts(" bar=0x");
+                puts_hex(bar0, 8);
+                guest_puts(" id=0x");
+                puts_hex(reset_id, 8);
+                guest_puts(" live=0x");
+                puts_hex(reset_live, 8);
+                guest_puts(" fact=0x");
+                puts_hex(reset_fact, 8);
+                guest_puts(")\n");
+                return;
+            }
+            guest_puts("vITS: edu reset identity/state PASSED\n");
+            vits_mapti(EDU_DEVID, 1, VITS_TEST_VLPI, 0);
+            vits_sync();
+            mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF,
+                         (msi_data & 0xFFFF0000) | 1);
+            vits_irq_received = 0;
+            vits_irq_intid = 0;
+            mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, 0xffffffff);
+            mmio_write32(EDU_BAR0_BASE + EDU_IRQ_RAISE, 0xfeedbabe);
+            timeout = 10000000;
+            while (!vits_irq_received && timeout-- > 0)
+                asm volatile("nop");
+            if (vits_irq_received && vits_irq_intid == VITS_TEST_VSPI)
+                guest_puts("vITS: edu function reset + MSI reinit PASSED\n");
+            else
+                guest_puts("vITS: edu function reset MSI FAILED\n");
+        } else {
+            guest_puts("vITS: edu function reset FAILED\n");
+        }
     }
 }
 

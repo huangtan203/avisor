@@ -293,6 +293,21 @@ static void vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
 
     /* 物理 DevID = vDevID（直通场景，设备唯一） */
     uint32_t pdevid = vdevid;
+    if (veventid == 0) {
+        unsigned int base = pci_edu_lpi_base;
+        unsigned int plpi_event = base + veventid;
+        if (!base || irq_domain_register(plpi_event, vits->vm->vmid, 0,
+                                         vintid) < 0) {
+            WARN("vITS: MSI event route registration failed");
+            return;
+        }
+        lpi_map[plpi_event - LPI_MAP_BASE].vmid =
+            (uint16_t)vits->vm->vmid;
+        lpi_map[plpi_event - LPI_MAP_BASE].vintid = vintid;
+        INFO("vITS: MAPTI uses PCI MSI LPI %u for event %u",
+             plpi_event, veventid);
+        return;
+    }
 
     /*
      * 1. 配置 LPI 属性表

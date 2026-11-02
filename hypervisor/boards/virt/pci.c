@@ -25,6 +25,7 @@
 #include "arch/aarch64/mmu.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/mm.h"
+#include "common/delays.h"
 #include "common/debug.h"
 #include "common/utils.h"
 
@@ -49,6 +50,11 @@
 /* Capability IDs */
 #define PCI_CAP_ID_MSI     0x05
 #define PCI_CAP_ID_MSIX    0x11
+#define PCI_CAP_ID_EXP     0x10
+#define PCI_EXP_DEVCAP     0x04
+#define PCI_EXP_DEVCTL     0x08
+#define PCI_EXP_DEVCAP_FLR (1U << 28)
+#define PCI_EXP_DEVCTL_FLR (1U << 15)
 
 /* MSI Capability 寄存器偏移（32 位消息地址模式） */
 #define PCI_MSI_CTRL       0x02  /* Message Control（offset 相对于 cap 头部） */
@@ -56,7 +62,15 @@
 #define PCI_MSI_DATA       0x08  /* Message Data（32位） */
 #define PCI_MSI_MASK       0x0c  /* Mask Bits（可选，取决于 MSC） */
 #define PCI_MSI_PEND       0x10
-#define EDU_REG_IRQ_ACK    0x24
+#define EDU_REG_LIVENESS   0x04
+#define EDU_REG_FACTORIAL  0x08
+#define EDU_REG_STATUS     0x20
+#define EDU_REG_IRQ_STATUS 0x24
+#define EDU_REG_DMA_SRC    0x80
+#define EDU_REG_DMA_DST    0x88
+#define EDU_REG_DMA_COUNT  0x90
+#define EDU_REG_DMA_CMD    0x98
+#define EDU_REG_IRQ_ACK    0x64
 
 /* MSI Message Control 位 */
 #define PCI_MSI_CTRL_EN          (1 << 0)   /* MSI Enable */
@@ -96,6 +110,9 @@ unsigned int pci_edu_intx_irq = 0;
  * edu MSI 相关变量（Phase 8）
  */
 static int edu_msi_cap_off = 0;   /* MSI Capability 在配置空间中的偏移（0=不存在） */
+static int edu_pcie_cap_off = 0;   /* PCIe Capability 偏移（0=不存在） */
+static int edu_flr_supported = 0;
+static unsigned int edu_msi_max_vectors = 1;
 unsigned int pci_edu_lpi_base = 0;  /* edu MSI 对应的 LPI 基址（0=未配置） */
 unsigned int pci_edu_msi_enabled = 0; /* MSI 是否已启用 */
 
@@ -251,13 +268,20 @@ void pci_init(void)
             uint8_t cap_id = (uint8_t)(cap_hdr & 0xFF);
             uint8_t next_ptr = (uint8_t)((cap_hdr >> 8) & 0xFF);
 
-            if (cap_id == PCI_CAP_ID_MSI) {
+            if (cap_id == PCI_CAP_ID_MSI)
                 edu_msi_cap_off = cap_off;
-                break;
-            }
+            else if (cap_id == PCI_CAP_ID_EXP)
+                edu_pcie_cap_off = cap_off;
             cap_off = next_ptr;
         }
 
+        if (edu_pcie_cap_off) {
+            uint32_t devcap = pci_config_read(edu_bus, edu_dev, edu_func,
+                                               edu_pcie_cap_off + PCI_EXP_DEVCAP);
+            edu_flr_supported = !!(devcap & PCI_EXP_DEVCAP_FLR);
+        }
+        INFO("PCI: edu PCIe FLR %s",
+             edu_flr_supported ? "supported" : "not supported");
         if (edu_msi_cap_off == 0) {
             INFO("PCI: edu has no MSI capability, use INTx only");
             return;
@@ -269,6 +293,7 @@ void pci_init(void)
         int is_64bit = (msi_ctrl & PCI_MSI_CTRL_64BIT) ? 1 : 0;
         int mme_shift = (msi_ctrl >> PCI_MSI_CTRL_MMC_SHIFT) & 0x7;
         unsigned int max_vectors = 1 << mme_shift;
+        edu_msi_max_vectors = max_vectors;
 
         INFO("PCI: edu MSI cap at 0x%x (%s-bit, max %u vectors)",
              edu_msi_cap_off, is_64bit ? "64" : "32", max_vectors);
@@ -282,14 +307,6 @@ void pci_init(void)
             return;
         }
         pci_edu_lpi_base = lpi_base;
-        unsigned int owned_vectors = max_vectors > 16 ? 16 : max_vectors;
-        for (unsigned int i = 0; i < owned_vectors; i++) {
-            if (irq_domain_register(lpi_base + i, 1, 0,
-                                    VIRQ_PCI_EDU) < 0) {
-                WARN("PCI: edu MSI LPI ownership registration failed");
-                return;
-            }
-        }
 
         /* 5.5 写 MSI 消息地址（32 位 PA，高 32 位为 0）和消息数据 */
         uint64_t msi_addr = its_get_msi_address();
@@ -324,6 +341,14 @@ void pci_init(void)
         msi_ctrl |= PCI_MSI_CTRL_EN;
         pci_config_write(edu_bus, edu_dev, edu_func,
                          edu_msi_cap_off + PCI_MSI_CTRL, msi_ctrl);
+        unsigned int owned_vectors = max_vectors > 16 ? 16 : max_vectors;
+        for (unsigned int i = 0; i < owned_vectors; i++) {
+            if (irq_domain_register(lpi_base + i, 1, 0,
+                                    VIRQ_PCI_EDU) < 0) {
+                WARN("PCI: edu MSI LPI ownership registration failed");
+                return;
+            }
+        }
 
         /* 禁用 INTx（Command 寄存器 bit 10） */
         uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func,
@@ -341,13 +366,12 @@ void pci_init(void)
     }
 }
 
-int pci_edu_vm_reset(struct task_struct *vm)
+static int pci_edu_quiesce(void)
 {
-    if (!vm || vm->vmid != 1 || !edu_found)
-        return -1;
+    uint32_t cmd;
+    unsigned int timeout = 100000;
 
-    uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func,
-                                  PCI_CFG_COMMAND);
+    cmd = pci_config_read(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND);
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
                      (cmd | PCI_CMD_INTX_DIS) & ~PCI_CMD_BUSMASTER);
     if (edu_msi_cap_off) {
@@ -356,6 +380,108 @@ int pci_edu_vm_reset(struct task_struct *vm)
         pci_config_write(edu_bus, edu_dev, edu_func,
                          edu_msi_cap_off + PCI_MSI_CTRL,
                          msi & ~PCI_MSI_CTRL_EN);
+    }
+    while (timeout-- &&
+           ((get32(PCI_EDU_BAR0_IPA + EDU_REG_STATUS) & 1) ||
+            (get32(PCI_EDU_BAR0_IPA + EDU_REG_DMA_CMD) & 1)))
+        wait_msec(1);
+    return timeout ? 0 : -1;
+}
+
+static void pci_edu_internal_reset(void)
+{
+    put32(PCI_EDU_BAR0_IPA + EDU_REG_IRQ_ACK, 0xffffffff);
+    put32(PCI_EDU_BAR0_IPA + EDU_REG_DMA_CMD, 0);
+    put32(PCI_EDU_BAR0_IPA + EDU_REG_DMA_SRC, 0);
+    put32(PCI_EDU_BAR0_IPA + EDU_REG_DMA_DST, 0);
+    put32(PCI_EDU_BAR0_IPA + EDU_REG_DMA_COUNT, 0);
+    put32(PCI_EDU_BAR0_IPA + EDU_REG_LIVENESS, 0);
+    put32(PCI_EDU_BAR0_IPA + EDU_REG_FACTORIAL, 0);
+    asm volatile("dsb sy" ::: "memory");
+}
+
+static int pci_edu_reinit_msi(void)
+{
+    unsigned int lpi_base;
+    unsigned int vectors = edu_msi_max_vectors > 16 ? 16 : edu_msi_max_vectors;
+
+    if (!edu_msi_cap_off)
+        return 0;
+    gic_set_spi_target(pci_edu_intx_irq, 0);
+    lpi_base = its_setup_pci_msi(edu_bus, edu_dev, edu_func,
+                                 edu_msi_max_vectors, 0);
+    if (!lpi_base)
+        return -1;
+    for (unsigned int i = 0; i < vectors; i++)
+        if (irq_domain_register(lpi_base + i, 1, 0, VIRQ_PCI_EDU) < 0)
+            return -1;
+    if (pci_edu_intx_irq >= 32 && pci_edu_intx_irq < 1020) {
+        if (irq_domain_register(pci_edu_intx_irq, 1, 0,
+                                VIRQ_PCI_EDU) < 0)
+            return -1;
+        gic_set_spi_target(pci_edu_intx_irq, 0);
+        gic_enable_irq(pci_edu_intx_irq);
+    }
+    uint64_t msi_addr = its_get_msi_address();
+    uint32_t data_off = edu_msi_cap_off +
+        ((pci_config_read(edu_bus, edu_dev, edu_func,
+                          edu_msi_cap_off + PCI_MSI_CTRL) &
+          PCI_MSI_CTRL_64BIT) ? 0x0c : PCI_MSI_DATA);
+    uint32_t old_data = pci_config_read(edu_bus, edu_dev, edu_func, data_off);
+    pci_config_write(edu_bus, edu_dev, edu_func, data_off,
+                     (old_data & 0xffff0000) | (its_get_msi_data(0) & 0xffff));
+    pci_config_write(edu_bus, edu_dev, edu_func,
+                     edu_msi_cap_off + PCI_MSI_ADDR_LO, (uint32_t)msi_addr);
+    if (pci_config_read(edu_bus, edu_dev, edu_func,
+                        edu_msi_cap_off + PCI_MSI_CTRL) & PCI_MSI_CTRL_64BIT)
+        pci_config_write(edu_bus, edu_dev, edu_func,
+                         edu_msi_cap_off + PCI_MSI_ADDR_LO + 4,
+                         (uint32_t)(msi_addr >> 32));
+    uint32_t msi_ctrl = pci_config_read(edu_bus, edu_dev, edu_func,
+                                        edu_msi_cap_off + PCI_MSI_CTRL);
+    msi_ctrl &= ~(0x7 << PCI_MSI_CTRL_MME_SHIFT);
+    pci_config_write(edu_bus, edu_dev, edu_func,
+                     edu_msi_cap_off + PCI_MSI_CTRL,
+                     msi_ctrl | PCI_MSI_CTRL_EN);
+    uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func,
+                                   PCI_CFG_COMMAND);
+    pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
+                     cmd | PCI_CMD_MEMORY | PCI_CMD_BUSMASTER |
+                     PCI_CMD_INTX_DIS);
+    pci_edu_lpi_base = lpi_base;
+    pci_edu_msi_enabled = 1;
+    INFO("PCI: edu MSI reinitialized (LPI base=%u)", lpi_base);
+    return 0;
+}
+
+int pci_edu_vm_reset(struct task_struct *vm)
+{
+    if (!vm || vm->vmid != 1 || !edu_found || pci_edu_quiesce() < 0)
+        return -1;
+    if (pci_edu_intx_irq >= 32 && pci_edu_intx_irq < 1020) {
+        gic_disable_irq(pci_edu_intx_irq);
+        put32(GICD_ICPENDR(pci_edu_intx_irq / 32),
+              1U << (pci_edu_intx_irq % 32));
+        irq_domain_unregister(pci_edu_intx_irq);
+    }
+    if (pci_edu_lpi_base) {
+        its_teardown_pci_msi(pci_edu_requester_id(), pci_edu_lpi_base, 16);
+        for (unsigned int i = 0; i < 16; i++)
+            vits_lpi_revoke(pci_edu_lpi_base + i);
+    }
+    pci_edu_lpi_base = 0;
+    pci_edu_msi_enabled = 0;
+    INFO("PCI: edu IRQ resources released for VM%lu", vm->vmid);
+    return 0;
+}
+
+int pci_edu_function_reset(struct task_struct *vm)
+{
+    if (!vm || vm->vmid != 1 || !edu_found)
+        return -1;
+    if (pci_edu_quiesce() < 0) {
+        WARN("PCI: edu reset aborted, device did not become idle");
+        return -1;
     }
     if (pci_edu_intx_irq >= 32 && pci_edu_intx_irq < 1020) {
         gic_disable_irq(pci_edu_intx_irq);
@@ -368,12 +494,30 @@ int pci_edu_vm_reset(struct task_struct *vm)
         for (unsigned int i = 0; i < 16; i++)
             vits_lpi_revoke(pci_edu_lpi_base + i);
     }
-    put32(PCI_EDU_BAR0_IPA + EDU_REG_IRQ_ACK, 0xffffffff);
-    asm volatile("dsb sy" ::: "memory");
-
+    if (edu_flr_supported && edu_pcie_cap_off) {
+        uint32_t devctl = pci_config_read(edu_bus, edu_dev, edu_func,
+                                          edu_pcie_cap_off + PCI_EXP_DEVCTL);
+        pci_config_write(edu_bus, edu_dev, edu_func,
+                         edu_pcie_cap_off + PCI_EXP_DEVCTL,
+                         devctl | PCI_EXP_DEVCTL_FLR);
+        wait_msec(100);
+    } else {
+        pci_edu_internal_reset();
+    }
+    pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_BAR0,
+                     (uint32_t)PCI_EDU_BAR0_IPA);
+    uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND);
+    pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
+                     cmd | PCI_CMD_MEMORY | PCI_CMD_BUSMASTER |
+                     PCI_CMD_INTX_DIS);
     pci_edu_lpi_base = 0;
     pci_edu_msi_enabled = 0;
-    INFO("PCI: edu IRQ resources released for VM%lu", vm->vmid);
+    if (pci_edu_reinit_msi() < 0) {
+        WARN("PCI: edu MSI reinitialization failed after reset");
+        return -1;
+    }
+    INFO("PCI: edu function reset complete for VM%lu (%s)", vm->vmid,
+         edu_flr_supported ? "PCIe FLR" : "edu internal fallback");
     return 0;
 }
 

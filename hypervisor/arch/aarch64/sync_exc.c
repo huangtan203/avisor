@@ -142,16 +142,20 @@ void handle_hvc64(unsigned long hvc_nr)
 		/* PCI 直通中断链路诊断 dump（Phase 7 调试用） */
 		pci_debug_dump();
 		break;
-	case HVC_PCI_IRQ_TEARDOWN_TEST:
+	case HVC_PCI_RESET:
 		if (current->vmid != 1 || current->vcpu_id != 0) {
 			regs->regs[0] = -1;
 			break;
 		}
-		regs->regs[0] = pci_edu_vm_reset(current);
+		regs->regs[0] = pci_edu_function_reset(current);
 		if (regs->regs[0] == 0) {
 			struct irq_route route;
-			if (irq_domain_lookup(pci_edu_intx_irq, &route) == 0 ||
-			    pci_edu_lpi_base != 0)
+			if (!pci_edu_lpi_base ||
+			    !pci_edu_msi_enabled ||
+			    irq_domain_lookup(pci_edu_intx_irq, &route) < 0 ||
+			    route.owner != IRQ_DOMAIN_OWNER_VM || route.vmid != 1 ||
+			    irq_domain_lookup(pci_edu_lpi_base, &route) < 0 ||
+			    route.owner != IRQ_DOMAIN_OWNER_VM || route.vmid != 1)
 				regs->regs[0] = -1;
 		}
 		break;

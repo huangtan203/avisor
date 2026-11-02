@@ -1,0 +1,41 @@
+Phase 106: PCIe FLR and edu function reset
+Date: 2026-11-02
+Platform: QEMU virt, AArch64, EL2, GICv3, ITS
+
+Build
+-----
+Command: make -f Makefile.virt -j$(nproc)
+Result: PASS
+Hypervisor image: bin_virt/kernel8.img
+Final image size: 257456 bytes
+Guest image: guests/el1_test/el1_test.bin
+Guest build emitted existing warnings outside this phase's scope.
+
+QEMU regression
+---------------
+Command: timeout 70 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase106-final3.log
+Exit: 124 (expected timeout termination)
+
+Observed PASS markers
+---------------------
+[vm1] edu: factorial PASSED
+[vm1] edu: MSI interrupt PASSED (irq_status=0x12345678)
+[vm1] vITS: PASSED! Received vSPI 72 (vLPI 8200)
+INFO[1]: PCI: edu function reset complete for VM1 (edu internal fallback)
+[vm1] vITS: edu reset identity/state PASSED
+INFO[1]: vITS: MAPTI done: vINTID=8200 -> pLPI=9001 (vmid=1)
+[vm1] vITS: edu function reset + MSI reinit PASSED
+[vm1] sched: vCPU migration CPU0->CPU1->CPU0 PASSED
+[vm1] gicd: LR overflow queue delivered all 4 interrupts PASSED
+[vm2] gicd: LR overflow queue delivered all 4 interrupts PASSED
+[vm3] PASSED: 双 vCPU Live Migration 成功（VM2 -> VM3）
+
+Failure scan
+------------
+Scanned for PANIC, ASSERT, FAILED, Unknown IRQ, and no ownership.
+No matching failure/drop markers found in the final QEMU serial log.
+
+FLR coverage
+------------
+QEMU reported: PCI: edu PCIe FLR not supported.
+The tested reset path was quiesce + edu internal register fallback + ITS/MSI reinitialization. The PCIe FLR request branch was not runtime-exercised.
