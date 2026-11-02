@@ -1,114 +1,143 @@
-# aVisor Hypervisor Phase 107 详细设计文档：PCI 枚举与 BAR 资源映射
+# aVisor Phase 107 详细设计：PCI 枚举与 BAR 资源映射
 
-> 版本：Phase 107
-> 平台：QEMU virt（AArch64、EL2、GICv3、ITS）
-> 主题：PCI ECAM 扫描、BAR sizing/allocation、ownership 映射与 Guest 动态发现
+> 平台：QEMU virt / AArch64 EL2 / GICv3 / ITS
+> 前置阶段：Phase 106 edu function reset
+> 本阶段引入：ECAM function 扫描、BAR sizing、资源记录与 owner resource 精确映射
 
-## 1. 概述
+## 1. 架构目标
 
-Phase 107 将 PCI 初始化从固定 bus 0 edu 地址改为对 QEMU `virt` 16MB ECAM 覆盖范围内最多 16 个 bus、32 个 device、按 multifunction header 探测 function。固定容量设备表记录 BDF、ID、header type、owner VM 和六个 BAR resource。Endpoint 使用 PCI BAR sizing 方式识别资源；MMIO BAR 按 2 的幂大小对齐，在平台 PCI MMIO window 内顺序分配，支持 32-bit 与 64-bit MMIO BAR。I/O BAR 被识别并保留未分配状态。
+固定 BDF 和 BAR 地址使设备迁移到其他 slot 后 Hypervisor/Guest 信息不一致。Phase 107 在启动期扫描平台 ECAM，建立固定容量 PCI resource table，动态探测并分配 endpoint BAR。当前 ownership policy 仍只把 QEMU edu 分配给 VM1；其他 function 可被枚举和编址，但不因此获得 Guest passthrough 权限。
 
-本阶段仅把归属 VM1 的 edu function 配置空间所在 4KB ECAM 页及其实际 BAR0 区间映射到 Stage-2。Guest 从 edu function BAR0 配置值动态发现设备地址。Phase 106 reset 路径使用启动期保存的 resource 记录恢复 BAR，不在 HVC 栈上重新扫描总线。
+## 2. 地址模型
 
-## 2. 架构与调用关系
+| 地址空间 | QEMU virt 范围 | 用途 |
+|---|---|---|
+| ECAM | `0x3f000000..0x3fffffff`（16 MiB） | bus/device/function 配置空间 |
+| PCI MMIO | `0x10000000` 起，受平台 aperture 限制 | MMIO BAR 分配 |
+| PCI I/O | Phase 108 才启用分配 | Phase 107 仅识别 |
+| Guest IPA | 当前采用 identity map | edu BAR Stage-2 映射 |
 
-### 2.1 启动期枚举与映射
+ECAM 地址计算：`base + (bus << 20) + (device << 15) + (function << 12) + reg`。
+
+## 3. 启动扫描架构
 
 ```mermaid
 flowchart TD
-    A[main_virt: pci_init] --> B[pci_enumerate]
-    B --> C[扫描 16 个 bus / 32 个 device]
-    C --> D[读取 function 0 header 与 multifunction bit]
-    D --> E[枚举存在的 function 并记录 BDF/ID/header]
-    E --> F{Endpoint header?}
-    F -->|是| G[pci_probe_bars]
-    G --> H[关闭 IO/MEM decode]
-    H --> I[写 BAR all-ones 并读取 sizing mask]
-    I --> J{I/O BAR?}
-    J -->|是| K[记录类型，当前不分配]
-    J -->|否| L[pci_allocate_mmio: 对齐/窗口边界检查]
-    L --> M[写入 BAR 地址并保存 resource]
-    E --> N{QEMU edu ID?}
-    N -->|是| O[记录 VM1 ownership 与 BDF]
-    O --> P[pci_init 配置 edu INTx/MSI]
-    Q[VM1 initialize] --> R[pci_passthrough_map]
-    R --> S[只映射 edu function 的 ECAM 页]
-    R --> T[只映射 edu 实际 BAR0 页区间]
+    A[main_virt] --> B[pci_init]
+    B --> C[pci_enumerate]
+    C --> D[scan configured ECAM buses]
+    D --> E[function 0 vendor/header]
+    E --> F{multifunction?}
+    F -->|no| G[scan function 0]
+    F -->|yes| H[scan functions 0..7]
+    G --> I[record BDF/ID/header]
+    H --> I
+    I --> J{endpoint?}
+    J -->|yes| K[pci_probe_bars]
+    J -->|bridge| L[Phase 108 recursive scan]
+    K --> M[program BAR + resource metadata]
+    M --> N{edu owner candidate?}
+    N -->|yes| O[record edu BDF/owner]
+    P[VM1 initialization] --> Q[pci_passthrough_map]
+    Q --> R[map owned BAR0 only]
 ```
 
-### 2.2 Guest 使用与 reset 恢复
+阶段历史扫描范围为最多 16 buses、32 devices、function 0 的 multifunction 位决定扫描 1/8 functions。bridge 递归策略由 Phase 108 加入。
+
+## 4. BAR 探测与分配
+
+### 4.1 探测算法
+
+1. 保存 PCI Command、原 BAR DWORD 和原 resource metadata。
+2. 清 I/O Space 与 Memory Space decode 位。
+3. 向 BAR 写全 1，读取 sizing mask，再恢复/写入实际地址。
+4. I/O BAR、32-bit MMIO BAR 和 64-bit MMIO BAR 分开解释属性位。
+5. 64-bit BAR 读取相邻高 DWORD，作为单一资源并跳过 paired slot。
+6. 校验 mask、非零 size、size 为 2 的幂和 aperture 边界。
+7. 按 size 对齐分配并编程，恢复原 Command。
+
+```mermaid
+sequenceDiagram
+    participant S as pci_scan_bus
+    participant P as pci_probe_bars
+    participant C as PCI config ECAM
+    participant A as MMIO allocator
+    S->>P: resource entry
+    P->>C: save Command and BARs
+    P->>C: disable decode
+    loop each BAR slot
+        P->>C: write all ones / read mask
+        C-->>P: mask and BAR attributes
+        P->>P: derive type, size, 64-bit pair
+    end
+    P->>A: aligned allocation
+    A-->>P: address or failure
+    P->>C: program BAR and restore Command
+    P-->>S: status and resource table
+```
+
+Phase 107 allocator按扫描顺序线性增长；降序排序和 pool allocator 是后续阶段能力，不能倒记为本阶段功能。
+
+## 5. Resource table 与所有权
+
+每个 function 记录 BDF、vendor/device、header type、owner VMID、bus hierarchy 元数据和 BAR array。BAR resource 至少包含地址、大小、flags、I/O 类型和 valid 状态。64-bit BAR 作为一个资源记录，保留 high DWORD 用于 reset 恢复。
+
+只有 edu 的 ECAM function page 和 BAR0 映射到 VM1。Phase 107 阶段 ECAM 仍可被 Guest 写入；trap-and-emulate/写权限由 Phase 110 改造。
+
+## 6. Owner passthrough 与 Guest discovery
 
 ```mermaid
 flowchart LR
-    A[Guest edu_test] --> B[读取 edu function BAR0]
-    B --> C[保存动态 edu_bar0_base]
-    C --> D[identity/liveness/factorial/MMIO 测试]
-    E[Guest HVC_PCI_RESET] --> F[EL2 pci_edu_function_reset]
-    F --> G[从 pci_devices resource 记录定位 edu]
-    G --> H[恢复保存的 BAR 地址，不执行 bus rescan]
-    H --> I[恢复 PCI Command 与 ITS/MSI]
-    I --> J[Guest 再读 BAR/identity 并验证 MSI]
+    pci_enumerate --> pci_get_owned_config
+    pci_get_owned_config --> HVC_PCI_CONFIG
+    HVC_PCI_CONFIG --> Guest[Guest 动态 BDF/ECAM/BAR/requester]
+    VM1_create --> pci_passthrough_map
+    pci_passthrough_map --> stage2_page_is_mapped
+    pci_passthrough_map --> map_stage2_page
+    Guest --> PCI_config_read
+    PCI_config_read --> vITS_MAPD_MAPTI
 ```
 
-## 3. 实现要点
+Guest 不再依赖固定 BDF，通过 HVC selector 0 获取 ECAM function 地址、BAR0、size 和 requester ID。MSI capability 从动态 ECAM 扫描。
 
-- `PCI_MAX_BUSES` 为 16，对应当前 QEMU `virt` ECAM 16MB 范围；扫描每个 bus 的 32 个 device。function 0 的 header type multifunction bit 决定扫描 1 或 8 个 function。
-- 固定容量表每项记录 vendor/device、BDF、header type、owner VMID 和六个 BAR 的地址、大小、类型及有效状态。当前仅匹配 QEMU edu 为 VM1 所有。
-- Endpoint 在 BAR 探测时暂时关闭 PCI IO/MEM decode。32-bit BAR 根据低 32-bit mask 求大小；64-bit BAR 同时探测高位并占用相邻 BAR slot。仅接纳非零且为 2 的幂大小。
-- MMIO allocator 对齐到资源大小，使用 checked 边界条件拒绝溢出和越过 PCI MMIO window 的分配。I/O BAR 识别后记录类型并告警，本阶段不分配 I/O port。
-- `pci_passthrough_map()` 只映射 VM1 edu function 的 4KB ECAM 页和保存的 BAR0 大小，不再暴露整个 16MB ECAM 或固定 1MB 地址。
-- Guest edu 访问和 vITS 中断测试使用 ECAM 中 BAR0 的动态值。reset 恢复从 resource table 还原 BAR 与高位（若有），不在 vCPU HVC 调用栈上执行全总线枚举。
-- `pci_edu_vm_reset()` 生命周期 teardown API 与 Phase 105 保持；Phase 106 function reset 入口继续独立。
+## 7. 关键函数调用图
 
-## 4. 代码映射
+```mermaid
+flowchart LR
+    pci_init --> pci_enumerate
+    pci_enumerate --> pci_scan_bus
+    pci_scan_bus --> pci_probe_bars
+    pci_probe_bars --> pci_allocate_mmio
+    pci_probe_bars --> pci_allocate_io
+    pci_scan_bus --> pci_init_vmsi
+    virt_board_vm_init --> pci_passthrough_map
+    pci_passthrough_map --> stage2_page_is_mapped
+    pci_passthrough_map --> map_stage2_page
+    handle_hvc64 --> pci_get_owned_config
+    pci_edu_function_reset --> saved_BAR_resources
+```
 
-| 文件 | Phase 107 变更 |
+## 8. 错误与事务边界
+
+- BAR 无效或 allocation 失败时恢复已修改的 BAR、Command 和 resource entries；Phase 109 扩展为完整 allocator transaction rollback。
+- Stage-2 已有映射时拒绝覆盖并撤销本次已建立页面。
+- `map_stage2_page()` 目前不返回分配失败状态，因此页表分配失败不能由此 PCI 调用点可靠回滚。
+- 资源表和总线容量固定，超出容量时拒绝继续记录。
+
+## 9. 文件映射
+
+| 文件 | 职责 |
 |---|---|
-| `hypervisor/boards/virt/pci.c` | 设备/resource 表、ECAM 扫描、BAR sizing/allocation、精确 Stage-2 映射、reset BAR 恢复 |
-| `include/boards/virt/base.h` | 移除固定 edu BAR 地址常量 |
-| `guests/el1_test/main.c` | 动态读取 edu BAR0 并用于设备与 vITS MSI 测试 |
+| `hypervisor/boards/virt/pci.c` | ECAM scan、BAR probe、设备表和映射 |
+| `include/boards/virt/base.h` | QEMU virt PCI 地址 aperture |
+| `include/boards/virt/pci.h` | PCI 查询与 passthrough API |
+| `hypervisor/arch/aarch64/sync_exc.c` | Guest resource HVC |
+| `guests/el1_test/main.c` | 动态 BAR discovery 和设备测试 |
 
-## 5. 验证
+## 10. 验证与限制
 
-构建命令：
-
-```sh
-make -f Makefile.virt -j$(nproc)
-```
-
-结果：PASS；Hypervisor 与 Guest 编译链接成功。Guest 工程仍有既有 warning。
-
-QEMU 回归命令：
-
-```sh
-timeout 70 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase107-final.log
-```
-
-QEMU 由 timeout 以退出码 124 正常终止。观察到：
-
-```text
-INFO[0]: PCI: enumerated 00:00.0 id=1b36:0008 header=0
-INFO[0]: PCI: enumerated 00:01.0 id=1af4:1000 header=0
-INFO[0]: PCI: 00:01.0 BAR1 MMIO 0x10000000/0x1000
-INFO[0]: PCI: 00:01.0 BAR4 MMIO 0x10004000/0x4000
-INFO[0]: PCI: enumerated 00:02.0 id=1234:11e8 header=0
-INFO[0]: PCI: 00:02.0 BAR0 MMIO 0x10100000/0x100000
-[vm1] edu: discovered BAR0=0x10100000
-[vm1] PCI enumeration/BAR discovery PASSED
-[vm1] edu: factorial PASSED
-[vm1] vITS: PASSED! Received vSPI 72 (vLPI 8200)
-[vm1] vITS: edu function reset + MSI reinit PASSED
-[vm1] sched: vCPU migration CPU0->CPU1->CPU0 PASSED
-[vm1] gicd: LR overflow queue delivered all 4 interrupts PASSED
-[vm3] PASSED: 双 vCPU Live Migration 成功（VM2 -> VM3）
-```
-
-扫描 `PANIC`、`ASSERT`、`FAILED`、`Data Abort`、`Unknown IRQ` 和 `no ownership` 未发现匹配项。
-
-## 6. 限制
-
-- 当前运行时拓扑验证了 multifunction-aware 的扫描逻辑路径与多个 bus 的寻址范围，但实际 QEMU 基础拓扑只枚举出 bus 0 的三个 function；尚未用多 bus/multifunction 自定义拓扑验证非零 bus 与额外 function。
-- 当前设备表只将 edu 分配给 VM1；其他设备被枚举和分配 BAR，但不映射给 Guest。设备 ownership policy 仍为单设备固定策略。
-- I/O BAR 只识别，不分配；PCI bridge 的 bus-number/window programming 与递归扫描在 Phase 108。
-- ECAM function 页仍以直通方式映射，Guest 可写该 function 的 BAR/Command；配置写入 trap-and-emulate 与 ownership enforcement 后续处理。
-- 当前 allocator 使用普通 PCI MMIO window；独立 prefetchable/high-MMIO window 尚未实现。
+- `make -f Makefile.virt -j$(nproc)`：PASS，Guest 有既存 warning。
+- 默认 QEMU 枚举 `00:00.0 1b36:0008`、`00:01.0 1af4:1000`、`00:02.0 1234:11e8`；virtio BAR1 `0x10000000/0x1000`、BAR4 `0x10004000/0x4000`，edu BAR0 `0x10100000/0x100000`。
+- Guest PCI/BAR discovery、edu factorial、vITS、reset/MSI reinit 及 migration/LR markers 通过；未发现 PANIC/ASSERT/FAILED/Data Abort/Unknown IRQ/no ownership。
+- 本次默认拓扑没有验证非零 bus 与额外 multifunction function；Phase 108 前 I/O BAR 不分配，bridge window 不配置。
+- 只有 edu 获得 owner mapping；ECAM 写保护、设备 DMA 隔离及通用 ownership policy 尚未实现。
