@@ -871,6 +871,117 @@ static int pci_bridge_config_matches(unsigned int bus, unsigned int dev,
     return matches;
 }
 
+struct pci_bridge_window {
+    uint64_t base;
+    uint64_t limit;
+    uint8_t enabled;
+};
+
+static struct pci_bridge_window pci_bridge_io_window(
+    const struct pci_bridge_config *config)
+{
+    uint64_t base = ((uint64_t)(config->io_base_limit & 0xf0) << 8) |
+                    ((uint64_t)(config->io_upper & 0xffff) << 16);
+    uint64_t limit = (config->io_base_limit & 0xf000) |
+                     (config->io_upper & 0xffff0000ULL);
+    struct pci_bridge_window window = {
+        .base = base,
+        .limit = limit | (PCI_BRIDGE_IO_GRANULARITY - 1),
+        .enabled = base <= limit,
+    };
+    return window;
+}
+
+static struct pci_bridge_window pci_bridge_memory_window(uint32_t value)
+{
+    uint64_t base = (uint64_t)(value & 0xfff0) << 16;
+    uint64_t limit = (uint64_t)(value & 0xfff00000);
+    struct pci_bridge_window window = {
+        .base = base,
+        .limit = limit | (PCI_BRIDGE_MEMORY_GRANULARITY - 1),
+        .enabled = base <= limit,
+    };
+    return window;
+}
+
+static struct pci_bridge_window pci_bridge_prefetch_window(
+    const struct pci_bridge_config *config)
+{
+    uint64_t base = ((uint64_t)config->prefetch_base_upper << 32) |
+                    ((uint64_t)(config->prefetch_base_limit & 0xfff0) << 16);
+    uint64_t limit = ((uint64_t)config->prefetch_limit_upper << 32) |
+                     (config->prefetch_base_limit & 0xfff00000ULL);
+    struct pci_bridge_window window = {
+        .base = base,
+        .limit = limit | (PCI_BRIDGE_MEMORY_GRANULARITY - 1),
+        .enabled = base <= limit,
+    };
+    return window;
+}
+
+static int pci_bar_in_window(const struct pci_bar_resource *bar,
+                             const struct pci_bridge_window *window)
+{
+    uint64_t base = bar->is_io ?
+        bar->address - VIRT_PCIE_IO_BASE : bar->address;
+    if (!window->enabled || !bar->size || base > UINT64_MAX - bar->size)
+        return 0;
+    return base >= window->base && base + bar->size - 1 <= window->limit;
+}
+
+static int pci_topology_audit(void)
+{
+    unsigned int bridge_count = 0;
+    unsigned int bar_count = 0;
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        struct pci_device_resource *bridge = &pci_devices[i];
+        if (bridge->header_type != PCI_HEADER_BRIDGE)
+            continue;
+        bridge_count++;
+        struct pci_bridge_config config = pci_bridge_config_read(
+            bridge->bus, bridge->dev, bridge->func);
+        unsigned int primary = config.bus_numbers & 0xff;
+        unsigned int secondary = (config.bus_numbers >> 8) & 0xff;
+        unsigned int subordinate = (config.bus_numbers >> 16) & 0xff;
+        if (primary != bridge->bus || secondary != bridge->secondary_bus ||
+            subordinate != bridge->subordinate_bus || secondary <= primary ||
+            subordinate < secondary || subordinate >= PCI_MAX_BUSES) {
+            WARN("PCI: bridge %02x:%02x.%u invalid bus topology %u/%u/%u",
+                 bridge->bus, bridge->dev, bridge->func,
+                 primary, secondary, subordinate);
+            return -1;
+        }
+        struct pci_bridge_window io = pci_bridge_io_window(&config);
+        struct pci_bridge_window memory = pci_bridge_memory_window(
+            config.memory_base_limit);
+        struct pci_bridge_window prefetch = pci_bridge_prefetch_window(&config);
+        for (unsigned int j = 0; j < pci_device_count; j++) {
+            struct pci_device_resource *child = &pci_devices[j];
+            if (child->bus < secondary || child->bus > subordinate)
+                continue;
+            for (unsigned int b = 0; b < PCI_MAX_BARS; b++) {
+                struct pci_bar_resource *bar = &child->bars[b];
+                if (!bar->valid)
+                    continue;
+                const struct pci_bridge_window *window = bar->is_io ? &io :
+                    (bar->flags & PCI_BAR_PREFETCH ? &prefetch : &memory);
+                if (!pci_bar_in_window(bar, window)) {
+                    WARN("PCI: bridge %02x:%02x.%u does not forward %02x:%02x.%u BAR%u 0x%lx/0x%lx",
+                         bridge->bus, bridge->dev, bridge->func,
+                         child->bus, child->dev, child->func, b,
+                         (unsigned long)bar->address,
+                         (unsigned long)bar->size);
+                    return -1;
+                }
+                bar_count++;
+            }
+        }
+    }
+    INFO("PCI: topology audit PASSED bridges=%u forwarded-bars=%u",
+         bridge_count, bar_count);
+    return 0;
+}
+
 static void pci_init_vmsi(struct pci_device_resource *resource)
 {
     uint32_t status = pci_config_read(resource->bus, resource->dev,
@@ -1209,6 +1320,10 @@ static int pci_enumerate(void)
     pool_init(&io_pool, 0, PCI_IO_ALLOC_END, PCI_ALLOC_FIRST_FIT);
     if (pci_scan_bus(0) < 0 || !edu_found)
         return -1;
+    if (pci_topology_audit() < 0) {
+        WARN("PCI: topology audit failed");
+        return -1;
+    }
     pool_dump_stats("MMIO", &mmio_pool);
     pool_dump_stats("I/O", &io_pool);
     for (unsigned int i = 0; i < pci_device_count; i++) {
