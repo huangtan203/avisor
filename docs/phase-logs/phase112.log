@@ -1,0 +1,35 @@
+Phase 112 generic PCI vMSI and MSI-X capability emulation
+
+Build:
+- Command: make -f Makefile.virt -j$(nproc)
+- Result: PASS.
+- Existing guest compiler warnings remain; no Phase 112 build errors.
+
+Default topology:
+- Command: timeout 65 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase112-basic-final.log
+- 00:01.0 virtio-net MSI-X discovered at cap 0x98: 4 vectors, Table BAR1+0x0.
+- Physical MSI-X Enable was cleared and read back off; no disable warning was emitted.
+- 00:02.0 edu 64-bit MSI discovered at cap 0x40; no Per-vector Masking capability.
+- Guest virtual MSI address protection: PASS.
+- Guest eventID 1 delivered through ITS/vITS as vSPI 72 (vLPI 8200): PASS.
+- edu reset identity/state and MSI reinit: PASS.
+- QEMU exited by timeout as expected.
+
+Nested bridge topology:
+- Command: timeout 75 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=off -cpu max -smp 2 -m 1G -device edu,bus=pcie.0,addr=0x3 -device pci-bridge,id=br1,bus=pcie.0,addr=0x4,chassis_nr=1 -device pci-bridge,id=br2,bus=br1,addr=0x1,chassis_nr=2 -device e1000,bus=br2,addr=0x2 -kernel bin_virt/kernel8.img -display none -monitor none -serial file:/tmp/avisor-phase112-nested-final.log
+- 00:01.0 virtio-net MSI-X discovered and physical Enable read back off.
+- 00:03.0 edu MSI discovered: 64-bit, no Per-vector Masking.
+- 01:01.0 and 00:04.0 bridge MSI capabilities discovered: 64-bit, Per-vector Masking capable.
+- Nested memory and I/O bridge windows configured.
+- Guest virtual MSI address protection and eventID delivery: PASS.
+- QEMU exited by timeout as expected.
+
+Safety and regression checks:
+- No `failed to disable physical MSI-X` or `physical MSI-X unexpectedly enabled` warning.
+- No PANIC, ASSERT or Data Abort observed in either topology.
+- Existing guest task-slot reuse/freeze failures may remain in full output; no full-suite pass is claimed.
+
+Coverage limits:
+- Phase 110 ownership policy only exposes the owner edu ECAM to VM1. Non-owner virtio-net MSI-X guest reads/writes are therefore not directly tested.
+- MSI-X Table/PBA BAR MMIO is not emulated or isolated in this phase.
+- PCI DMA remains without SMMU/IOMMU isolation.
