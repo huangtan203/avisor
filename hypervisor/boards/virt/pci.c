@@ -165,6 +165,8 @@ struct pci_device_resource {
     uint8_t func;
     uint8_t header_type;
     uint8_t owner_vmid;
+    uint8_t dma_owner_vmid;
+    uint8_t dma_authorized;
     uint8_t primary_bus;
     uint8_t secondary_bus;
     uint8_t subordinate_bus;
@@ -183,6 +185,7 @@ struct pci_device_resource {
     uint32_t msi_pend;
     uint32_t msix_table_offset;
     uint32_t msix_pba_offset;
+    uint32_t dma_generation;
     struct pci_bar_resource bars[PCI_MAX_BARS];
 };
 
@@ -279,6 +282,33 @@ static void pci_config_write(unsigned int bus, unsigned int dev,
 static uint32_t pci_command_dma_safe(uint32_t command)
 {
     return command & ~PCI_CMD_BUSMASTER;
+}
+
+static int pci_dma_set_authorized(struct pci_device_resource *resource,
+                                  unsigned int owner_vmid, int authorized)
+{
+    if (!resource || !resource->owner_vmid ||
+        owner_vmid != resource->owner_vmid)
+        return -1;
+    uint32_t command = pci_config_read(resource->bus, resource->dev,
+                                       resource->func, PCI_CFG_COMMAND);
+    command = pci_command_dma_safe(command);
+    if (authorized)
+        command |= PCI_CMD_BUSMASTER;
+    pci_config_write(resource->bus, resource->dev, resource->func,
+                     PCI_CFG_COMMAND, command);
+    uint32_t verify = pci_config_read(resource->bus, resource->dev,
+                                      resource->func, PCI_CFG_COMMAND);
+    if (!!(verify & PCI_CMD_BUSMASTER) != !!authorized)
+        return -1;
+    resource->dma_owner_vmid = authorized ? owner_vmid : 0;
+    resource->dma_authorized = !!authorized;
+    resource->dma_generation++;
+    INFO("PCI: DMA %s %02x:%02x.%u owner=VM%u generation=%u",
+         authorized ? "authorized" : "revoked", resource->bus,
+         resource->dev, resource->func, owner_vmid,
+         resource->dma_generation);
+    return 0;
 }
 
 static void pool_init(struct pci_resource_pool *pool, uint64_t base,
@@ -947,6 +977,9 @@ static int pci_dma_guard_init(void)
             command |= PCI_CMD_MEMORY;
         pci_config_write(resource->bus, resource->dev, resource->func,
                          PCI_CFG_COMMAND, command);
+        resource->dma_owner_vmid = 0;
+        resource->dma_authorized = 0;
+        resource->dma_generation = 1;
         uint32_t verify = pci_config_read(resource->bus, resource->dev,
                                           resource->func,
                                           PCI_CFG_COMMAND);
@@ -959,6 +992,32 @@ static int pci_dma_guard_init(void)
     }
     INFO("PCI: DMA guard active, bus mastering disabled for %u functions",
          guarded);
+    return 0;
+}
+
+static int pci_dma_state_audit(void)
+{
+    unsigned int authorized = 0;
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        struct pci_device_resource *resource = &pci_devices[i];
+        uint32_t command = pci_config_read(resource->bus, resource->dev,
+                                           resource->func,
+                                           PCI_CFG_COMMAND);
+        int physical = !!(command & PCI_CMD_BUSMASTER);
+        if (physical != resource->dma_authorized ||
+            (resource->dma_authorized &&
+             resource->dma_owner_vmid != resource->owner_vmid) ||
+            (!resource->dma_authorized && resource->dma_owner_vmid)) {
+            WARN("PCI: DMA state mismatch %02x:%02x.%u physical=%u authorized=%u owner=%u/%u generation=%u",
+                 resource->bus, resource->dev, resource->func, physical,
+                 resource->dma_authorized, resource->dma_owner_vmid,
+                 resource->owner_vmid, resource->dma_generation);
+            return -1;
+        }
+        authorized += resource->dma_authorized;
+    }
+    INFO("PCI: DMA state audit PASSED functions=%u authorized=%u",
+         pci_device_count, authorized);
     return 0;
 }
 
@@ -1436,7 +1495,7 @@ static int pci_enumerate(void)
     pool_init(&io_pool, 0, PCI_IO_ALLOC_END, PCI_ALLOC_FIRST_FIT);
     if (pci_scan_bus(0) < 0 || !edu_found)
         return -1;
-    if (pci_dma_guard_init() < 0)
+    if (pci_dma_guard_init() < 0 || pci_dma_state_audit() < 0)
         return -1;
     if (pci_bar_resource_audit() < 0) {
         WARN("PCI: BAR resource audit failed");
@@ -1659,11 +1718,10 @@ void pci_init(void)
                 return;
             }
         }
-        uint32_t dma_command = pci_config_read(
-            edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND);
-        pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
-                         dma_command | PCI_CMD_BUSMASTER);
-        INFO("PCI: edu bus mastering enabled by hypervisor after MSI routing");
+        if (pci_dma_set_authorized(edu_resource, 1, 1) < 0) {
+            WARN("PCI: edu DMA authorization failed after MSI routing");
+            return;
+        }
         pci_config_write(edu_bus, edu_dev, edu_func,
                          edu_msi_cap_off + PCI_MSI_CTRL, msi_ctrl);
 
@@ -1689,18 +1747,19 @@ static int pci_edu_quiesce(void)
     unsigned int timeout = 100000;
 
     cmd = pci_config_read(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND);
+    struct pci_device_resource *resource =
+        pci_find_resource(edu_bus, edu_dev, edu_func);
+    if (!resource || pci_dma_set_authorized(resource, 1, 0) < 0)
+        return -1;
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
-                     (cmd | PCI_CMD_INTX_DIS) & ~PCI_CMD_BUSMASTER);
+                     pci_command_dma_safe(cmd) | PCI_CMD_INTX_DIS);
     if (edu_msi_cap_off) {
         uint32_t msi = pci_config_read(edu_bus, edu_dev, edu_func,
                                        edu_msi_cap_off + PCI_MSI_CTRL);
         pci_config_write(edu_bus, edu_dev, edu_func,
                          edu_msi_cap_off + PCI_MSI_CTRL,
                          msi & ~PCI_MSI_CTRL_EN);
-        struct pci_device_resource *resource =
-            pci_find_resource(edu_bus, edu_dev, edu_func);
-        if (resource)
-            resource->msi_ctrl &= ~PCI_MSI_CTRL_EN;
+        resource->msi_ctrl &= ~PCI_MSI_CTRL_EN;
     }
     while (timeout-- &&
            ((get32(edu_bar0 + EDU_REG_STATUS) & 1) ||
@@ -1780,8 +1839,10 @@ static int pci_edu_reinit_msi(void)
     uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func,
                                    PCI_CFG_COMMAND);
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
-                     cmd | PCI_CMD_MEMORY | PCI_CMD_INTX_DIS |
-                     PCI_CMD_BUSMASTER);
+                     pci_command_dma_safe(cmd) | PCI_CMD_MEMORY |
+                     PCI_CMD_INTX_DIS);
+    if (!edu_resource || pci_dma_set_authorized(edu_resource, 1, 1) < 0)
+        return -1;
     pci_edu_lpi_base = lpi_base;
     pci_edu_msi_enabled = 1;
     INFO("PCI: edu MSI reinitialized (LPI base=%u)", lpi_base);
@@ -2264,7 +2325,8 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
         return 1;
     if (reg < PCI_CFG_COMMAND + 2 && reg + size > PCI_CFG_COMMAND) {
         uint32_t command = pci_config_read(bus, dev, func, PCI_CFG_COMMAND);
-        uint32_t dma_state = command & PCI_CMD_BUSMASTER;
+        uint32_t dma_state = resource->dma_authorized ?
+                             PCI_CMD_BUSMASTER : 0;
         unsigned int first = reg > PCI_CFG_COMMAND ? reg : PCI_CFG_COMMAND;
         unsigned int last = reg + size < PCI_CFG_COMMAND + 2 ?
                             reg + size : PCI_CFG_COMMAND + 2;
@@ -2279,6 +2341,8 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
         }
         command = pci_command_dma_safe(command) | dma_state;
         pci_config_write(bus, dev, func, PCI_CFG_COMMAND, command);
+        if (pci_dma_state_audit() < 0)
+            WARN("PCI: DMA state audit failed after guest Command write");
         *value = pci_config_read_width(bus, dev, func, reg, size);
         return 1;
     }
