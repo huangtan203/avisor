@@ -1859,44 +1859,48 @@ static void pci_edu_internal_reset(void)
 
 static int pci_edu_reinit_msi(uint32_t expected_generation)
 {
-    unsigned int lpi_base;
+    unsigned int lpi_base = 0;
+    unsigned int registered_vectors = 0;
+    unsigned int intx_registered = 0;
     unsigned int vectors = edu_msi_max_vectors > 16 ? 16 : edu_msi_max_vectors;
+    struct pci_device_resource *edu_resource =
+        pci_find_resource(edu_bus, edu_dev, edu_func);
 
     if (!edu_msi_cap_off)
         return 0;
+    if (!edu_resource ||
+        pci_dma_get_generation(edu_resource) != expected_generation)
+        return -1;
+
     gic_set_spi_target(pci_edu_intx_irq, 0);
     lpi_base = its_setup_pci_msi(edu_bus, edu_dev, edu_func,
                                  edu_msi_max_vectors, 0);
     if (!lpi_base)
         return -1;
-    for (unsigned int i = 0; i < vectors; i++)
-        if (irq_domain_register(lpi_base + i, 1, 0, VIRQ_PCI_EDU) < 0)
-            return -1;
+    for (unsigned int i = 0; i < vectors; i++) {
+        if (irq_domain_register(lpi_base + i, 1, 0,
+                                VIRQ_PCI_EDU) < 0)
+            goto rollback;
+        registered_vectors++;
+    }
     if (pci_edu_intx_irq >= 32 && pci_edu_intx_irq < 1020) {
         if (irq_domain_register(pci_edu_intx_irq, 1, 0,
                                 VIRQ_PCI_EDU) < 0)
-            return -1;
+            goto rollback;
+        intx_registered = 1;
         gic_set_spi_target(pci_edu_intx_irq, 0);
-        gic_enable_irq(pci_edu_intx_irq);
     }
+
     uint64_t msi_addr = its_get_msi_address();
-    uint32_t data_off = edu_msi_cap_off +
-        ((pci_config_read(edu_bus, edu_dev, edu_func,
-                          edu_msi_cap_off + PCI_MSI_CTRL) &
-          PCI_MSI_CTRL_64BIT) ? 0x0c : PCI_MSI_DATA);
-    uint32_t old_data = pci_config_read(edu_bus, edu_dev, edu_func, data_off);
-    pci_config_write(edu_bus, edu_dev, edu_func, data_off,
+    uint32_t data_off =
+        (pci_config_read(edu_bus, edu_dev, edu_func,
+                         edu_msi_cap_off + PCI_MSI_CTRL) &
+         PCI_MSI_CTRL_64BIT) ? 0x0c : PCI_MSI_DATA;
+    uint32_t old_data = pci_config_read(edu_bus, edu_dev, edu_func,
+                                        edu_msi_cap_off + data_off);
+    pci_config_write(edu_bus, edu_dev, edu_func,
+                     edu_msi_cap_off + data_off,
                      (old_data & 0xffff0000) | (its_get_msi_data(0) & 0xffff));
-    struct pci_device_resource *edu_resource =
-        pci_find_resource(edu_bus, edu_dev, edu_func);
-    if (edu_resource) {
-        edu_resource->msi_addr = msi_addr;
-        edu_resource->msi_data = its_get_msi_data(0) & 0xffff;
-        edu_resource->msi_ctrl = (edu_resource->msi_ctrl &
-            ~PCI_MSI_CTRL_EN) | PCI_MSI_CTRL_EN;
-        edu_resource->msi_mask = 0;
-        edu_resource->msi_pend = 0;
-    }
     pci_config_write(edu_bus, edu_dev, edu_func,
                      edu_msi_cap_off + PCI_MSI_ADDR_LO, (uint32_t)msi_addr);
     if (pci_config_read(edu_bus, edu_dev, edu_func,
@@ -1907,6 +1911,17 @@ static int pci_edu_reinit_msi(uint32_t expected_generation)
     pci_config_write(edu_bus, edu_dev, edu_func,
                      edu_msi_cap_off + data_off,
                      its_get_msi_data(0) & 0xffff);
+
+    if (pci_dma_set_authorized(edu_resource, 1, 1,
+                               expected_generation) < 0)
+        goto rollback;
+
+    edu_resource->msi_addr = msi_addr;
+    edu_resource->msi_data = its_get_msi_data(0) & 0xffff;
+    edu_resource->msi_ctrl = (edu_resource->msi_ctrl &
+                              ~PCI_MSI_CTRL_EN) | PCI_MSI_CTRL_EN;
+    edu_resource->msi_mask = 0;
+    edu_resource->msi_pend = 0;
     uint32_t msi_ctrl = pci_config_read(edu_bus, edu_dev, edu_func,
                                         edu_msi_cap_off + PCI_MSI_CTRL);
     msi_ctrl &= ~(0x7 << PCI_MSI_CTRL_MME_SHIFT);
@@ -1916,16 +1931,27 @@ static int pci_edu_reinit_msi(uint32_t expected_generation)
     uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func,
                                    PCI_CFG_COMMAND);
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
-                     pci_command_dma_safe(cmd) | PCI_CMD_MEMORY |
-                     PCI_CMD_INTX_DIS);
-    if (!edu_resource ||
-        pci_dma_set_authorized(edu_resource, 1, 1,
-                               expected_generation) < 0)
-        return -1;
+                     cmd | PCI_CMD_MEMORY | PCI_CMD_INTX_DIS);
+    gic_disable_irq(pci_edu_intx_irq);
     pci_edu_lpi_base = lpi_base;
     pci_edu_msi_enabled = 1;
     INFO("PCI: edu MSI reinitialized (LPI base=%u)", lpi_base);
     return 0;
+
+rollback:
+    if (intx_registered) {
+        gic_disable_irq(pci_edu_intx_irq);
+        put32(GICD_ICPENDR(pci_edu_intx_irq / 32),
+              1U << (pci_edu_intx_irq % 32));
+        irq_domain_unregister(pci_edu_intx_irq);
+    }
+    its_teardown_pci_msi(pci_edu_requester_id(), lpi_base, vectors);
+    while (registered_vectors)
+        vits_lpi_revoke(lpi_base + --registered_vectors);
+    pci_edu_lpi_base = 0;
+    pci_edu_msi_enabled = 0;
+    WARN("PCI: edu MSI reinitialization transaction rolled back");
+    return -1;
 }
 
 int pci_edu_vm_reset(struct task_struct *vm)
