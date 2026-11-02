@@ -43,6 +43,8 @@
 #include "boards/virt/base.h"
 #include "boards/virt/gicv3.h"
 #include "boards/virt/vgic.h"
+#include "boards/virt/irq_domain.h"
+#include "boards/virt/pci.h"
 #include "common/mm.h"
 #include "common/debug.h"
 #include "common/utils.h"
@@ -200,6 +202,12 @@ static void vits_cmd_mapd(struct vits_state *vits, uint64_t cmd[4])
     INFO("vITS: MAPD vdevid=%u itt_size=%u itt_addr=0x%lx valid=%d",
          vdevid, itt_size, (unsigned long)itt_addr, valid);
 
+    if (!vits->vm || vits->vm->vmid != 1 ||
+        !pci_edu_owns_requester(vdevid)) {
+        WARN("vITS: MAPD rejected for unowned requester %u", vdevid);
+        return;
+    }
+
     if (!valid) {
         WARN("vITS: MAPD invalid not supported");
         return;
@@ -236,6 +244,12 @@ static void vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
     INFO("vITS: MAPTI vdevid=%u veventid=%u vintid=%u vicid=%u",
          vdevid, veventid, vintid, vicid);
 
+    if (!vits->vm || vits->vm->vmid != 1 ||
+        !pci_edu_owns_requester(vdevid)) {
+        WARN("vITS: MAPTI rejected for unowned requester %u", vdevid);
+        return;
+    }
+
     /*
      * vINTID 检查：
      * 物理 LPI 必须 >= 8192（规范 + QEMU 强制），但 Guest 视角的
@@ -256,6 +270,10 @@ static void vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
     unsigned int plpi = next_alloc_plpi++;
 
     /* 记录映射 */
+    if (irq_domain_register(plpi, vits->vm->vmid, 0, vintid) < 0) {
+        WARN("vITS: LPI ownership registration failed for %u", plpi);
+        return;
+    }
     lpi_map[plpi - LPI_MAP_BASE].vmid = (uint16_t)vits->vm->vmid;
     lpi_map[plpi - LPI_MAP_BASE].vintid = vintid;
 
@@ -577,14 +595,12 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
 int vits_lpi_to_virq(unsigned int plpi, unsigned int *out_vmid,
                      unsigned int *out_vintid)
 {
-    if (plpi < LPI_MAP_BASE || plpi >= LPI_MAP_BASE + LPI_MAP_MAX)
-        return -1;
+    struct irq_route route;
 
-    struct lpi_map_entry *e = &lpi_map[plpi - LPI_MAP_BASE];
-    if (e->vmid == 0)
+    if (irq_domain_lookup(plpi, &route) < 0 ||
+        route.owner != IRQ_DOMAIN_OWNER_VM)
         return -1;
-
-    *out_vmid = e->vmid;
-    *out_vintid = e->vintid;
+    *out_vmid = (unsigned int)route.vmid;
+    *out_vintid = route.vintid;
     return 0;
 }

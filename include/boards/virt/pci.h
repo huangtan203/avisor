@@ -29,6 +29,7 @@ extern unsigned int pci_edu_intx_irq;
  */
 extern unsigned int pci_edu_lpi_base;
 extern unsigned int pci_edu_msi_enabled;
+int pci_edu_owns_requester(unsigned int requester_id);
 
 /* 把 edu 的 ECAM + BAR0 映射进指定 VM 的 Stage 2（MMIO 直通） */
 void pci_passthrough_map(struct task_struct *vm);

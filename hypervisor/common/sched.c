@@ -12,6 +12,9 @@
 #include "common/debug.h"
 #include "common/irq.h"
 #include "common/mm.h"
+#ifdef PLATFORM_VIRT
+#include "boards/virt/irq_domain.h"
+#endif
 #include "common/smp.h"
 #include "common/task.h"
 #include "common/utils.h"
@@ -224,6 +227,9 @@ int sched_migrate_current(int target_cpu)
     cpu_state[target_cpu].task[target_slot] = tsk;
     tsk->pid = target_slot;
     tsk->phys_cpu = target_cpu;
+#ifdef PLATFORM_VIRT
+    irq_domain_update_vcpu_affinity(tsk->vmid, tsk->vcpu_id, target_cpu);
+#endif
 
     rq_unlock(second_cpu);
     rq_unlock(first_cpu);

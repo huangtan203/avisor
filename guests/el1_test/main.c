@@ -3930,6 +3930,10 @@ static void vits_test(void)
     /* 3. MAPD: devid=EDU_DEVID -> ITT */
     vits_mapd(EDU_DEVID, (u64)vits_itt_buf, 3);  /* size=3 -> 16 events */
 
+    /* 未拥有的 requester 不得创建设备到 LPI 映射。 */
+    vits_mapd(EDU_DEVID + 1, (u64)vits_itt_buf, 3);
+    vits_mapti(EDU_DEVID + 1, 1, VITS_TEST_VLPI + 1, 0);
+
     /* 4. MAPTI: eventid=1 -> vLPI=VITS_TEST_VLPI, icid=0
      * 用 eventid=1 避免和 Phase 8 已配置的 eventid=0 冲突 */
     vits_mapti(EDU_DEVID, 1, VITS_TEST_VLPI, 0);

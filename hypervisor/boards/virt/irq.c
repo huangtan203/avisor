@@ -22,6 +22,7 @@
 #include "boards/virt/pci.h"
 #include "boards/virt/its.h"
 #include "boards/virt/vits.h"
+#include "boards/virt/irq_domain.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/debug.h"
 #include "common/entry.h"
@@ -130,8 +131,11 @@ void handle_irq(void)
          * 若找到匹配：向目标 VM 注入对应的虚拟中断。
          * 若没找到：回退到 Phase 8 的硬编码方式（edu 的 8192..8207 → vIRQ 50）。
          */
-        unsigned int tgt_vmid = 0, tgt_vintid = 0;
-        if (vits_lpi_to_virq(irq, &tgt_vmid, &tgt_vintid) == 0) {
+        struct irq_route route;
+        if (irq_domain_lookup(irq, &route) == 0 &&
+            route.owner == IRQ_DOMAIN_OWNER_VM) {
+            unsigned int tgt_vmid = (unsigned int)route.vmid;
+            unsigned int tgt_vintid = route.vintid;
             /*
              * Phase 10: 用 vgic_inject_virq_to_vm 支持向任意 VM 注入
              * （即使目标 VM 不在当前运行也能注入到 saved state）
@@ -142,6 +146,7 @@ void handle_irq(void)
                 for (int i = 0; i < cpu_state[c].nr_tasks; i++) {
                     struct task_struct *t = cpu_state[c].task[i];
                     if (t && t->pid != 0 && t->vmid == tgt_vmid &&
+                        t->vcpu_id == route.vcpu_id &&
                         t->state != TASK_ZOMBIE) {
                         target_vm = t;
                         break;
@@ -164,14 +169,7 @@ void handle_irq(void)
             return;
         }
 
-        /* Phase 8 兼容：硬编码 edu 的 8192..8207 → vIRQ 50 */
-        if (pci_edu_msi_enabled &&
-            irq >= pci_edu_lpi_base && irq < pci_edu_lpi_base + 16) {
-            if (current && current->pid != 0 && current->vmid == 1)
-                vgic_inject_virq(VIRQ_PCI_EDU);
-        } else {
-            WARN("LPI %u dropped (no mapping)", irq);
-        }
+        WARN("LPI %u dropped (no ownership route)", irq);
         gic_eoi_irq(irq);
         return;
     }
@@ -190,8 +188,12 @@ void handle_irq(void)
      * 由 Guest 写虚拟 EOIR 时经 LR2 的 HW 映射自动去活。
      */
     if (pci_edu_intx_irq != 0 && irq == pci_edu_intx_irq) {
-        if (current && current->pid != 0 && current->vmid == 1) {
-            vgic_inject_virq_hw_eoi(VIRQ_PCI_EDU, pci_edu_intx_irq);
+        struct irq_route route;
+        if (irq_domain_lookup(irq, &route) == 0 &&
+            route.owner == IRQ_DOMAIN_OWNER_VM && current &&
+            current->pid != 0 && current->vmid == route.vmid &&
+            current->vcpu_id == route.vcpu_id) {
+            vgic_inject_virq_hw_eoi(route.vintid, pci_edu_intx_irq);
             gic_eoi_irq(irq);
             return;  // 跳过末尾公共处理，由 HW 联动去活物理 INTx
         }

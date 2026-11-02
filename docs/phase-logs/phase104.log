@@ -1,0 +1,40 @@
+Phase 104: IRQ ownership and routing domain
+Date: 2026-11-02
+Platform: QEMU virt, AArch64, EL2, GICv3
+
+Build
+-----
+Command: make -f Makefile.virt -j$(nproc)
+Result: PASS
+Image: bin_virt/kernel8.img
+Final image size: 248464 bytes
+
+QEMU regression
+---------------
+Command: timeout 45 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase104-final.log
+Exit: 124 (expected timeout termination)
+Serial log: 116796 bytes
+
+Observed PASS/security markers
+------------------------------
+IRQ domain: ownership/routing isolation selftest PASSED
+WARN[1]: vITS: MAPD rejected for unowned requester 17
+WARN[1]: vITS: MAPTI rejected for unowned requester 17
+[vm1] vITS: PASSED! Received vSPI 72 (vLPI 8200)
+[vm1] sched: vCPU migration CPU0->CPU1->CPU0 PASSED
+[vm2] gicd: LR overflow queue delivered all 4 interrupts PASSED
+[vm1] gicd: LR overflow queue delivered all 4 interrupts PASSED
+[vm1] virtio-net: ALL loopback tests PASSED!
+[vm2] virtio-net: ALL loopback tests PASSED!
+[vm2] ivshmem: ping-pong test PASSED
+[vm1] ivshmem: ping-pong test PASSED
+[vm3] PASSED: 双 vCPU Live Migration 成功（VM2 -> VM3）
+
+Failure scan
+------------
+Scanned for PANIC, ASSERT, FAILED, SOME tests FAILED, Unknown IRQ, and no ownership route.
+No matching failure/drop markers found in the final QEMU serial log.
+
+Notes
+-----
+Requester ID 17 was rejected for both MAPD and MAPTI, while the owned edu requester (16) completed the vITS LPI test. The route target_cpu updated by vCPU migration is software metadata only; physical IRQ affinity and GICD IROUTER migration are not implemented in this phase. QEMU timeout termination is expected for this continuing guest regression workload.

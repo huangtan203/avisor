@@ -57,6 +57,7 @@
 #include "boards/virt/pci.h"
 #include "boards/virt/its.h"
 #include "boards/virt/vits.h"
+#include "boards/virt/irq_domain.h"
 #include "boards/virt/shmem.h"
 
 /*
@@ -185,6 +186,10 @@ void hypervisor_main()
     /* 3. 设置异常向量表（VBAR_EL2） */
     irq_vector_init();
     printf("[2] Exception vectors installed (VBAR_EL2)\n");
+
+    if (irq_domain_init() < 0 || irq_domain_selftest() < 0)
+        PANIC("IRQ domain selftest failed");
+    printf("IRQ domain: ownership/routing isolation selftest PASSED\n");
 
     /* 4. 初始化 GICv3 + GICv3 虚拟化（vGIC） */
     gic_init();

@@ -17,6 +17,8 @@
 #include "boards/virt/pci.h"
 #include "boards/virt/base.h"
 #include "boards/virt/gicv3.h"
+#include "boards/virt/vgic.h"
+#include "boards/virt/irq_domain.h"
 #include "boards/virt/its.h"
 #include "arch/aarch64/mmu.h"
 #include "arch/aarch64/sysregs.h"
@@ -65,6 +67,16 @@ static unsigned int edu_bus;
 static unsigned int edu_dev;
 static unsigned int edu_func;
 static int edu_found = 0;
+
+static unsigned int pci_edu_requester_id(void)
+{
+    return (edu_bus << 8) | (edu_dev << 3) | edu_func;
+}
+
+int pci_edu_owns_requester(unsigned int requester_id)
+{
+    return edu_found && requester_id == pci_edu_requester_id();
+}
 
 /*
  * edu INTx 的 GIC 全局中断号（运行时计算，pci_init 填充）。
@@ -180,9 +192,14 @@ void pci_init(void)
              " -> GIC SPI %u (global %u)",
              'A' + pin - 1, edu_dev, 'A' + host_pin,
              pci_edu_intx_irq - 32, pci_edu_intx_irq);
+        if (irq_domain_register(pci_edu_intx_irq, 1, 0,
+                                VIRQ_PCI_EDU) < 0) {
+            WARN("PCI: edu INTx ownership registration failed");
+            return;
+        }
     }
 
-    /* 4. 把 INTx 物理中断路由到 CPU0 并使能 */
+    /* 4. 把 edu INTx 物理中断路由到 CPU0 并使能 */
     gic_set_spi_target(pci_edu_intx_irq, 0);
     /*
      * 把直通 SPI 优先级设为 0x60（高于虚拟中断默认的 0x80）。
@@ -262,6 +279,14 @@ void pci_init(void)
             return;
         }
         pci_edu_lpi_base = lpi_base;
+        unsigned int owned_vectors = max_vectors > 16 ? 16 : max_vectors;
+        for (unsigned int i = 0; i < owned_vectors; i++) {
+            if (irq_domain_register(lpi_base + i, 1, 0,
+                                    VIRQ_PCI_EDU) < 0) {
+                WARN("PCI: edu MSI LPI ownership registration failed");
+                return;
+            }
+        }
 
         /* 5.5 写 MSI 消息地址（32 位 PA，高 32 位为 0）和消息数据 */
         uint64_t msi_addr = its_get_msi_address();
