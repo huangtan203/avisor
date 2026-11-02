@@ -788,6 +788,89 @@ rollback:
     return -1;
 }
 
+struct pci_bridge_config {
+    uint32_t bus_numbers;
+    uint32_t io_base_limit;
+    uint32_t io_upper;
+    uint32_t memory_base_limit;
+    uint32_t prefetch_base_limit;
+    uint32_t prefetch_base_upper;
+    uint32_t prefetch_limit_upper;
+};
+
+static struct pci_bridge_config pci_bridge_config_read(unsigned int bus,
+                                                        unsigned int dev,
+                                                        unsigned int func)
+{
+    struct pci_bridge_config config = {
+        .bus_numbers = pci_config_read(bus, dev, func,
+                                       PCI_BRIDGE_BUS_NUMBERS),
+        .io_base_limit = pci_config_read(bus, dev, func,
+                                         PCI_BRIDGE_IO_BASE_LIMIT),
+        .io_upper = pci_config_read(bus, dev, func,
+                                    PCI_BRIDGE_IO_BASE_UPPER),
+        .memory_base_limit = pci_config_read(bus, dev, func,
+                                             PCI_BRIDGE_MEMORY_BASE_LIMIT),
+        .prefetch_base_limit = pci_config_read(
+            bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_LIMIT),
+        .prefetch_base_upper = pci_config_read(
+            bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_UPPER),
+        .prefetch_limit_upper = pci_config_read(
+            bus, dev, func, PCI_BRIDGE_PREFETCH_LIMIT_UPPER),
+    };
+    return config;
+}
+
+static void pci_bridge_config_write(unsigned int bus, unsigned int dev,
+                                    unsigned int func,
+                                    const struct pci_bridge_config *config)
+{
+    pci_config_write(bus, dev, func, PCI_BRIDGE_BUS_NUMBERS,
+                     config->bus_numbers);
+    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_LIMIT,
+                     config->io_base_limit);
+    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER,
+                     config->io_upper);
+    pci_config_write(bus, dev, func, PCI_BRIDGE_MEMORY_BASE_LIMIT,
+                     config->memory_base_limit);
+    pci_config_write(bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_LIMIT,
+                     config->prefetch_base_limit);
+    pci_config_write(bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_UPPER,
+                     config->prefetch_base_upper);
+    pci_config_write(bus, dev, func, PCI_BRIDGE_PREFETCH_LIMIT_UPPER,
+                     config->prefetch_limit_upper);
+}
+
+static int pci_bridge_config_matches(unsigned int bus, unsigned int dev,
+                                     unsigned int func,
+                                     const struct pci_bridge_config *expected)
+{
+    struct pci_bridge_config actual = pci_bridge_config_read(bus, dev, func);
+    int matches = (actual.bus_numbers & 0x00ffffff) ==
+                      (expected->bus_numbers & 0x00ffffff) &&
+                  (actual.io_base_limit & 0xf0f0) ==
+                      (expected->io_base_limit & 0xf0f0) &&
+                  actual.io_upper == expected->io_upper &&
+                  (actual.memory_base_limit & 0xfff0fff0) ==
+                      (expected->memory_base_limit & 0xfff0fff0) &&
+                  (actual.prefetch_base_limit & 0xfff1fff1) ==
+                      (expected->prefetch_base_limit & 0xfff1fff1) &&
+                  actual.prefetch_base_upper ==
+                      expected->prefetch_base_upper &&
+                  actual.prefetch_limit_upper ==
+                      expected->prefetch_limit_upper;
+    if (!matches)
+        WARN("PCI: bridge %02x:%02x.%u config expected=%x/%x/%x/%x/%x/%x/%x actual=%x/%x/%x/%x/%x/%x/%x",
+             bus, dev, func, expected->bus_numbers, expected->io_base_limit,
+             expected->io_upper, expected->memory_base_limit,
+             expected->prefetch_base_limit, expected->prefetch_base_upper,
+             expected->prefetch_limit_upper, actual.bus_numbers,
+             actual.io_base_limit, actual.io_upper, actual.memory_base_limit,
+             actual.prefetch_base_limit, actual.prefetch_base_upper,
+             actual.prefetch_limit_upper);
+    return matches;
+}
+
 static void pci_init_vmsi(struct pci_device_resource *resource)
 {
     uint32_t status = pci_config_read(resource->bus, resource->dev,
@@ -921,20 +1004,8 @@ static int pci_scan_bus(unsigned int bus)
                 unsigned int secondary = pci_next_bus++;
                 uint32_t bridge_command = pci_config_read(
                     bus, dev, func, PCI_CFG_COMMAND);
-                uint32_t saved_bus_numbers = pci_config_read(
-                    bus, dev, func, PCI_BRIDGE_BUS_NUMBERS);
-                uint32_t saved_io_window = pci_config_read(
-                    bus, dev, func, PCI_BRIDGE_IO_BASE_LIMIT);
-                uint32_t saved_io_upper = pci_config_read(
-                    bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER);
-                uint32_t saved_mmio_window = pci_config_read(
-                    bus, dev, func, PCI_BRIDGE_MEMORY_BASE_LIMIT);
-                uint32_t saved_prefetch_window = pci_config_read(
-                    bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_LIMIT);
-                uint32_t saved_prefetch_base_hi = pci_config_read(
-                    bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_UPPER);
-                uint32_t saved_prefetch_limit_hi = pci_config_read(
-                    bus, dev, func, PCI_BRIDGE_PREFETCH_LIMIT_UPPER);
+                struct pci_bridge_config saved_config =
+                    pci_bridge_config_read(bus, dev, func);
                 struct pci_resource_pool saved_mmio = mmio_pool;
                 struct pci_resource_pool saved_io = io_pool;
                 unsigned int saved_next_bus = pci_next_bus - 1;
@@ -953,24 +1024,7 @@ static int pci_scan_bus(unsigned int bus)
                     io_pool = saved_io;
                     pci_next_bus = saved_next_bus;
                     pci_device_count = saved_count;
-                    pci_config_write(bus, dev, func, PCI_BRIDGE_BUS_NUMBERS,
-                                     saved_bus_numbers);
-                    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_LIMIT,
-                                     saved_io_window);
-                    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER,
-                                     saved_io_upper);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_MEMORY_BASE_LIMIT,
-                                     saved_mmio_window);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_BASE_LIMIT,
-                                     saved_prefetch_window);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_BASE_UPPER,
-                                     saved_prefetch_base_hi);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_LIMIT_UPPER,
-                                     saved_prefetch_limit_hi);
+                    pci_bridge_config_write(bus, dev, func, &saved_config);
                     pci_config_write(bus, dev, func, PCI_CFG_COMMAND,
                                      bridge_command);
                     resource->primary_bus = 0;
@@ -989,8 +1043,15 @@ static int pci_scan_bus(unsigned int bus)
                 resource->subordinate_bus = subordinate;
                 bus_numbers = (bus & 0xff) | (secondary << 8) |
                               (subordinate << 16);
-                pci_config_write(bus, dev, func, PCI_BRIDGE_BUS_NUMBERS,
-                                 bus_numbers);
+                struct pci_bridge_config planned_config = {
+                    .bus_numbers = bus_numbers,
+                    .io_base_limit = 0x000000f0,
+                    .io_upper = 0,
+                    .memory_base_limit = 0x0000fff0,
+                    .prefetch_base_limit = 0x0001fff1,
+                    .prefetch_base_upper = 0,
+                    .prefetch_limit_upper = 0,
+                };
 
                 uint64_t mmio_base = UINT64_MAX, mmio_limit = 0;
                 uint64_t prefetch_base = UINT64_MAX, prefetch_limit = 0;
@@ -1025,14 +1086,10 @@ static int pci_scan_bus(unsigned int bus)
                         PCI_BRIDGE_MEMORY_GRANULARITY, 0x100000);
                     uint32_t window = (uint32_t)((base >> 16) & 0xfff0) |
                         (uint32_t)((limit >> 16) << 16 & 0xfff00000);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_MEMORY_BASE_LIMIT, window);
+                    planned_config.memory_base_limit = window;
                     INFO("PCI: bridge %02x:%02x.%u memory window 0x%lx-0x%lx",
                          bus, dev, func, (unsigned long)base,
                          (unsigned long)(limit + PCI_BRIDGE_MEMORY_GRANULARITY - 1));
-                } else {
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_MEMORY_BASE_LIMIT, 0x0000fff0);
                 }
                 if (prefetch_base != UINT64_MAX) {
                     uint64_t base = prefetch_base &
@@ -1044,35 +1101,12 @@ static int pci_scan_bus(unsigned int bus)
                     uint32_t window = ((base >> 16) & 0xfff0) |
                         (((limit >> 16) & 0xfff0) << 16) |
                         (1U << 0) | (1U << 16);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_BASE_LIMIT, window);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_BASE_UPPER,
-                                     base >> 32);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_LIMIT_UPPER,
-                                     limit >> 32);
-                    uint32_t verify_window = pci_config_read(
-                        bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_LIMIT);
-                    uint32_t verify_base_hi = pci_config_read(
-                        bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_UPPER);
-                    uint32_t verify_limit_hi = pci_config_read(
-                        bus, dev, func, PCI_BRIDGE_PREFETCH_LIMIT_UPPER);
-                    if (verify_window != window ||
-                        verify_base_hi != (uint32_t)(base >> 32) ||
-                        verify_limit_hi != (uint32_t)(limit >> 32))
-                        WARN("PCI: bridge %02x:%02x.%u prefetch window mismatch",
-                             bus, dev, func);
+                    planned_config.prefetch_base_limit = window;
+                    planned_config.prefetch_base_upper = base >> 32;
+                    planned_config.prefetch_limit_upper = limit >> 32;
                     INFO("PCI: bridge %02x:%02x.%u prefetch window 0x%lx-0x%lx",
                          bus, dev, func, (unsigned long)base,
                          (unsigned long)(limit + PCI_BRIDGE_MEMORY_GRANULARITY - 1));
-                } else {
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_BASE_LIMIT, 0x0000fff0);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_BASE_UPPER, 0);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_LIMIT_UPPER, 0);
                 }
                 int reserve_failed = 0;
                 if (mmio_base != UINT64_MAX) {
@@ -1111,57 +1145,43 @@ static int pci_scan_bus(unsigned int bus)
                     if (pool_reserve_range(&io_pool, base, reserve_size) < 0)
                         reserve_failed = 1;
                     uint32_t io_type = 1U;
-                    uint32_t io_window = ((base >> 8) & 0xf0) |
-                        (limit & 0xf000) | io_type | (io_type << 8);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_IO_BASE_LIMIT, io_window);
-                    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER,
-                                     ((base >> 16) & 0xffff) |
-                                     ((limit >> 16) << 16));
-                    uint32_t verify = pci_config_read(
-                        bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER);
-                    if (verify != (((base >> 16) & 0xffff) |
-                                   ((limit >> 16) << 16)))
-                        WARN("PCI: bridge %02x:%02x.%u I/O upper window mismatch",
-                             bus, dev, func);
+                    planned_config.io_base_limit =
+                        ((base >> 8) & 0xf0) | (limit & 0xf000) |
+                        io_type | (io_type << 8);
+                    planned_config.io_upper = ((base >> 16) & 0xffff) |
+                                              ((limit >> 16) << 16);
                     INFO("PCI: bridge %02x:%02x.%u I/O window 0x%x-0x%x",
                          bus, dev, func, base,
                          limit + PCI_BRIDGE_IO_GRANULARITY - 1);
-                } else {
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_IO_BASE_LIMIT, 0x000000f0);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_IO_BASE_UPPER, 0);
                 }
                 if (reserve_failed) {
                     mmio_pool = saved_mmio;
                     io_pool = saved_io;
                     pci_next_bus = saved_next_bus;
                     pci_device_count = saved_count;
-                    pci_config_write(bus, dev, func, PCI_BRIDGE_BUS_NUMBERS,
-                                     saved_bus_numbers);
-                    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_LIMIT,
-                                     saved_io_window);
-                    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER,
-                                     saved_io_upper);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_MEMORY_BASE_LIMIT,
-                                     saved_mmio_window);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_BASE_LIMIT,
-                                     saved_prefetch_window);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_BASE_UPPER,
-                                     saved_prefetch_base_hi);
-                    pci_config_write(bus, dev, func,
-                                     PCI_BRIDGE_PREFETCH_LIMIT_UPPER,
-                                     saved_prefetch_limit_hi);
+                    pci_bridge_config_write(bus, dev, func, &saved_config);
                     pci_config_write(bus, dev, func, PCI_CFG_COMMAND,
                                      bridge_command);
                     WARN("PCI: bridge window reservation failed for %02x:%02x.%u",
                          bus, dev, func);
                     return -1;
                 }
+                pci_bridge_config_write(bus, dev, func, &planned_config);
+                if (!pci_bridge_config_matches(bus, dev, func,
+                                               &planned_config)) {
+                    mmio_pool = saved_mmio;
+                    io_pool = saved_io;
+                    pci_next_bus = saved_next_bus;
+                    pci_device_count = saved_count;
+                    pci_bridge_config_write(bus, dev, func, &saved_config);
+                    pci_config_write(bus, dev, func, PCI_CFG_COMMAND,
+                                     bridge_command);
+                    WARN("PCI: bridge config readback failed for %02x:%02x.%u",
+                         bus, dev, func);
+                    return -1;
+                }
+                INFO("PCI: bridge %02x:%02x.%u config committed and verified",
+                     bus, dev, func);
             }
             pci_init_vmsi(resource);
             if (resource->msi_cap_off && resource->owner_vmid == 1 &&
