@@ -191,9 +191,12 @@ struct vm_virt_state {
 	unsigned long gic_lr[NR_VGIC_LRS]; /* ICH_LR0..LRn_EL2 */
 	unsigned long cntv_ctl;         /* CNTV_CTL_EL0 */
 	unsigned long cntv_cval;        /* CNTV_CVAL_EL0 */
-	int vtimer_pending;             /* vtimer 延迟注入标志 */
-	int vgic_ipi_pending;           /* 跨核 vGIC 注入：有待注入的虚拟中断 */
-	unsigned int vgic_ipi_vintid;   /* 跨核 vGIC 注入：待注入的虚拟中断号 */
+	int vtimer_pending;			/* vtimer 延迟注入标志 */
+	volatile unsigned int vgic_pending_lock;
+	unsigned int vgic_pending_head;
+	unsigned int vgic_pending_tail;
+	unsigned int vgic_pending_count;
+	unsigned int vgic_pending[32];
 };
 
 struct freeze_context {

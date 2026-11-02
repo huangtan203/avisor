@@ -148,6 +148,7 @@ el2_irq:
 el01_irq:
 	kernel_entry
 	bl handle_irq
+	bl vgic_refill_pending
 	kernel_exit
 
 el01_sync:
@@ -158,6 +159,7 @@ el01_sync:
 	/* hvc number in x8 */
 	mov x3, x8
 	bl handle_sync_exception
+	bl vgic_refill_pending
 	kernel_exit
 
 .globl switch_from_kthread

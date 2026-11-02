@@ -1,0 +1,38 @@
+Phase 103: vGIC LR overflow queue and deferred refill
+Date: 2026-11-02
+Platform: QEMU virt, AArch64, GICv3
+
+Build
+-----
+Command: make -f Makefile.virt -j$(nproc)
+Result: PASS
+Image: bin_virt/kernel8.img
+Final image size: 243704 bytes
+Existing Guest/MM compiler warnings remain; no compilation, assembly, or link errors.
+
+QEMU regression
+---------------
+Command: timeout 45 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase103-final2.log
+Exit: 124 (expected timeout termination)
+Serial log: 116364 bytes
+
+Observed PASS markers
+---------------------
+[vm1] virtio-net: ALL loopback tests PASSED!
+[vm2] virtio-net: ALL loopback tests PASSED!
+[vm1] ivshmem: ping-pong test PASSED
+[vm2] ivshmem: ping-pong test PASSED
+[vm1] vITS: PASSED! Received vSPI 72 (vLPI 8200)
+[vm1] sched: vCPU migration CPU0->CPU1->CPU0 PASSED
+[vm1] gicd: LR overflow queue delivered all 4 interrupts PASSED
+[vm2] gicd: LR overflow queue delivered all 4 interrupts PASSED
+[vm3] PASSED: 双 vCPU Live Migration 成功（VM2 -> VM3）
+
+Failure scan
+------------
+Scanned for PANIC, ASSERT, FAILED, and SOME tests FAILED.
+No matching failure markers found in the final QEMU serial log.
+
+Notes
+-----
+An experimental maintenance PPI path was removed after it generated repeated unexpected IRQ warnings. The final implementation refills software LR entries at Guest exception-return and vCPU restore safe points. The final run has no maintenance IRQ warning flood.

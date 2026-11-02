@@ -177,6 +177,7 @@ static void gic_vcpu_init(void)
 
 /* 虚拟 GICD 测试接收标志 */
 static volatile int vgicd_irq_received = 0;
+static volatile u32 vgicd_queue_received = 0;
 
 static inline int vgicd_inject(u32 vintid)
 {
@@ -280,6 +281,17 @@ static void phase15_vgicd_test(void)
         guest_puts("gicd: inject PASSED (enabled SPI delivered)\n");
     else
         guest_puts("gicd: inject FAILED\n");
+
+    vgicd_queue_received = 0;
+    for (u32 i = 0; i < 4; i++)
+        vgicd_inject(VGICD_TEST_VIRQ + i);
+    timeout = 10000000;
+    while (vgicd_queue_received != 0xF && timeout-- > 0)
+        asm volatile("nop");
+    if (vgicd_queue_received == 0xF)
+        guest_puts("gicd: LR overflow queue delivered all 4 interrupts PASSED\n");
+    else
+        guest_puts("gicd: LR overflow queue FAILED\n");
 
     guest_puts("\nPhase 15: ALL tests done\n");
 }
@@ -4053,9 +4065,11 @@ void guest_irq_handler(void)
     } else if (intid == SHM_NOTIFY_VIRQ) {
         /* 共享内存通知中断（Phase 10） */
         shm_notify_received = 1;
-    } else if (intid == VGICD_TEST_VIRQ) {
-        /* Phase 15: 虚拟 GICD 测试中断 */
-        vgicd_irq_received = 1;
+    } else if (intid >= VGICD_TEST_VIRQ &&
+               intid < VGICD_TEST_VIRQ + 4) {
+        if (intid == VGICD_TEST_VIRQ)
+            vgicd_irq_received = 1;
+        vgicd_queue_received |= 1U << (intid - VGICD_TEST_VIRQ);
     } else if (intid == VGICR_TEST_PPI) {
         /* Phase 16: 虚拟 GICR 测试中断 */
         vgicr_irq_received = 1;

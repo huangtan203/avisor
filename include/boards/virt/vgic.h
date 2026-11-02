@@ -113,6 +113,7 @@ int vgic_inject_virq(uint32_t vintid);
  * 查询指定虚拟中断是否 pending
  */
 int vgic_is_virq_pending(uint32_t vintid);
+void vgic_refill_pending(void);
 
 /*
  * Phase 10: 向指定 VM 注入虚拟中断（不要求目标 VM 正在运行）

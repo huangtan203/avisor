@@ -18,6 +18,74 @@
 #include "common/smp.h"
 #include "common/utils.h"
 
+#define VGIC_PENDING_CAPACITY 32
+
+static inline uint64_t read_lr(int idx);
+static inline void write_lr(int idx, uint64_t val);
+
+static void vgic_pending_lock(struct vm_virt_state *virt)
+{
+    unsigned int value;
+    unsigned int failed;
+
+    for (;;) {
+        asm volatile("1: ldaxr %w0, [%2]\n"
+                     "cbnz %w0, 1b\n"
+                     "mov %w0, #1\n"
+                     "stxr %w1, %w0, [%2]\n"
+                     "cbnz %w1, 1b\n"
+                     : "=&r"(value), "=&r"(failed)
+                     : "r"(&virt->vgic_pending_lock)
+                     : "memory");
+        return;
+    }
+}
+
+static void vgic_pending_unlock(struct vm_virt_state *virt)
+{
+    asm volatile("stlr wzr, [%0]"
+                 :: "r"(&virt->vgic_pending_lock) : "memory");
+}
+
+static int vgic_pending_push(struct vm_virt_state *virt, uint32_t vintid)
+{
+    int ret = 0;
+
+    vgic_pending_lock(virt);
+    for (unsigned int i = 0; i < virt->vgic_pending_count; i++) {
+        unsigned int pos = (virt->vgic_pending_head + i) %
+                           VGIC_PENDING_CAPACITY;
+        if (virt->vgic_pending[pos] == vintid)
+            goto out;
+    }
+    if (virt->vgic_pending_count >= VGIC_PENDING_CAPACITY) {
+        ret = -1;
+        goto out;
+    }
+    virt->vgic_pending[virt->vgic_pending_tail] = vintid;
+    virt->vgic_pending_tail =
+        (virt->vgic_pending_tail + 1) % VGIC_PENDING_CAPACITY;
+    virt->vgic_pending_count++;
+out:
+    vgic_pending_unlock(virt);
+    return ret;
+}
+
+static int vgic_pending_pop(struct vm_virt_state *virt, uint32_t *vintid)
+{
+    vgic_pending_lock(virt);
+    if (!virt->vgic_pending_count) {
+        vgic_pending_unlock(virt);
+        return -1;
+    }
+    *vintid = virt->vgic_pending[virt->vgic_pending_head];
+    virt->vgic_pending_head =
+        (virt->vgic_pending_head + 1) % VGIC_PENDING_CAPACITY;
+    virt->vgic_pending_count--;
+    vgic_pending_unlock(virt);
+    return 0;
+}
+
 static inline uint64_t read_lr(int idx)
 {
     switch (idx) {
@@ -490,7 +558,25 @@ static int vgic_inject_virq_raw(uint32_t vintid)
             (lr & ICH_LR_STATE_MASK) == ICH_LR_PENDING)
             return 0;
     }
-    return -1;  /* 没有空闲 LR */
+    return vgic_pending_push(&current->virt, vintid);
+}
+
+void vgic_refill_pending(void)
+{
+    uint32_t vintid;
+
+    if (!current || current->pid == 0)
+        return;
+    for (int i = 1; i < NR_VGIC_LRS - 1; i++) {
+        if ((read_lr(i) & ICH_LR_STATE_MASK) != 0)
+            continue;
+        if (vgic_pending_pop(&current->virt, &vintid) < 0)
+            return;
+        if (vgic_inject_virq_raw(vintid) < 0) {
+            vgic_pending_push(&current->virt, vintid);
+            return;
+        }
+    }
 }
 
 /*
@@ -514,7 +600,10 @@ int vgic_inject_virq(uint32_t vintid)
         !virt_vgicd_spi_enabled(current, vintid))
         return -1;
 
-    return vgic_inject_virq_raw(vintid);
+    int ret = vgic_inject_virq_raw(vintid);
+    if (ret == 0)
+        vgic_refill_pending();
+    return ret;
 }
 
 /*
@@ -604,21 +693,25 @@ int vgic_inject_virq_to_vm(struct task_struct *vm, uint32_t vintid)
 
     /* 情况 1：目标就是当前运行的 vCPU，直接写本核硬件 LR
      * （走 raw：LPI/vSGI 经此路径，不受 GICD SPI enable 门控） */
-    if (vm == current && vm->pid != 0)
-        return vgic_inject_virq_raw(vintid);
+    if (vm == current && vm->pid != 0) {
+        int ret = vgic_inject_virq_raw(vintid);
+        if (ret == 0)
+            vgic_refill_pending();
+        return ret;
+    }
 
-    /* 情况 3：跨核——mailbox + 物理 SGI 交给目标核处理 */
     if (vm->phys_cpu != smp_processor_id()) {
-        vm->virt.vgic_ipi_vintid = vintid;
-        vm->virt.vgic_ipi_pending = 1;
-        /* 确保 mailbox 写全局可见后再触发 SGI */
+        int ret = vgic_pending_push(&vm->virt, vintid);
+        if (ret < 0)
+            return ret;
         asm volatile("dmb ish" ::: "memory");
         smp_send_ipi(vm->phys_cpu, SGI_VGIC_UPDATE);
         return 0;
     }
 
-    /* 情况 2：同核但目标未运行——写 saved state，下次调度恢复时生效 */
-    return vgic_inject_saved(&vm->virt, vintid);
+    if (vgic_inject_saved(&vm->virt, vintid) == 0)
+        return 0;
+    return vgic_pending_push(&vm->virt, vintid);
 }
 
 /*
@@ -645,19 +738,14 @@ void vgic_ipi_update_handle(void)
         struct task_struct *vm = cpu_state[cpu].task[i];
         if (!vm || vm->pid == 0)
             continue;
-        if (!vm->virt.vgic_ipi_pending)
-            continue;
-
-        uint32_t vintid = vm->virt.vgic_ipi_vintid;
-        vm->virt.vgic_ipi_pending = 0;
 
         if (cpu_state[cpu].curr == vm) {
-            /* 目标正在运行：写硬件 LR，立即送达
-             * （走 raw：LPI/vSGI 经此路径，不受 GICD SPI enable 门控） */
-            vgic_inject_virq_raw(vintid);
+            vgic_refill_pending();
         } else {
-            /* 目标未运行：写 saved state，下次调度恢复时生效 */
-            vgic_inject_saved(&vm->virt, vintid);
+            uint32_t vintid;
+            if (vgic_pending_pop(&vm->virt, &vintid) == 0 &&
+                vgic_inject_saved(&vm->virt, vintid) < 0)
+                vgic_pending_push(&vm->virt, vintid);
         }
     }
 }

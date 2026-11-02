@@ -720,8 +720,9 @@ static void virt_entering_vm(struct task_struct *tsk)
 	/* 1. 恢复虚拟时间偏移 */
 	WRITE_SYSREG64(tsk->mm.cntvoff, CNTVOFF_EL2);
 
-	/* 2. 恢复虚拟 GIC 接口全部状态（VMCR + 所有 LR） */
+	/* 2. 恢复虚拟 GIC 接口并重填 pending queue */
 	vgic_restore_state(&tsk->virt);
+	vgic_refill_pending();
 
 	/* 3. 恢复虚拟定时器 */
 	WRITE_SYSREG64(tsk->virt.cntv_cval, CNTV_CVAL_EL0);
