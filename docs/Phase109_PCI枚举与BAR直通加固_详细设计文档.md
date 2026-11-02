@@ -1,98 +1,136 @@
-# aVisor Hypervisor Phase 109 详细设计文档：PCI 枚举与 BAR 直通加固
+# aVisor Phase 109 详细设计：PCI 资源事务与 Owner BAR 直通加固
 
-> 阶段：Phase 109
-> 平台：QEMU virt（AArch64、EL2、GICv3、ITS）
-> 前置阶段：Phase 108 PCI bridge 递归枚举与 I/O BAR 分配
+> 平台：QEMU virt / AArch64 EL2 / GICv3 / ITS
+> 前置阶段：Phase 108 recursive PCI bridge 和 I/O BAR
+> 本阶段：BAR transaction rollback、Stage-2 conflict rollback、owner resource HVC
 
-## 1. 目标与范围
+## 1. 背景与目标
 
-本阶段加固 PCI BAR sizing 与资源分配失败路径，确保失败时恢复设备 BAR、PCI Command、MMIO/I/O allocator 游标及 BAR resource 表；校验 BAR size、对齐与 PCI aperture 边界。Stage-2 只映射归属 VM 的 edu ECAM function page 与 BAR0 pages，并在遇到已有 IPA 映射时撤销本次已建立的映射。
+Phase 108 建立了递归枚举和资源分配，但 BAR 探测涉及多次配置空间写入；中途失败可能留下部分编程状态。Guest passthrough mapping 也必须避免覆盖已有 Stage-2 映射。Phase 109 把 BAR sizing/assignment 变为可回滚事务，并通过受限 HVC 暴露当前 VM 拥有的 edu 资源。
 
-新增 `HVC_PCI_CONFIG`，selector 0 仅允许 VM1 查询已归属 edu 的 ECAM、BAR0、BAR size 与 requester ID。Guest 不再依赖固定 BDF，vITS MAPD/MAPTI 和 MSI capability 扫描使用动态 requester/ECAM 地址。
+目标边界仍为单设备策略：只有 VM1 的 edu function 可查询和透传。桥下 e1000 等设备可由 Hypervisor 枚举和分配资源，但不因此获得 Guest ECAM 权限。
 
-## 2. 调用与资源流
+## 2. 架构
 
 ```mermaid
-flowchart TD
-    A[pci_init] --> B[pci_scan_bus]
-    B --> C[pci_probe_bars]
-    C --> D[保存 Command BAR resource 与 allocator 游标]
-    D --> E[关闭 decode 并 sizing BAR]
-    E --> F{size 对齐且 aperture 有空间?}
-    F -->|否| G[恢复 BAR Command allocator 与 resource table]
-    F -->|是| H[编程 BAR 并提交资源]
-    H --> I[记录 edu BDF BAR 与 requester]
-    J[VM1 启动] --> K[pci_passthrough_map]
-    K --> L[精确映射 edu function ECAM page]
-    K --> M[映射 edu BAR0 有效 pages]
-    N[Guest HVC_PCI_CONFIG selector=0] --> O{VM1 且资源归属当前 VM?}
-    O -->|否| P[返回 -1]
-    O -->|是| Q[返回 ECAM BAR0 size requester ID]
-    Q --> R[Guest 动态 PCI/MSI discovery]
-    R --> S[vITS ownership 校验 MAPD/MAPTI]
+flowchart LR
+    Boot[pci_init] --> Enum[pci_enumerate/scan]
+    Enum --> Tx[pci_probe_bars transaction]
+    Tx --> Config[ECAM config space]
+    Tx --> Pool[MMIO/I/O allocators]
+    Tx --> Table[PCI resource table]
+    VMinit[VM1 initialization] --> Map[pci_passthrough_map]
+    Map --> Query[stage2_page_is_mapped]
+    Map --> S2[Stage-2 BAR mapping]
+    Guest[Guest] --> HVC[HVC_PCI_CONFIG selector 0]
+    HVC --> Owner[owned resource query]
+    Owner --> GuestInfo[ECAM/BAR/size/requester tuple]
+    GuestInfo --> VITS[vITS requester validation]
 ```
+
+## 3. BAR assignment transaction
+
+事务快照覆盖：PCI Command、所有 BAR low/high DWORD、目标 resource entries、MMIO/I/O allocator state。所有 BAR sizing 完成后再按大小降序分配，任一资源无效或分配失败即恢复快照。
 
 ```mermaid
 sequenceDiagram
-    participant G as Guest VM1
-    participant H as HVC handler
-    participant P as PCI ownership/resource table
-    participant I as vITS
-    G->>H: HVC_PCI_CONFIG(selector=0)
-    H->>P: 查询当前 VM 的 owned edu resource
-    P-->>H: ECAM, BAR0, size, requester ID
-    H-->>G: x0..x3 resource tuple
-    G->>G: 动态读取 PCI ID/BAR 与 MSI capability
-    G->>I: MAPD/MAPTI(dynamic requester)
-    I->>P: requester ownership check
-    P-->>I: owned / rejected
-    I-->>G: 配置结果与虚拟 LPI
+    participant Scan as pci_scan_bus
+    participant Tx as pci_probe_bars
+    participant Cfg as ECAM config
+    participant Pool as resource pools
+    participant Res as pci_device_resource
+    Scan->>Tx: probe function
+    Tx->>Cfg: snapshot Command/BAR low/high
+    Tx->>Pool: snapshot pools
+    Tx->>Res: snapshot BAR metadata
+    Tx->>Cfg: disable decode; probe all BAR masks
+    Tx->>Tx: validate sizes and sort descending
+    loop each valid BAR entry
+        Tx->>Pool: aligned allocation
+        Pool-->>Tx: address or error
+        Tx->>Cfg: program BAR pair
+        Tx->>Res: commit resource metadata
+    end
+    alt any failure
+        Tx->>Cfg: restore all BARs and Command
+        Tx->>Res: restore resource snapshot
+        Tx->>Pool: restore pool snapshot
+    else success
+        Tx->>Cfg: restore Command
+    end
 ```
 
-## 3. 关键实现
+64-bit BAR 作为配对 entry 排序，保存原 high DWORD；失败回滚时恢复两个 DWORD。allocator 的 pool snapshot 是最终事务状态保障。
 
-- `pci_probe_bars()` 对 endpoint 执行 BAR sizing；失败路径恢复原始 BAR（含 64-bit pair）、PCI Command、MMIO/I/O allocator 游标和 BAR resource entries，并将错误返回至扫描者。
-- MMIO/I/O allocator 保持按 BAR size 对齐，并验证窗口范围和整数溢出；无效 mask/size 或资源耗尽触发 endpoint transaction rollback。
-- `stage2_page_is_mapped()` 只读检查目标 IPA 是否已有 leaf mapping，避免用会创建空页表的 probe 作为冲突检查。`pci_passthrough_map()` 只回滚本次建立的 BAR 页和 ECAM 页，不触碰调用前已有映射。
-- `HVC_PCI_CONFIG` selector 0 当前仅支持 VM1 的 edu 资源；非法 selector、无效资源或非 owner 均返回 `-1`。
-- Guest HVC helper 返回 x0..x3。Guest 使用 Hypervisor 返回的动态 ECAM/BAR/requester 信息，不再固定 requester 常量或 `00:02.0` ECAM 地址。
-- vITS requester policy 继续由 Hypervisor 按枚举出的 edu BDF 校验；移位拓扑中 requester 为 24，邻接未授权 requester 25 被拒绝。
+## 4. Owner mapping transaction
 
-## 4. 代码映射
+`pci_passthrough_map()` 检查 VMID、BAR0 对齐、size 和 MMIO aperture；逐页确认 IPA 尚未映射，再进行 identity mapping。发生冲突时只 unmap 本次创建的 BAR pages，不撤销调用前已有映射。ECAM 后续由 Phase 110 trap-and-emulate，不再向 Guest 直映。
 
-| 文件 | 变更 |
+```mermaid
+flowchart TD
+    A[pci_passthrough_map VM] --> B{VM1 + edu resource valid?}
+    B -->|no| E[fail]
+    B -->|yes| C[for each BAR0 page]
+    C --> D{stage2_page_is_mapped?}
+    D -->|yes| R[unmap pages created by this call]
+    D -->|no| F[map_stage2_page identity/device]
+    F --> C
+    C -->|complete| G[pci_map_owned_io]
+    G --> H[success]
+```
+
+当前 `map_stage2_page()` 没有失败返回值，因此只能检测既有映射冲突，不能报告中间页表分配失败。
+
+## 5. HVC resource ABI 与 ownership
+
+`HVC_PCI_CONFIG` selector 0 仅接受 VM1。成功返回寄存器组：x0=ECAM function address、x1=BAR0 address、x2=BAR0 size、x3=requester ID。非法 selector、未找到 edu 或非 owner 返回 -1。
+
+```mermaid
+sequenceDiagram
+    participant G as Guest
+    participant H as handle_hvc64
+    participant P as pci_get_owned_config
+    participant T as PCI resource table
+    G->>H: selector=0
+    H->>P: current task + selector
+    P->>T: find edu owned by VM1
+    T-->>P: BDF and BAR0 metadata
+    P-->>H: ECAM/BAR0/size/requester
+    H-->>G: x0..x3
+    G->>G: discover capability and device dynamically
+```
+
+## 6. 函数调用图
+
+```mermaid
+flowchart LR
+    pci_init --> pci_enumerate
+    pci_scan_bus --> pci_probe_bars
+    pci_probe_bars --> pci_allocate_mmio
+    pci_probe_bars --> pci_allocate_io
+    pci_probe_bars --> pci_config_write
+    vm_init --> pci_passthrough_map
+    pci_passthrough_map --> stage2_page_is_mapped
+    pci_passthrough_map --> map_stage2_page
+    handle_hvc64 --> pci_get_owned_config
+    pci_get_owned_config --> pci_edu_requester_id
+    guest_vits_test --> HVC_PCI_CONFIG
+```
+
+## 7. 代码映射
+
+| 文件 | 职责 |
 |---|---|
-| `hypervisor/boards/virt/pci.c` | BAR transaction rollback、owner resource query、Stage-2 passthrough mapping conflict/rollback |
-| `hypervisor/common/mm.c`、`include/common/mm.h` | 增加只读 Stage-2 leaf mapping 查询 |
-| `hypervisor/arch/aarch64/sync_exc.c`、`include/common/hvc.h` | HVC_PCI_CONFIG handler 与 ABI |
-| `include/boards/virt/pci.h` | PCI ownership query 与 mapping API |
-| `hypervisor/boards/virt/virt_board.c` | 检查 passthrough mapping 结果 |
-| `guests/el1_test/guest.h`、`guests/el1_test/main.c` | 多寄存器 HVC helper、动态 PCI/MSI discovery 与 ownership 负测 |
+| `hypervisor/boards/virt/pci.c` | BAR 事务、pool rollback、owner query 与映射 |
+| `hypervisor/common/mm.c`、`include/common/mm.h` | Stage-2 leaf 查询 |
+| `hypervisor/arch/aarch64/sync_exc.c`、`include/common/hvc.h` | HVC handler/编号 |
+| `hypervisor/boards/virt/virt_board.c` | VM 初始化映射错误检查 |
+| `guests/el1_test/guest.h`、`guests/el1_test/main.c` | HVC ABI 与动态 requester discovery |
 
-## 5. 验证
+## 8. 验证与已知边界
 
-构建：`make -f Makefile.virt -j$(nproc)`，通过。`git diff --check` 通过。
-
-默认拓扑日志：`/tmp/avisor-phase109-final-basic.log`。发现 edu `00:02.0`，BAR0 `0x10100000/0x100000`；Guest PCI enumeration/BAR discovery、vITS MSI delivery、edu reset + MSI reinit 均通过。vITS 接受 requester 16 并拒绝未授权 requester 17。
-
-移位与嵌套 bridge 拓扑命令：
-
-```sh
-timeout 75 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=off \
-  -cpu max -smp 2 -m 1G -device edu,bus=pcie.0,addr=0x3 \
-  -device pci-bridge,id=br1,bus=pcie.0,addr=0x4,chassis_nr=1 \
-  -device pci-bridge,id=br2,bus=br1,addr=0x1,chassis_nr=2 \
-  -device e1000,bus=br2,addr=0x2 -kernel bin_virt/kernel8.img \
-  -display none -monitor none -serial file:/tmp/avisor-phase109-final-nested.log
-```
-
-日志发现 edu `00:03.0`、两级 bridge `00:04.0`/`01:01.0` 和下游 e1000 `02:02.0`。Guest PCI discovery、动态 requester 24、拒绝 requester 25、MSI delivery 和 reset + MSI reinit 均通过。QEMU 按测试设定由 timeout 终止。
-
-完整 Guest 日志仍出现既有 `FAIL: task 槽位未被实际复用`，与 Phase 108 已记录的 Phase 44 task-slot reuse 自测失败一致；本阶段不宣称该项或全量 Guest 回归通过。Stage-2 mapping API `map_stage2_page()` 无失败返回值，因此页表页分配失败不可由本 PCI 调用点恢复；本阶段覆盖已有映射冲突的事务 rollback。
-
-## 6. 限制
-
-- HVC 当前仅暴露 VM1 的 edu selector 0；未实现通用多设备 selector。
-- QEMU 移位与 nested bridge 拓扑完成 discovery/MSI/reset 验证；桥后 e1000 由 Hypervisor 枚举和分配 BAR，但未透传给 Guest。
-- Stage-2 页表内存分配失败无法通过现有 `map_stage2_page()` ABI 向调用方报告。
-- 未新增独立 IOMMU/SMMU DMA translation abstraction；本阶段以设备 ownership、Hypervisor requester 校验与精确 Stage-2 映射为范围。
+- `make -f Makefile.virt -j$(nproc)` 与 `git diff --check`：PASS。
+- 默认拓扑：edu `00:02.0` BAR0 `0x10100000/0x100000`；Guest discovery、vITS requester 16、拒绝 requester 17、MSI/reset recovery 通过。
+- nested topology：edu `00:03.0`，两级 bridge 和 e1000 `02:02.0`；动态 requester 24，拒绝邻接 requester 25；QEMU 由 timeout 结束。
+- 完整 Guest log 有历史 task-slot reuse FAIL，本阶段不宣称全部 Guest tests 通过。
+- Stage-2 map API 无失败状态；仅 VM1 edu 可通过 HVC 查询；无 IOMMU/SMMU DMA 隔离。
