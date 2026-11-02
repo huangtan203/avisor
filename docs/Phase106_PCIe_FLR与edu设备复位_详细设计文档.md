@@ -1,125 +1,157 @@
-# aVisor Hypervisor Phase 106 详细设计文档：PCIe FLR 与 edu 设备复位
+# aVisor Phase 106 详细设计：PCIe FLR 与 edu Function Reset
 
-> 版本：Phase 106
-> 平台：QEMU virt（AArch64、EL2、GICv3、ITS）
-> 主题：PCIe FLR 探测、edu quiescence、设备复位与 MSI/IRQ 恢复
+> 平台：QEMU virt / AArch64 EL2 / GICv3 / ITS
+> 前置阶段：Phase 105 IRQ teardown
+> 核心：在安全 quiesce 后执行 FLR 或 edu fallback，并重建 MSI/IRQ 状态
 
-## 1. 概述
+## 1. 问题与目标
 
-Phase 106 为 VM1 透传的 QEMU edu 增加设备功能级复位路径。启动枚举 PCI capability list 时记录 MSI 与 PCI Express capability，并读取 Device Capabilities 的 FLR 支持位。Guest 通过 `HVC_PCI_RESET` 请求复位；Hypervisor 先禁用 INTx、Bus Master 和 MSI，等待 edu factorial/DMA busy 位退出，再撤销 IRQ ownership 与 ITS/vITS LPI 映射。设备支持 FLR 时写 PCIe Device Control FLR 位并等待；否则清理 edu 中断、DMA、liveness 和 factorial 寄存器。最后恢复 BAR、PCI Command、ITS MSI 表项、MSI 配置与 IRQ route。
+Phase 105 只能释放设备中断资源，不能让仍在运行的 Guest 请求一次“复位后继续使用”。Phase 106 增加 `HVC_PCI_RESET` 和 `pci_edu_function_reset()`：关闭中断/DMA入口、等待设备空闲、撤销旧 route，执行标准 FLR 或设备模型 fallback，再恢复 BAR、Command、ITS、MSI 和 IRQ ownership。
 
-`pci_edu_vm_reset()` 仍是 Phase 105 的生命周期 teardown 接口，由 VM 销毁及迁移 source reclaim 使用；它不执行设备复位，也不重新分配 IRQ。Guest function reset 使用单独的 `pci_edu_function_reset()`。
+`pci_edu_vm_reset()` 保持 teardown 语义，用于 VM 销毁；`pci_edu_function_reset()` 是可恢复事务，二者不能混用。
 
-## 2. 架构与调用关系
-
-### 2.1 Guest HVC 与 reset/recovery
-
-```mermaid
-flowchart TD
-    A[VM1 vCPU0: HVC_PCI_RESET] --> B[handle_hvc64 权限检查]
-    B --> C[pci_edu_function_reset]
-    C --> D[pci_edu_quiesce]
-    D --> E[禁用 INTx 与 Bus Master]
-    E --> F[禁用 MSI]
-    F --> G{factorial 或 DMA busy?}
-    G -->|是，且未超时| H[wait_msec 1ms 后重查]
-    H --> G
-    G -->|超时| X[返回失败，不执行 reset]
-    G -->|否| I[禁用 INTx SPI、清 pending、撤销 route]
-    I --> J[its_teardown_pci_msi]
-    J --> K[vits_lpi_revoke 与 IRQ route revoke]
-    K --> L{PCIe FLR supported?}
-    L -->|是| M[写 Device Control FLR 并等待]
-    L -->|否| N[pci_edu_internal_reset]
-    M --> O[恢复 BAR0 与 PCI Command]
-    N --> O
-    O --> P[pci_edu_reinit_msi]
-    P --> Q[重建 ITS mapping 与全部 MSI LPI routes]
-    Q --> R[重写 MSI address/data/control 并恢复 Bus Master]
-    R --> S[HVC 检查 VM1 INTx/MSI ownership]
-    S --> T[Guest 校验 PCI/edu identity 与 reset 状态]
-    T --> U[Guest MAPTI EventID 1 并触发 MSI]
-```
-
-### 2.2 关键函数调用关系
+## 2. 架构设计
 
 ```mermaid
 flowchart LR
-    A[pci_init] --> B[PCI capability list walk]
-    B --> C[记录 MSI capability]
-    B --> D[记录 PCIe capability 与 FLR bit]
-    E[handle_hvc64: HVC_PCI_RESET] --> F[pci_edu_function_reset]
-    F --> G[pci_edu_quiesce]
-    F --> H[its_teardown_pci_msi]
-    F --> I[vits_lpi_revoke]
-    F --> J[pci_edu_internal_reset 或 PCIe FLR]
-    F --> K[pci_edu_reinit_msi]
-    K --> L[its_setup_pci_msi]
-    K --> M[irq_domain_register: MSI vectors]
-    K --> N[irq_domain_register: INTx]
-    O[VM teardown / migration reclaim] --> P[pci_edu_vm_reset]
-    P --> G
-    P --> H
-    P --> I
+    Guest[VM1 Guest HVC_PCI_RESET] --> HVC[EL2 HVC handler]
+    HVC --> Reset[pci_edu_function_reset]
+    Reset --> Quiesce[Interrupt/DMA quiesce]
+    Reset --> Route[IRQ domain + vITS revoke]
+    Reset --> Device[PCIe FLR or edu fallback]
+    Reset --> Recover[BAR/Command/MSI recovery]
+    Recover --> ITS[Physical ITS]
+    Recover --> Route
+    Recover --> Guest
 ```
 
-## 3. 实现要点
+复位事务分为五个阶段：授权、quiesce、route teardown、设备 reset、资源恢复。任一前置条件失败不得继续对设备执行 reset。
 
-- PCI capability 遍历完整走访链表，同时记录 MSI capability 与 PCI Express capability；FLR 支持由 Device Capabilities bit 28 判断，FLR 请求写 Device Control bit 15。
-- `pci_edu_quiesce()` 先设置 INTx Disable、清 Bus Master、禁用 MSI，再最多等待 100000 次 1ms，直到 edu factorial STATUS 与 DMA CMD busy 位均清零。
-- FLR 前先撤销设备 MSI ITS mapping 与软件 IRQ routes，避免旧物理 LPI 在 reset 后继续投递到 VM。INTx route 同时禁用、清 pending 并注销。
-- QEMU edu 未报告 FLR 支持时，fallback 清 IRQ pending、DMA command/source/destination/count、liveness 与 factorial 寄存器。
-- MSI recovery 重新调用 `its_setup_pci_msi()`，并重新登记所有已分配向量（包括 vector 0）与 INTx ownership，然后恢复 MSI message address/data/control 与 PCI Command。
-- HVC 成功后检查恢复的 INTx route 和 MSI base route 均属于 VM1，且 MSI 状态有效；该检查用于验证 reset 的恢复后置条件，不再使用 teardown 测试的“route 必须缺失”断言。
-- Guest 在 reset 后检查 PCI vendor/device、BAR0、edu identification、liveness 读回及 factorial 结果，并对 EventID 1 重新 MAPTI 后验证 MSI 送达。
-- VM teardown 的 `pci_edu_vm_reset()` 保留独立 teardown 语义，避免破坏 `task.c` 与 `migration.c` 的既有生命周期调用。
+## 3. Capability 探测
 
-## 4. 代码映射
+PCI capability 链遍历记录：
 
-| 文件 | Phase 106 变更 |
+- MSI capability offset、64-bit address、MMC/MME 等能力；
+- PCI Express capability offset；
+- Device Capabilities bit 28（FLR supported）；
+- Device Control bit 15（Initiate FLR）。
+
+链指针来自 `PCI_CFG_CAP_PTR`，按 capability header 的 next 指针遍历。Phase 107 以后 capability 元数据逐步并入通用 function resource；本阶段运行目标仍是 edu。
+
+## 4. Reset 状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Authorized
+    Authorized --> Quiescing: VM1/vCPU0 + edu present
+    Authorized --> Failed: permission/ownership invalid
+    Quiescing --> RoutesRemoved: factorial/DMA idle
+    Quiescing --> Failed: timeout
+    RoutesRemoved --> FLR: PCIe FLR supported
+    RoutesRemoved --> EduFallback: FLR unsupported
+    FLR --> Restoring
+    EduFallback --> Restoring
+    Restoring --> Ready: BAR/Command/ITS/MSI/INTx restored
+    Restoring --> Failed: recovery failed
+    Ready --> [*]
+    Failed --> [*]
+```
+
+### 4.1 Quiesce
+
+`pci_edu_quiesce()`：
+
+1. 设置 INTx Disable；
+2. 清 Bus Master；
+3. 禁用 MSI；
+4. 轮询 factorial STATUS 和 DMA CMD busy；
+5. 最多 100000 次、每次等待 1 ms，超时返回失败。
+
+### 4.2 Route teardown
+
+关闭物理 INTx 并清 pending，调用 `its_teardown_pci_msi()` 清 LPI enable、提交 MAPD invalid/SYNC，再由 `vits_lpi_revoke()` 清软件映射和 IRQ route。
+
+### 4.3 设备复位
+
+- 支持 FLR：写 PCIe Device Control FLR bit 并等待设备完成。
+- 不支持 FLR：`pci_edu_internal_reset()` 清中断、DMA source/destination/count/cmd、liveness 和 factorial 状态。
+
+### 4.4 恢复
+
+恢复启动期保存的 BAR 与 PCI Command；`pci_edu_reinit_msi()` 重新调用 `its_setup_pci_msi()`，登记 MSI LPI/INTx route，重写 MSI address/data/control，并恢复 bus master。
+
+## 5. 调用时序
+
+```mermaid
+sequenceDiagram
+    participant G as Guest VM1
+    participant H as handle_hvc64
+    participant P as pci_edu_function_reset
+    participant I as ITS/vITS/IRQ domain
+    participant D as edu/PCI function
+    G->>H: HVC_PCI_RESET
+    H->>H: 校验 VM1/vCPU0
+    H->>P: reset request
+    P->>D: INTx disable, Bus Master off, MSI off
+    loop until idle or timeout
+        P->>D: read factorial/DMA busy
+    end
+    P->>I: disable INTx + teardown MSI + revoke routes
+    alt FLR supported
+        P->>D: PCIe Device Control.FLR=1
+    else QEMU edu fallback
+        P->>D: clear edu IRQ/DMA/liveness/factorial registers
+    end
+    P->>D: restore BAR and Command
+    P->>I: rebuild ITS mappings and routes
+    P-->>H: success/failure
+    H->>I: verify INTx/MSI ownership postcondition
+    H-->>G: status
+```
+
+## 6. 函数调用图
+
+```mermaid
+flowchart LR
+    handle_hvc64 --> pci_edu_function_reset
+    pci_edu_function_reset --> pci_edu_quiesce
+    pci_edu_function_reset --> its_teardown_pci_msi
+    pci_edu_function_reset --> vits_lpi_revoke
+    pci_edu_function_reset --> pci_edu_internal_reset
+    pci_edu_function_reset --> pci_edu_reinit_msi
+    pci_edu_reinit_msi --> its_setup_pci_msi
+    pci_edu_reinit_msi --> irq_domain_register
+    task_release --> pci_edu_vm_reset
+```
+
+## 7. 文件映射
+
+| 文件 | 设计职责 |
 |---|---|
-| `hypervisor/boards/virt/pci.c` | PCIe capability/FLR 探测、quiesce、edu fallback reset、MSI/IRQ 恢复 |
-| `hypervisor/arch/aarch64/sync_exc.c` | `HVC_PCI_RESET` 权限与 reset 后 ownership 检查 |
-| `hypervisor/boards/virt/vits.c` | event 0 复用 PCI MSI vector 0 的 route；reset 后 EventID 1 重新建图 |
-| `guests/el1_test/main.c` | reset 后 PCI/edu identity/state 与 MSI 回归断言 |
-| `include/common/hvc.h`、`guests/el1_test/guest.h` | HVC reset 编号定义 |
-| `include/boards/virt/pci.h` | 声明 VM teardown 与 function reset API |
+| `hypervisor/boards/virt/pci.c` | capability 探测、quiesce、reset、恢复事务 |
+| `hypervisor/arch/aarch64/sync_exc.c` | HVC 权限及恢复后 ownership 断言 |
+| `hypervisor/boards/virt/its.c` | ITS teardown/setup |
+| `hypervisor/boards/virt/vits.c` | LPI revoke 与 reset 后重映射 |
+| `include/common/hvc.h`、`guests/el1_test/guest.h` | HVC ABI |
+| `guests/el1_test/main.c` | reset 后 identity/state/MSI 回归 |
 
-## 5. 验证
+## 8. 正确性与失败处理
 
-构建命令：
+- quiesce 超时不进入 reset，避免在设备 busy 时破坏状态。
+- reset 前撤销旧 MSI route，恢复时重新分配并登记，避免陈旧 LPI。
+- BAR 使用保存的 resource 恢复，不在 HVC 栈内重新扫描总线。
+- HVC 成功返回前验证 INTx route 和 MSI base route 仍属于 VM1。
 
-```sh
-make -f Makefile.virt -j$(nproc)
-```
+## 9. 验证
 
-结果：PASS；Hypervisor 与 Guest 成功编译链接。Guest build 有若干既存 warning，本阶段未处理。
+- `make -f Makefile.virt -j$(nproc)`：PASS；Guest 仅有既存 warning。
+- QEMU：`timeout 70 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase106-final3.log`。
+- edu factorial/MSI、vITS vLPI 8200、reset identity/state、MSI reinit、迁移和 LR overflow 标记通过；无 PANIC/ASSERT/FAILED/Unknown IRQ/no ownership。
+- QEMU 报告 `edu PCIe FLR not supported`，因此实际覆盖 quiesce + edu fallback + ITS/MSI recovery；标准 FLR 分支仅经代码审查和构建。
 
-QEMU 回归命令：
+## 10. 限制
 
-```sh
-timeout 70 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase106-final3.log
-```
-
-QEMU 由 timeout 以退出码 124 正常终止。关键输出：
-
-```text
-INFO[0]: PCI: edu PCIe FLR not supported
-[vm1] edu: factorial PASSED
-[vm1] vITS: PASSED! Received vSPI 72 (vLPI 8200)
-INFO[1]: PCI: edu function reset complete for VM1 (edu internal fallback)
-[vm1] vITS: edu reset identity/state PASSED
-INFO[1]: vITS: MAPTI done: vINTID=8200 -> pLPI=9001 (vmid=1)
-[vm1] vITS: edu function reset + MSI reinit PASSED
-[vm1] sched: vCPU migration CPU0->CPU1->CPU0 PASSED
-[vm1] gicd: LR overflow queue delivered all 4 interrupts PASSED
-[vm3] PASSED: 双 vCPU Live Migration 成功（VM2 -> VM3）
-```
-
-扫描 `PANIC`、`ASSERT`、`FAILED`、`Unknown IRQ`、`no ownership` 未发现匹配项。
-
-## 6. 限制
-
-- 当前 QEMU edu capability 未声明可用 PCIe FLR，因此运行时验证覆盖的是 quiesce + edu 内部寄存器 fallback；标准 FLR 分支虽已实现，但尚未在支持 FLR 的设备/模拟器上执行。
-- quiescence 依赖 edu busy 位和 100 秒上限；本阶段不提供通用 PCI 设备 reset framework，也未实现 DMA 的 IOMMU/SMMU 隔离。
-- Guest 对 liveness 与 factorial 的检查遵循 edu 模型语义：liveness 写零后读回 `0xffffffff`，factorial 输入零后读回 `0! = 1`。
+- 无支持 FLR 的运行时设备覆盖。
+- quiesce 只理解 edu busy 寄存器，不是通用 PCI reset framework。
+- 无 SMMU/IOMMU，Bus Master off 不能替代 DMA 隔离。
+- 没有定义恢复中途失败后的完整硬件回滚；当前设备模型和调用路径要求恢复步骤成功。
