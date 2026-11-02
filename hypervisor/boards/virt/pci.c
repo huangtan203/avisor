@@ -5,8 +5,8 @@
  * 目标设备：QEMU edu 教育设备（vendor 0x1234 / device 0x11e8）
  *
  * 直通三步：
- *   1. 枚举（ECAM）：扫描 bus 0 找到 edu，编程 BAR0=0x10000000，
- *      使能 memory/bus master。
+ *   1. 枚举（ECAM）：扫描 PCI 拓扑并分配 BAR；未接入 IOMMU 时仅
+ *      使能所需的 I/O/Memory decode，保持 bus master 关闭。
  *   2. Stage 2 映射：把 ECAM（16MB）+ BAR0（1MB）用 device 属性
  *      映射进 VM 的 IPA 空间（等值映射，IPA == PA）。
  *   3. 中断：按 pin+slot swizzle 计算 edu INTx 落在主桥哪根 INTx 线、
@@ -274,6 +274,11 @@ static void pci_config_write(unsigned int bus, unsigned int dev,
                              unsigned int func, unsigned int reg, uint32_t val)
 {
     put32(ecam_addr(bus, dev, func, reg), val);
+}
+
+static uint32_t pci_command_dma_safe(uint32_t command)
+{
+    return command & ~PCI_CMD_BUSMASTER;
 }
 
 static void pool_init(struct pci_resource_pool *pool, uint64_t base,
@@ -929,6 +934,34 @@ static int pci_bar_in_window(const struct pci_bar_resource *bar,
     return base >= window->base && base + bar->size - 1 <= window->limit;
 }
 
+static int pci_dma_guard_init(void)
+{
+    unsigned int guarded = 0;
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        struct pci_device_resource *resource = &pci_devices[i];
+        uint32_t command = pci_config_read(resource->bus, resource->dev,
+                                           resource->func,
+                                           PCI_CFG_COMMAND);
+        command = pci_command_dma_safe(command);
+        if (resource->owner_vmid)
+            command |= PCI_CMD_MEMORY;
+        pci_config_write(resource->bus, resource->dev, resource->func,
+                         PCI_CFG_COMMAND, command);
+        uint32_t verify = pci_config_read(resource->bus, resource->dev,
+                                          resource->func,
+                                          PCI_CFG_COMMAND);
+        if (verify & PCI_CMD_BUSMASTER) {
+            WARN("PCI: failed to disable bus mastering for %02x:%02x.%u",
+                 resource->bus, resource->dev, resource->func);
+            return -1;
+        }
+        guarded++;
+    }
+    INFO("PCI: DMA guard active, bus mastering disabled for %u functions",
+         guarded);
+    return 0;
+}
+
 static int pci_bar_resource_audit(void)
 {
     unsigned int bar_count = 0;
@@ -1403,6 +1436,8 @@ static int pci_enumerate(void)
     pool_init(&io_pool, 0, PCI_IO_ALLOC_END, PCI_ALLOC_FIRST_FIT);
     if (pci_scan_bus(0) < 0 || !edu_found)
         return -1;
+    if (pci_dma_guard_init() < 0)
+        return -1;
     if (pci_bar_resource_audit() < 0) {
         WARN("PCI: BAR resource audit failed");
         return -1;
@@ -1452,9 +1487,9 @@ void pci_init(void)
 
     /* 1. BAR 已由启动期 resource allocator 编程。 */
 
-    /* 2. 使能 memory space + bus master */
+    /* 使能 BAR memory decode；ITS/MSI 路由完成前保持 bus master 关闭。 */
     uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND);
-    cmd |= PCI_CMD_MEMORY | PCI_CMD_BUSMASTER;
+    cmd = (cmd | PCI_CMD_MEMORY) & ~PCI_CMD_BUSMASTER;
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND, cmd);
 
     /*
@@ -1616,8 +1651,6 @@ void pci_init(void)
         msi_ctrl |= PCI_MSI_CTRL_EN;
         edu_resource->msi_ctrl = (edu_resource->msi_ctrl &
                                   ~PCI_MSI_CTRL_EN) | PCI_MSI_CTRL_EN;
-        pci_config_write(edu_bus, edu_dev, edu_func,
-                         edu_msi_cap_off + PCI_MSI_CTRL, msi_ctrl);
         unsigned int owned_vectors = max_vectors > 16 ? 16 : max_vectors;
         for (unsigned int i = 0; i < owned_vectors; i++) {
             if (irq_domain_register(lpi_base + i, 1, 0,
@@ -1626,6 +1659,13 @@ void pci_init(void)
                 return;
             }
         }
+        uint32_t dma_command = pci_config_read(
+            edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND);
+        pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
+                         dma_command | PCI_CMD_BUSMASTER);
+        INFO("PCI: edu bus mastering enabled by hypervisor after MSI routing");
+        pci_config_write(edu_bus, edu_dev, edu_func,
+                         edu_msi_cap_off + PCI_MSI_CTRL, msi_ctrl);
 
         /* 禁用 INTx（Command 寄存器 bit 10） */
         uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func,
@@ -1656,7 +1696,7 @@ static int pci_edu_quiesce(void)
                                        edu_msi_cap_off + PCI_MSI_CTRL);
         pci_config_write(edu_bus, edu_dev, edu_func,
                          edu_msi_cap_off + PCI_MSI_CTRL,
-                         msi | PCI_MSI_CTRL_EN);
+                         msi & ~PCI_MSI_CTRL_EN);
         struct pci_device_resource *resource =
             pci_find_resource(edu_bus, edu_dev, edu_func);
         if (resource)
@@ -1740,8 +1780,8 @@ static int pci_edu_reinit_msi(void)
     uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func,
                                    PCI_CFG_COMMAND);
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
-                     cmd | PCI_CMD_MEMORY | PCI_CMD_BUSMASTER |
-                     PCI_CMD_INTX_DIS);
+                     cmd | PCI_CMD_MEMORY | PCI_CMD_INTX_DIS |
+                     PCI_CMD_BUSMASTER);
     pci_edu_lpi_base = lpi_base;
     pci_edu_msi_enabled = 1;
     INFO("PCI: edu MSI reinitialized (LPI base=%u)", lpi_base);
@@ -1825,10 +1865,9 @@ int pci_edu_function_reset(struct task_struct *vm)
     }
     edu_bar0 = edu_resource->bars[0].address;
     edu_bar0_size = edu_resource->bars[0].size;
-    pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND, cmd);
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
-                     cmd | PCI_CMD_MEMORY | PCI_CMD_BUSMASTER |
-                     PCI_CMD_INTX_DIS);
+                     (cmd | PCI_CMD_MEMORY | PCI_CMD_INTX_DIS) &
+                     ~PCI_CMD_BUSMASTER);
     pci_edu_lpi_base = 0;
     pci_edu_msi_enabled = 0;
     if (pci_edu_reinit_msi() < 0) {
@@ -2225,6 +2264,7 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
         return 1;
     if (reg < PCI_CFG_COMMAND + 2 && reg + size > PCI_CFG_COMMAND) {
         uint32_t command = pci_config_read(bus, dev, func, PCI_CFG_COMMAND);
+        uint32_t dma_state = command & PCI_CMD_BUSMASTER;
         unsigned int first = reg > PCI_CFG_COMMAND ? reg : PCI_CFG_COMMAND;
         unsigned int last = reg + size < PCI_CFG_COMMAND + 2 ?
                             reg + size : PCI_CFG_COMMAND + 2;
@@ -2237,7 +2277,9 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
                 command = (command & ~PCI_CMD_INTX_DIS) |
                           ((uint32_t)(incoming & (PCI_CMD_INTX_DIS >> 8)) << 8);
         }
+        command = pci_command_dma_safe(command) | dma_state;
         pci_config_write(bus, dev, func, PCI_CFG_COMMAND, command);
+        *value = pci_config_read_width(bus, dev, func, reg, size);
         return 1;
     }
     for (unsigned int i = 0; i < size; i++) {
