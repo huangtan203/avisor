@@ -1,0 +1,35 @@
+Phase 105: IRQ migration and device release
+Date: 2026-11-02
+Platform: QEMU virt, AArch64, EL2, GICv3, ITS
+
+Build
+-----
+Command: make -f Makefile.virt -j$(nproc)
+Result: PASS
+Image: bin_virt/kernel8.img
+Final image size: 248648 bytes
+
+QEMU regression
+---------------
+Command: timeout 45 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase105-final3.log
+Exit: 124 (expected timeout termination)
+Serial log: 113506 bytes
+
+Observed PASS markers
+---------------------
+IRQ domain: ownership/routing isolation selftest PASSED
+[vm1] vITS: PASSED! Received vSPI 72 (vLPI 8200)
+[vm1] sched: vCPU migration CPU0->CPU1->CPU0 PASSED
+[vm2] gicd: LR overflow queue delivered all 4 interrupts PASSED
+[vm1] gicd: LR overflow queue delivered all 4 interrupts PASSED
+INFO[2]: migration: source VM reclaimed (pages=22 shm=0 ksm=247 done=1)
+[vm3] PASSED: 双 vCPU Live Migration 成功（VM2 -> VM3）
+
+Failure scan
+------------
+Scanned for PANIC, ASSERT, FAILED, Unknown IRQ, and no ownership route.
+No matching failure/drop markers found in the final QEMU serial log.
+
+Coverage limits
+---------------
+The Live Migration test moves VM2 to VM3, so it does not invoke the VM1-owned PCI edu IRQ teardown path. The run confirms general IRQ migration and source VM reclamation, but does not prove edu function reset, VM1 teardown, device reuse, DMA quiescence, or LPI affinity migration. These are not reported as runtime-verified.

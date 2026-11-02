@@ -20,6 +20,8 @@
 #include "boards/virt/vgic.h"
 #include "boards/virt/irq_domain.h"
 #include "boards/virt/its.h"
+#include "boards/virt/vits.h"
+#include "common/task.h"
 #include "arch/aarch64/mmu.h"
 #include "arch/aarch64/sysregs.h"
 #include "common/mm.h"
@@ -53,7 +55,8 @@
 #define PCI_MSI_ADDR_LO    0x04  /* Message Address（32位） */
 #define PCI_MSI_DATA       0x08  /* Message Data（32位） */
 #define PCI_MSI_MASK       0x0c  /* Mask Bits（可选，取决于 MSC） */
-#define PCI_MSI_PEND       0x10  /* Pending Bits（可选） */
+#define PCI_MSI_PEND       0x10
+#define EDU_REG_IRQ_ACK    0x24
 
 /* MSI Message Control 位 */
 #define PCI_MSI_CTRL_EN          (1 << 0)   /* MSI Enable */
@@ -336,6 +339,41 @@ void pci_init(void)
         INFO("PCI: edu MSI enabled (LPI base=%u, msg_addr=0x%lx msg_data=0x%x)",
              lpi_base, msi_addr, msi_data);
     }
+}
+
+int pci_edu_vm_reset(struct task_struct *vm)
+{
+    if (!vm || vm->vmid != 1 || !edu_found)
+        return -1;
+
+    uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func,
+                                  PCI_CFG_COMMAND);
+    pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
+                     (cmd | PCI_CMD_INTX_DIS) & ~PCI_CMD_BUSMASTER);
+    if (edu_msi_cap_off) {
+        uint32_t msi = pci_config_read(edu_bus, edu_dev, edu_func,
+                                       edu_msi_cap_off + PCI_MSI_CTRL);
+        pci_config_write(edu_bus, edu_dev, edu_func,
+                         edu_msi_cap_off + PCI_MSI_CTRL,
+                         msi & ~PCI_MSI_CTRL_EN);
+    }
+    if (pci_edu_intx_irq >= 32 && pci_edu_intx_irq < 1020) {
+        gic_disable_irq(pci_edu_intx_irq);
+        put32(GICD_ICPENDR(pci_edu_intx_irq / 32),
+              1U << (pci_edu_intx_irq % 32));
+        irq_domain_unregister(pci_edu_intx_irq);
+    }
+    if (pci_edu_lpi_base) {
+        its_teardown_pci_msi(pci_edu_requester_id(), pci_edu_lpi_base, 16);
+        for (unsigned int i = 0; i < 16; i++)
+            vits_lpi_revoke(pci_edu_lpi_base + i);
+    }
+    put32(PCI_EDU_BAR0_IPA + EDU_REG_IRQ_ACK, 0xffffffff);
+    asm volatile("dsb sy" ::: "memory");
+
+    pci_edu_lpi_base = 0;
+    pci_edu_msi_enabled = 0;
+    return 0;
 }
 
 void pci_passthrough_map(struct task_struct *vm)

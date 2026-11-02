@@ -113,5 +113,6 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val);
  * 查询物理 LPI 对应的虚拟中断，返回 0=找到，-1=未映射
  * 输出 vmid 和 vINTID。
  */
+int vits_lpi_revoke(unsigned int plpi);
 int vits_lpi_to_virq(unsigned int plpi, unsigned int *out_vmid,
                      unsigned int *out_vintid);

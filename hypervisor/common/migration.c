@@ -31,6 +31,7 @@
 #ifdef PLATFORM_VIRT
 #include "arch/aarch64/sysregs.h"
 #include "boards/virt/vgic.h"
+#include "boards/virt/pci.h"
 #include "boards/virt/virt_board.h"
 #include "boards/virt/shmem.h"
 #endif
@@ -428,6 +429,8 @@ static void migration_reclaim_src(struct task_struct *src)
 #ifdef PLATFORM_VIRT
 	mig_reclaim_shm = shm_detach_vm(src);
 	mig_reclaim_ksm = ksm_drop_vm(src);
+	if (src->vmid == 1)
+		pci_edu_vm_reset(src);
 	virt_destroy_vm(src);
 	mig_reclaim_pages = destroy_vm_pages(src);
 	mig_reclaim_vm_done = (mig_reclaim_shm >= 0 &&

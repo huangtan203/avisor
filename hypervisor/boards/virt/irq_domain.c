@@ -136,8 +136,9 @@ int irq_domain_unregister_vm(unsigned long vmid)
 int irq_domain_update_vcpu_affinity(unsigned long vmid, int vcpu_id,
                                     int target_cpu)
 {
+    unsigned int irqs[IRQ_DOMAIN_MAX_ROUTES];
+    unsigned int count = 0;
     unsigned long flags;
-    int updated = 0;
 
     if (target_cpu < 0 || target_cpu >= MAX_CPUS)
         return -1;
@@ -146,11 +147,15 @@ int irq_domain_update_vcpu_affinity(unsigned long vmid, int vcpu_id,
         if (routes[i].enabled && routes[i].owner == IRQ_DOMAIN_OWNER_VM &&
             routes[i].vmid == vmid && routes[i].vcpu_id == vcpu_id) {
             routes[i].target_cpu = target_cpu;
-            updated++;
+            if (routes[i].pintid >= 32 && routes[i].pintid < 1020)
+                irqs[count++] = routes[i].pintid;
         }
     }
     domain_unlock(flags);
-    return updated;
+
+    for (unsigned int i = 0; i < count; i++)
+        gic_set_spi_target(irqs[i], target_cpu);
+    return (int)count;
 }
 
 int irq_domain_init(void)
@@ -183,7 +188,7 @@ int irq_domain_selftest(void)
         irq_domain_register(16382, 1, VM_MAX_VCPUS, 80) != -1 ||
         irq_domain_lookup(16383, &route) < 0 || route.vmid != 1 ||
         route.vcpu_id != 1 || route.vintid != 80 ||
-        irq_domain_update_vcpu_affinity(1, 1, 1) != 1 ||
+        irq_domain_update_vcpu_affinity(1, 1, 1) != 0 ||
         irq_domain_lookup(16383, &route) < 0 || route.target_cpu != 1)
         ret = -1;
     if (irq_domain_unregister(16383) < 0 ||

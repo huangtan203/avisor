@@ -195,6 +195,26 @@ unsigned int its_setup_pci_msi(unsigned int bus, unsigned int dev,
     return lpi_base;
 }
 
+void its_teardown_pci_msi(unsigned int devid, unsigned int lpi_base,
+                          unsigned int num_vectors)
+{
+    if (!lpi_base)
+        return;
+    if (num_vectors > ITS_ITT_MAX_EVENTS)
+        num_vectors = ITS_ITT_MAX_EVENTS;
+    if (lpi_prop_pa) {
+        volatile uint8_t *cfg = (volatile uint8_t *)(uintptr_t)lpi_prop_pa;
+        for (unsigned int i = 0; i < num_vectors; i++) {
+            unsigned int lpi = lpi_base + i;
+            if (lpi >= LPI_INTID_BASE)
+                cfg[lpi - LPI_INTID_BASE] = 0;
+        }
+    }
+    asm volatile("dsb sy" ::: "memory");
+    its_send_cmd(ITS_CMD_MAPD | ((uint64_t)devid << 32), 0, 0, 0);
+    its_send_cmd(ITS_CMD_SYNC, 0, 0, 0);
+}
+
 /* ---------- 初始化 ---------- */
 
 void its_init(void)

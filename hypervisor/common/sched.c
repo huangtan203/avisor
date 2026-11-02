@@ -228,7 +228,10 @@ int sched_migrate_current(int target_cpu)
     tsk->pid = target_slot;
     tsk->phys_cpu = target_cpu;
 #ifdef PLATFORM_VIRT
-    irq_domain_update_vcpu_affinity(tsk->vmid, tsk->vcpu_id, target_cpu);
+    if (irq_domain_update_vcpu_affinity(tsk->vmid, tsk->vcpu_id,
+                                       target_cpu) < 0)
+        WARN("sched: failed to update IRQ affinity for VM%lu vCPU%d",
+             tsk->vmid, tsk->vcpu_id);
 #endif
 
     rq_unlock(second_cpu);

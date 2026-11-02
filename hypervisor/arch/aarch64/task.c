@@ -33,6 +33,8 @@
 #include "emulator/raspi/bcm2837.h"
 #else
 #include "boards/virt/virt_board.h"
+#include "boards/virt/irq_domain.h"
+#include "boards/virt/pci.h"
 #endif
 
 int uart_forwarded_task = 0;
@@ -290,7 +292,15 @@ static int remove_task_slot(struct task_struct *tsk)
 	if (cpu != smp_processor_id() || sched_dequeue_task(tsk) != 1)
 		return 0;
 
-	/* 先从 runqueue 摘除，再解绑 registry，最后释放任务资源。 */
+	/* 先从 runqueue 摘除，再释放 VM 设备资源并解绑 registry。 */
+#ifdef PLATFORM_VIRT
+	if (tsk->vcpu_id == 0) {
+		if (tsk->vmid == 1)
+			pci_edu_vm_reset(tsk);
+		irq_domain_unregister_vm(tsk->vmid);
+		virt_destroy_vm(tsk);
+	}
+#endif
 	vm_detach_vcpu(tsk);
 	destroy_task_aux(tsk);
 	deallocate_page(tsk);
