@@ -141,6 +141,13 @@ static inline void mmio_write32(u64 addr, u32 val)
     __raw_writel(val, addr);
 }
 
+static inline u16 mmio_read16(u64 addr)
+{
+    u16 value;
+    asm volatile("ldrh %w0, [%1]" : "=r"(value) : "r"(addr) : "memory");
+    return value;
+}
+
 /* ---------- GIC 虚拟 CPU 接口操作 ---------- */
 
 /*
@@ -1462,9 +1469,10 @@ static void edu_test(void)
     edu_ecam_base = ecam;
     id = mmio_read32(ecam);
     u32 bar0 = mmio_read32(ecam + 0x10);
+    u16 vendor16 = mmio_read16(ecam);
     edu_bar0_base &= ~0xfULL;
     if ((id & 0xffff) != 0x1234 || (id >> 16) != 0x11e8 ||
-        (bar0 & ~0xfU) != edu_bar0_base) {
+        vendor16 != 0x1234 || (bar0 & ~0xfU) != edu_bar0_base) {
         guest_puts("PCI enumeration/BAR discovery FAILED (resource mismatch)\n");
         return;
     }
@@ -1474,6 +1482,12 @@ static void edu_test(void)
     if (!edu_bar0_base)
         return;
     guest_puts("PCI enumeration/BAR discovery PASSED\n");
+
+    mmio_write32(ecam + 0x10, 0x20000000);
+    if ((mmio_read32(ecam + 0x10) & ~0xfU) == edu_bar0_base)
+        guest_puts("PCI BAR write protection PASSED\n");
+    else
+        guest_puts("PCI BAR write protection FAILED\n");
 
     /* 1. identification（应为 0x010000ed） */
     id = mmio_read32(edu_bar0_base + EDU_ID_REG);

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <stdint.h>
 #include "common/sched.h"
 
 #define HAVE_FUNC(ops, func, ...) ((ops) && ((ops)->func))
@@ -18,6 +19,8 @@ struct board_ops {
 	unsigned long (*mmio_read)(struct task_struct *, unsigned long);
 	void (*mmio_write)(struct task_struct *, unsigned long, unsigned long);
 	int (*is_mmio_addr)(struct task_struct *, unsigned long);
+	int (*mmio_access)(struct task_struct *, unsigned long, unsigned int,
+			   int, uint64_t *);
 	void (*entering_vm)(struct task_struct *);
 	void (*leaving_vm)(struct task_struct *);
 	int (*is_irq_asserted)(struct task_struct *);

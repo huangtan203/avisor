@@ -373,6 +373,9 @@ static int virt_is_mmio_addr(struct task_struct *tsk, unsigned long ipa)
     if (ipa >= VIRT_VITS_BASE && ipa < VIRT_VITS_BASE + VIRT_VITS_SIZE)
         return 1;
 
+    if (pci_is_mmio_addr(tsk, ipa))
+        return 1;
+
     /* 注意：ivshmem 共享内存区域是真实内存映射，不是 MMIO 模拟 */
 
     return 0;
@@ -849,6 +852,7 @@ uint8_t virt_vgic_vintid_priority(struct task_struct *vm, uint32_t vintid)
 const struct board_ops virt_board_ops = {
 	.initialize = virt_initialize,
 	.mmio_read = virt_mmio_read,
+	.mmio_access = pci_mmio_access,
 	.mmio_write = virt_mmio_write,
 	.is_mmio_addr = virt_is_mmio_addr,
 	.entering_vm = virt_entering_vm,

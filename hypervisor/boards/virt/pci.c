@@ -849,6 +849,95 @@ int pci_edu_function_reset(struct task_struct *vm)
     return 0;
 }
 
+static int pci_resource_owner(struct pci_device_resource *resource,
+                              unsigned int bus, unsigned int dev,
+                              unsigned int func)
+{
+    return resource->bus == bus && resource->dev == dev &&
+           resource->func == func;
+}
+
+static struct pci_device_resource *pci_find_resource(unsigned int bus,
+                                                      unsigned int dev,
+                                                      unsigned int func)
+{
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        if (pci_resource_owner(&pci_devices[i], bus, dev, func))
+            return &pci_devices[i];
+    }
+    return 0;
+}
+
+static int pci_io_page_conflict(unsigned int page, unsigned int owner_vmid)
+{
+    uint64_t page_start = VIRT_PCIE_IO_BASE + (uint64_t)page * PAGE_SIZE;
+    uint64_t page_end = page_start + PAGE_SIZE;
+
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        struct pci_device_resource *resource = &pci_devices[i];
+        for (unsigned int bar = 0; bar < PCI_MAX_BARS; bar++) {
+            struct pci_bar_resource *entry = &resource->bars[bar];
+            uint64_t start, end;
+            if (!entry->valid || !entry->is_io)
+                continue;
+            start = entry->address;
+            end = start + entry->size;
+            if (start < page_end && end > page_start &&
+                resource->owner_vmid != owner_vmid)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static int pci_map_owned_io(struct task_struct *vm)
+{
+    uint8_t mapped[PCI_IO_ALLOC_END / PAGE_SIZE];
+    unsigned int mapped_count = 0;
+
+    memzero(mapped, sizeof(mapped));
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        struct pci_device_resource *resource = &pci_devices[i];
+        if (resource->owner_vmid != vm->vmid)
+            continue;
+        for (unsigned int bar = 0; bar < PCI_MAX_BARS; bar++) {
+            struct pci_bar_resource *entry = &resource->bars[bar];
+            uint64_t start, end;
+            if (!entry->valid || !entry->is_io)
+                continue;
+            if (entry->address < VIRT_PCIE_IO_BASE ||
+                entry->address + entry->size > VIRT_PCIE_IO_BASE +
+                VIRT_PCIE_IO_SIZE)
+                goto rollback;
+            start = entry->address & PAGE_MASK;
+            end = (entry->address + entry->size + PAGE_SIZE - 1) & PAGE_MASK;
+            for (uint64_t ipa = start; ipa < end; ipa += PAGE_SIZE) {
+                unsigned int page = (ipa - VIRT_PCIE_IO_BASE) / PAGE_SIZE;
+                if (pci_io_page_conflict(page, vm->vmid))
+                    goto rollback;
+                if (mapped[page])
+                    continue;
+                if (stage2_page_is_mapped(vm, ipa))
+                    goto rollback;
+                map_stage2_page(vm, ipa, ipa,
+                                MMU_STAGE2_DEVICE_PAGE_FLAGS);
+                mapped[page] = 1;
+                mapped_count++;
+            }
+        }
+    }
+    INFO("PCI: mapped %u owned I/O aperture pages into VM%lu",
+         mapped_count, (unsigned long)vm->vmid);
+    return 0;
+
+rollback:
+    for (unsigned int page = 0; page < PCI_IO_ALLOC_END / PAGE_SIZE; page++)
+        if (mapped[page])
+            unmap_stage2_page(vm, VIRT_PCIE_IO_BASE +
+                              (uint64_t)page * PAGE_SIZE, 0);
+    return -1;
+}
+
 int pci_passthrough_map(struct task_struct *vm)
 {
     if (!vm || vm->vmid != 1 || !edu_found || !edu_bar0 ||
@@ -858,16 +947,7 @@ int pci_passthrough_map(struct task_struct *vm)
         edu_bar0_size > PCI_MMIO_ALLOC_END - edu_bar0)
         return -1;
 
-    uint64_t ecam = ecam_addr(edu_bus, edu_dev, edu_func, 0) &
-                    ~(uint64_t)(PAGE_SIZE - 1);
-    if (ecam < VIRT_PCIE_ECAM_BASE ||
-        ecam >= VIRT_PCIE_ECAM_BASE + VIRT_PCIE_ECAM_SIZE)
-        return -1;
-
     uint64_t mapped_bar_size = 0;
-    if (stage2_page_is_mapped(vm, ecam))
-        return -1;
-    map_stage2_page(vm, ecam, ecam, MMU_STAGE2_DEVICE_PAGE_FLAGS);
     for (uint64_t off = 0; off < edu_bar0_size; off += PAGE_SIZE) {
         uint64_t ipa = edu_bar0 + off;
         if (stage2_page_is_mapped(vm, ipa))
@@ -875,9 +955,10 @@ int pci_passthrough_map(struct task_struct *vm)
         map_stage2_page(vm, ipa, ipa, MMU_STAGE2_DEVICE_PAGE_FLAGS);
         mapped_bar_size += PAGE_SIZE;
     }
-    INFO("PCI: passthrough mapped into VM%lu (ECAM page=0x%lx BAR0=0x%lx/0x%lx)",
-         (unsigned long)vm->vmid, (unsigned long)ecam,
-         (unsigned long)edu_bar0, (unsigned long)edu_bar0_size);
+    if (pci_map_owned_io(vm) < 0)
+        goto rollback;
+    INFO("PCI: mapped %u owned devices into VM%lu (ECAM emulated)",
+         edu_found ? 1 : 0, (unsigned long)vm->vmid);
     return 0;
 
 rollback:
@@ -885,10 +966,100 @@ rollback:
         mapped_bar_size -= PAGE_SIZE;
         unmap_stage2_page(vm, edu_bar0 + mapped_bar_size, 0);
     }
-    unmap_stage2_page(vm, ecam, 0);
     WARN("PCI: passthrough mapping rolled back for VM%lu",
          (unsigned long)vm->vmid);
     return -1;
+}
+
+static uint32_t pci_config_read_width(unsigned int bus, unsigned int dev,
+                                      unsigned int func, unsigned int reg,
+                                      unsigned int size)
+{
+    uint32_t value = 0;
+    for (unsigned int i = 0; i < size; i++) {
+        uint32_t word = pci_config_read(bus, dev, func,
+                                        (reg + i) & ~3U);
+        value |= ((word >> (((reg + i) & 3U) * 8)) & 0xffU) << (i * 8);
+    }
+    return value;
+}
+
+int pci_is_mmio_addr(struct task_struct *vm, unsigned long ipa)
+{
+    (void)vm;
+    return (ipa >= VIRT_PCIE_ECAM_BASE &&
+            ipa < VIRT_PCIE_ECAM_BASE + VIRT_PCIE_ECAM_SIZE) ||
+           (ipa >= VIRT_PCIE_IO_BASE &&
+            ipa < VIRT_PCIE_IO_BASE + VIRT_PCIE_IO_SIZE);
+}
+
+int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
+                    unsigned int size, int write, uint64_t *value)
+{
+    uint64_t ecam_end = VIRT_PCIE_ECAM_BASE + VIRT_PCIE_ECAM_SIZE;
+    uint64_t io_end = VIRT_PCIE_IO_BASE + VIRT_PCIE_IO_SIZE;
+    unsigned int bus, dev, func, reg;
+    struct pci_device_resource *resource;
+
+    if (!value || (size != 1 && size != 2 && size != 4))
+        return 0;
+    if (ipa >= VIRT_PCIE_IO_BASE && ipa < io_end) {
+        unsigned int page = (ipa - VIRT_PCIE_IO_BASE) / PAGE_SIZE;
+        if (!vm || pci_io_page_conflict(page, vm->vmid)) {
+            *value = write ? 0 : (size == 4 ? 0xffffffffU :
+                                  (size == 2 ? 0xffffU : 0xffU));
+            return 1;
+        }
+        return 0;
+    }
+    if (ipa < VIRT_PCIE_ECAM_BASE || ipa >= ecam_end)
+        return 0;
+    uint64_t offset = ipa - VIRT_PCIE_ECAM_BASE;
+    bus = (offset >> 20) & 0xff;
+    dev = (offset >> 15) & 0x1f;
+    func = (offset >> 12) & 7;
+    reg = offset & 0xfff;
+    resource = pci_find_resource(bus, dev, func);
+    if (!resource || resource->owner_vmid != (vm ? vm->vmid : 0)) {
+        *value = write ? 0 : (size == 4 ? 0xffffffffU :
+                              (size == 2 ? 0xffffU : 0xffU));
+        return 1;
+    }
+    if (!write) {
+        *value = pci_config_read_width(bus, dev, func, reg, size);
+        return 1;
+    }
+    if ((uint64_t)reg + size > 0x1000)
+        return 1;
+    if (reg < PCI_BAR0 + PCI_MAX_BARS * 4 &&
+        reg + size > PCI_BAR0)
+        return 1;
+    if (reg < PCI_CFG_COMMAND + 2 && reg + size > PCI_CFG_COMMAND) {
+        uint32_t command = pci_config_read(bus, dev, func, PCI_CFG_COMMAND);
+        unsigned int first = reg > PCI_CFG_COMMAND ? reg : PCI_CFG_COMMAND;
+        unsigned int last = reg + size < PCI_CFG_COMMAND + 2 ?
+                            reg + size : PCI_CFG_COMMAND + 2;
+        for (unsigned int byte = first; byte < last; byte++) {
+            unsigned int src_shift = (byte - reg) * 8;
+            uint8_t incoming = (*value >> src_shift) & 0xff;
+            if (byte == PCI_CFG_COMMAND)
+                command = (command & ~0xffU) | incoming;
+            else
+                command = (command & ~PCI_CMD_INTX_DIS) |
+                          ((uint32_t)(incoming & (PCI_CMD_INTX_DIS >> 8)) << 8);
+        }
+        pci_config_write(bus, dev, func, PCI_CFG_COMMAND, command);
+        return 1;
+    }
+    for (unsigned int i = 0; i < size; i++) {
+        unsigned int byte_reg = reg + i;
+        unsigned int shift = (byte_reg & 3U) * 8;
+        uint32_t word = pci_config_read(bus, dev, func, byte_reg & ~3U);
+        uint32_t byte = (*value >> (i * 8)) & 0xffU;
+        word = (word & ~(0xffU << shift)) | (byte << shift);
+        pci_config_write(bus, dev, func, byte_reg & ~3U, word);
+    }
+    return 1;
 }
 
 /*

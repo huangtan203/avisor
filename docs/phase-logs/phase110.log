@@ -1,0 +1,28 @@
+Phase 110 ECAM trap-and-emulate and I/O BAR passthrough
+
+Build:
+- make -f Makefile.virt -j$(nproc): PASS
+- Existing warnings remain in guest/main.c and mm.c deallocate_page pointer arguments.
+
+Default topology:
+- Command: timeout 65 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase110-basic-final.log
+- VM1 mapping reports ECAM emulated; zero owner I/O aperture pages (edu has MMIO BAR only).
+- PCI enumeration/BAR discovery: PASS.
+- 16-bit Vendor ID config read: PASS.
+- BAR relocation write protection: PASS.
+- edu identification, liveness, factorial, MSI interrupt, vITS delivery and reset + MSI reinit: PASS.
+
+Moved edu / nested bridge topology:
+- edu at 00:03.0, nested bridges at 00:04.0 and 01:01.0, e1000 at 02:02.0.
+- Enumeration and bridge resource windows: PASS.
+- Dynamic requester ID 24; Guest discovery, 16-bit config read, BAR write protection, MSI and reset + MSI reinit: PASS.
+- e1000 is unowned and not mapped into VM1; no owner I/O BAR positive mapping case was present.
+- QEMU exited by timeout as expected.
+
+Known existing regression:
+- Full guest output includes `FAIL: task 槽位未被实际复用`, the previously known task-slot reuse self-test failure. No full-suite pass is claimed.
+
+Coverage limits:
+- I/O aperture owner mapping and same-page cross-owner rejection are implemented but were not exercised by these topologies.
+- Non-BAR/Command owner config writes, including MSI capability writes, are still forwarded to the device. No vMSI write filter is implemented.
+- PCI DMA remains without SMMU/IOMMU isolation.

@@ -40,6 +40,9 @@ int pci_edu_function_reset(struct task_struct *vm);
 
 /* 把 edu 的 ECAM + BAR0 映射进指定 VM 的 Stage 2（MMIO 直通） */
 int pci_passthrough_map(struct task_struct *vm);
+int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
+                    unsigned int size, int write, uint64_t *value);
+int pci_is_mmio_addr(struct task_struct *vm, unsigned long ipa);
 
 /* 调试：dump PCI 直通中断链路状态（HVC_PCI_DEBUG 触发） */
 void pci_debug_dump(void);
