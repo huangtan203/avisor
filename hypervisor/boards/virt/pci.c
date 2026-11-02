@@ -373,6 +373,7 @@ int pci_edu_vm_reset(struct task_struct *vm)
 
     pci_edu_lpi_base = 0;
     pci_edu_msi_enabled = 0;
+    INFO("PCI: edu IRQ resources released for VM%lu", vm->vmid);
     return 0;
 }
 

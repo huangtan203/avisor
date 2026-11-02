@@ -23,6 +23,7 @@
 #define HVC_GET_TIMER_FREQ 2 /* 返回值 x0 = 定时器频率（Hz） */
 #define HVC_GET_VMID 3 /* 返回值 x0 = 当前 VM 的 ID（pid，Phase 3） */
 #define HVC_PCI_DEBUG 4 /* PCI 直通中断链路诊断 dump（Phase 7 调试用） */
+#define HVC_PCI_IRQ_TEARDOWN_TEST 5 /* VM1 测试：释放 edu IRQ 路由 */
 
 /* Phase 10: 新增 hypercall */
 #define HVC_SCHED_YIELD     10  /* 主动让出 CPU，返回 0 */

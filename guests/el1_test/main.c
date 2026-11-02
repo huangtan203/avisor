@@ -4025,6 +4025,11 @@ static void vits_test(void)
         /* 7. 恢复 MSI data = 0（保持 Phase 8 兼容） */
         mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF, msi_data);
         guest_puts("vITS: MSI data restored\n");
+
+        if (hvc_call(HVC_PCI_IRQ_TEARDOWN_TEST, 0) == 0)
+            guest_puts("vITS: edu IRQ teardown PASSED\n");
+        else
+            guest_puts("vITS: edu IRQ teardown FAILED\n");
     }
 }
 

@@ -23,6 +23,7 @@
 #ifdef PLATFORM_VIRT
 #include "boards/virt/arch_timer.h"
 #include "boards/virt/pci.h"
+#include "boards/virt/irq_domain.h"
 #include "boards/virt/virt_mm.h"
 #include "boards/virt/virt_board.h"
 #include "boards/virt/vgic.h"
@@ -140,6 +141,19 @@ void handle_hvc64(unsigned long hvc_nr)
 	case HVC_PCI_DEBUG:
 		/* PCI 直通中断链路诊断 dump（Phase 7 调试用） */
 		pci_debug_dump();
+		break;
+	case HVC_PCI_IRQ_TEARDOWN_TEST:
+		if (current->vmid != 1 || current->vcpu_id != 0) {
+			regs->regs[0] = -1;
+			break;
+		}
+		regs->regs[0] = pci_edu_vm_reset(current);
+		if (regs->regs[0] == 0) {
+			struct irq_route route;
+			if (irq_domain_lookup(pci_edu_intx_irq, &route) == 0 ||
+			    pci_edu_lpi_base != 0)
+				regs->regs[0] = -1;
+		}
 		break;
 
 	/* Phase 10: 调度器 hypercall */
