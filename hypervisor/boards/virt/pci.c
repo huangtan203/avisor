@@ -191,6 +191,34 @@ struct pci_device_resource {
 
 static struct pci_device_resource pci_devices[PCI_MAX_DEVICES];
 static unsigned int pci_device_count;
+static volatile unsigned int pci_dma_lock;
+
+static unsigned long pci_dma_lock_acquire(void)
+{
+    unsigned long flags;
+    unsigned int value, failed;
+
+    asm volatile("mrs %0, daif\nmsr daifset, #2"
+                 : "=r"(flags) :: "memory");
+    for (;;) {
+        asm volatile("1: ldaxr %w0, [%2]\n"
+                     "cbnz %w0, 1b\n"
+                     "mov %w0, #1\n"
+                     "stxr %w1, %w0, [%2]\n"
+                     "cbnz %w1, 1b\n"
+                     : "=&r"(value), "=&r"(failed)
+                     : "r"(&pci_dma_lock)
+                     : "memory");
+        if (!failed)
+            return flags;
+    }
+}
+
+static void pci_dma_lock_release(unsigned long flags)
+{
+    asm volatile("stlr wzr, [%0]\nmsr daif, %1"
+                 :: "r"(&pci_dma_lock), "r"(flags) : "memory");
+}
 
 static struct pci_device_resource *pci_find_resource(unsigned int bus,
                                                       unsigned int dev,
@@ -290,6 +318,13 @@ static int pci_dma_set_authorized(struct pci_device_resource *resource,
     if (!resource || !resource->owner_vmid ||
         owner_vmid != resource->owner_vmid)
         return -1;
+    unsigned long flags = pci_dma_lock_acquire();
+    if (resource->dma_generation == UINT32_MAX) {
+        pci_dma_lock_release(flags);
+        WARN("PCI: DMA generation exhausted for %02x:%02x.%u",
+             resource->bus, resource->dev, resource->func);
+        return -1;
+    }
     uint32_t command = pci_config_read(resource->bus, resource->dev,
                                        resource->func, PCI_CFG_COMMAND);
     command = pci_command_dma_safe(command);
@@ -299,15 +334,18 @@ static int pci_dma_set_authorized(struct pci_device_resource *resource,
                      PCI_CFG_COMMAND, command);
     uint32_t verify = pci_config_read(resource->bus, resource->dev,
                                       resource->func, PCI_CFG_COMMAND);
-    if (!!(verify & PCI_CMD_BUSMASTER) != !!authorized)
+    if (!!(verify & PCI_CMD_BUSMASTER) != !!authorized) {
+        pci_dma_lock_release(flags);
         return -1;
+    }
     resource->dma_owner_vmid = authorized ? owner_vmid : 0;
     resource->dma_authorized = !!authorized;
     resource->dma_generation++;
+    uint32_t generation = resource->dma_generation;
+    pci_dma_lock_release(flags);
     INFO("PCI: DMA %s %02x:%02x.%u owner=VM%u generation=%u",
          authorized ? "authorized" : "revoked", resource->bus,
-         resource->dev, resource->func, owner_vmid,
-         resource->dma_generation);
+         resource->dev, resource->func, owner_vmid, generation);
     return 0;
 }
 
@@ -966,6 +1004,7 @@ static int pci_bar_in_window(const struct pci_bar_resource *bar,
 
 static int pci_dma_guard_init(void)
 {
+    unsigned long flags = pci_dma_lock_acquire();
     unsigned int guarded = 0;
     for (unsigned int i = 0; i < pci_device_count; i++) {
         struct pci_device_resource *resource = &pci_devices[i];
@@ -984,18 +1023,20 @@ static int pci_dma_guard_init(void)
                                           resource->func,
                                           PCI_CFG_COMMAND);
         if (verify & PCI_CMD_BUSMASTER) {
+            pci_dma_lock_release(flags);
             WARN("PCI: failed to disable bus mastering for %02x:%02x.%u",
                  resource->bus, resource->dev, resource->func);
             return -1;
         }
         guarded++;
     }
+    pci_dma_lock_release(flags);
     INFO("PCI: DMA guard active, bus mastering disabled for %u functions",
          guarded);
     return 0;
 }
 
-static int pci_dma_state_audit(void)
+static int pci_dma_state_audit_locked(void)
 {
     unsigned int authorized = 0;
     for (unsigned int i = 0; i < pci_device_count; i++) {
@@ -1019,6 +1060,14 @@ static int pci_dma_state_audit(void)
     INFO("PCI: DMA state audit PASSED functions=%u authorized=%u",
          pci_device_count, authorized);
     return 0;
+}
+
+static int pci_dma_state_audit(void)
+{
+    unsigned long flags = pci_dma_lock_acquire();
+    int ret = pci_dma_state_audit_locked();
+    pci_dma_lock_release(flags);
+    return ret;
 }
 
 static int pci_bar_resource_audit(void)
@@ -2324,6 +2373,7 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
         pci_vmsi_access(resource, reg, size, 1, value))
         return 1;
     if (reg < PCI_CFG_COMMAND + 2 && reg + size > PCI_CFG_COMMAND) {
+        unsigned long dma_flags = pci_dma_lock_acquire();
         uint32_t command = pci_config_read(bus, dev, func, PCI_CFG_COMMAND);
         uint32_t dma_state = resource->dma_authorized ?
                              PCI_CMD_BUSMASTER : 0;
@@ -2341,9 +2391,11 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
         }
         command = pci_command_dma_safe(command) | dma_state;
         pci_config_write(bus, dev, func, PCI_CFG_COMMAND, command);
-        if (pci_dma_state_audit() < 0)
-            WARN("PCI: DMA state audit failed after guest Command write");
+        int audit_ret = pci_dma_state_audit_locked();
         *value = pci_config_read_width(bus, dev, func, reg, size);
+        pci_dma_lock_release(dma_flags);
+        if (audit_ret < 0)
+            WARN("PCI: DMA state audit failed after guest Command write");
         return 1;
     }
     for (unsigned int i = 0; i < size; i++) {
