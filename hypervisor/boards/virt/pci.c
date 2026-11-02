@@ -425,6 +425,9 @@ static int pool_reserve_range(struct pci_resource_pool *pool, uint64_t base,
     if (!pool_range_valid(pool, base, size) ||
         pool->count > PCI_FREE_LIST_MAX)
         return -1;
+    struct pci_resource_pool updated = *pool;
+    struct pci_resource_pool *original = pool;
+    pool = &updated;
     uint64_t end = base + size;
     for (unsigned int i = 0; i < pool->count;) {
         struct pci_free_range *range = &pool->ranges[i];
@@ -438,6 +441,9 @@ static int pool_reserve_range(struct pci_resource_pool *pool, uint64_t base,
         }
         if (range->base >= end)
             break;
+        if (range->base > pool->base + pool->size ||
+            range_end > pool->base + pool->size)
+            return -1;
         if (base <= range->base && end >= range_end) {
             for (unsigned int j = i; j + 1 < pool->count; j++)
                 pool->ranges[j] = pool->ranges[j + 1];
@@ -466,6 +472,7 @@ static int pool_reserve_range(struct pci_resource_pool *pool, uint64_t base,
         pool->count++;
         i += 2;
     }
+    *original = updated;
     return 0;
 }
 
