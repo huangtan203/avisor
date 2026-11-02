@@ -312,13 +312,32 @@ static uint32_t pci_command_dma_safe(uint32_t command)
     return command & ~PCI_CMD_BUSMASTER;
 }
 
+static uint32_t pci_dma_get_generation(struct pci_device_resource *resource)
+{
+    unsigned long flags = pci_dma_lock_acquire();
+    uint32_t generation = resource->dma_generation;
+    pci_dma_lock_release(flags);
+    return generation;
+}
+
 static int pci_dma_set_authorized(struct pci_device_resource *resource,
-                                  unsigned int owner_vmid, int authorized)
+                                  unsigned int owner_vmid, int authorized,
+                                  uint32_t expected_generation)
 {
     if (!resource || !resource->owner_vmid ||
         owner_vmid != resource->owner_vmid)
         return -1;
     unsigned long flags = pci_dma_lock_acquire();
+    if (resource->dma_generation != expected_generation ||
+        !!resource->dma_authorized == !!authorized) {
+        uint32_t current_generation = resource->dma_generation;
+        unsigned int state = resource->dma_authorized;
+        pci_dma_lock_release(flags);
+        WARN("PCI: rejected stale DMA transition %02x:%02x.%u expected=%u current=%u state=%u target=%u",
+             resource->bus, resource->dev, resource->func,
+             expected_generation, current_generation, state, !!authorized);
+        return -1;
+    }
     if (resource->dma_generation == UINT32_MAX) {
         pci_dma_lock_release(flags);
         WARN("PCI: DMA generation exhausted for %02x:%02x.%u",
@@ -1045,7 +1064,8 @@ static int pci_dma_state_audit_locked(void)
                                            resource->func,
                                            PCI_CFG_COMMAND);
         int physical = !!(command & PCI_CMD_BUSMASTER);
-        if (physical != resource->dma_authorized ||
+        if (!resource->dma_generation ||
+            physical != resource->dma_authorized ||
             (resource->dma_authorized &&
              resource->dma_owner_vmid != resource->owner_vmid) ||
             (!resource->dma_authorized && resource->dma_owner_vmid)) {
@@ -1767,7 +1787,10 @@ void pci_init(void)
                 return;
             }
         }
-        if (pci_dma_set_authorized(edu_resource, 1, 1) < 0) {
+        uint32_t dma_generation =
+            pci_dma_get_generation(edu_resource);
+        if (pci_dma_set_authorized(edu_resource, 1, 1,
+                                   dma_generation) < 0) {
             WARN("PCI: edu DMA authorization failed after MSI routing");
             return;
         }
@@ -1790,7 +1813,7 @@ void pci_init(void)
     }
 }
 
-static int pci_edu_quiesce(void)
+static int pci_edu_quiesce(uint32_t *revoked_generation)
 {
     uint32_t cmd;
     unsigned int timeout = 100000;
@@ -1798,8 +1821,13 @@ static int pci_edu_quiesce(void)
     cmd = pci_config_read(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND);
     struct pci_device_resource *resource =
         pci_find_resource(edu_bus, edu_dev, edu_func);
-    if (!resource || pci_dma_set_authorized(resource, 1, 0) < 0)
+    if (!resource)
         return -1;
+    uint32_t generation = pci_dma_get_generation(resource);
+    if (pci_dma_set_authorized(resource, 1, 0, generation) < 0)
+        return -1;
+    if (revoked_generation)
+        *revoked_generation = generation + 1;
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
                      pci_command_dma_safe(cmd) | PCI_CMD_INTX_DIS);
     if (edu_msi_cap_off) {
@@ -1829,7 +1857,7 @@ static void pci_edu_internal_reset(void)
     asm volatile("dsb sy" ::: "memory");
 }
 
-static int pci_edu_reinit_msi(void)
+static int pci_edu_reinit_msi(uint32_t expected_generation)
 {
     unsigned int lpi_base;
     unsigned int vectors = edu_msi_max_vectors > 16 ? 16 : edu_msi_max_vectors;
@@ -1890,7 +1918,9 @@ static int pci_edu_reinit_msi(void)
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
                      pci_command_dma_safe(cmd) | PCI_CMD_MEMORY |
                      PCI_CMD_INTX_DIS);
-    if (!edu_resource || pci_dma_set_authorized(edu_resource, 1, 1) < 0)
+    if (!edu_resource ||
+        pci_dma_set_authorized(edu_resource, 1, 1,
+                               expected_generation) < 0)
         return -1;
     pci_edu_lpi_base = lpi_base;
     pci_edu_msi_enabled = 1;
@@ -1900,7 +1930,7 @@ static int pci_edu_reinit_msi(void)
 
 int pci_edu_vm_reset(struct task_struct *vm)
 {
-    if (!vm || vm->vmid != 1 || !edu_found || pci_edu_quiesce() < 0)
+    if (!vm || vm->vmid != 1 || !edu_found || pci_edu_quiesce(NULL) < 0)
         return -1;
     if (pci_edu_intx_irq >= 32 && pci_edu_intx_irq < 1020) {
         gic_disable_irq(pci_edu_intx_irq);
@@ -1921,9 +1951,10 @@ int pci_edu_vm_reset(struct task_struct *vm)
 
 int pci_edu_function_reset(struct task_struct *vm)
 {
+    uint32_t revoked_generation;
     if (!vm || vm->vmid != 1 || !edu_found)
         return -1;
-    if (pci_edu_quiesce() < 0) {
+    if (pci_edu_quiesce(&revoked_generation) < 0) {
         WARN("PCI: edu reset aborted, device did not become idle");
         return -1;
     }
@@ -1980,7 +2011,7 @@ int pci_edu_function_reset(struct task_struct *vm)
                      ~PCI_CMD_BUSMASTER);
     pci_edu_lpi_base = 0;
     pci_edu_msi_enabled = 0;
-    if (pci_edu_reinit_msi() < 0) {
+    if (pci_edu_reinit_msi(revoked_generation) < 0) {
         WARN("PCI: edu MSI reinitialization failed after reset");
         return -1;
     }
