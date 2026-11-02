@@ -1945,7 +1945,9 @@ rollback:
               1U << (pci_edu_intx_irq % 32));
         irq_domain_unregister(pci_edu_intx_irq);
     }
-    its_teardown_pci_msi(pci_edu_requester_id(), lpi_base, vectors);
+    if (its_teardown_pci_msi(pci_edu_requester_id(), lpi_base,
+                             vectors) < 0)
+        WARN("PCI: failed to release rolled-back ITS MSI resources");
     while (registered_vectors)
         vits_lpi_revoke(lpi_base + --registered_vectors);
     pci_edu_lpi_base = 0;
@@ -1965,8 +1967,11 @@ int pci_edu_vm_reset(struct task_struct *vm)
         irq_domain_unregister(pci_edu_intx_irq);
     }
     if (pci_edu_lpi_base) {
-        its_teardown_pci_msi(pci_edu_requester_id(), pci_edu_lpi_base, 16);
-        for (unsigned int i = 0; i < 16; i++)
+        its_teardown_pci_msi(pci_edu_requester_id(), pci_edu_lpi_base,
+                             edu_msi_max_vectors > 16 ? 16 :
+                             edu_msi_max_vectors);
+        for (unsigned int i = 0; i < (edu_msi_max_vectors > 16 ? 16 :
+                                     edu_msi_max_vectors); i++)
             vits_lpi_revoke(pci_edu_lpi_base + i);
     }
     pci_edu_lpi_base = 0;
@@ -1991,8 +1996,11 @@ int pci_edu_function_reset(struct task_struct *vm)
         irq_domain_unregister(pci_edu_intx_irq);
     }
     if (pci_edu_lpi_base) {
-        its_teardown_pci_msi(pci_edu_requester_id(), pci_edu_lpi_base, 16);
-        for (unsigned int i = 0; i < 16; i++)
+        its_teardown_pci_msi(pci_edu_requester_id(), pci_edu_lpi_base,
+                             edu_msi_max_vectors > 16 ? 16 :
+                             edu_msi_max_vectors);
+        for (unsigned int i = 0; i < (edu_msi_max_vectors > 16 ? 16 :
+                                     edu_msi_max_vectors); i++)
             vits_lpi_revoke(pci_edu_lpi_base + i);
     }
     if (edu_flr_supported && edu_pcie_cap_off) {

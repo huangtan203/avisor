@@ -68,8 +68,50 @@ static paddr_t lpi_prop_pa;  /* LPI 配置表 */
 static paddr_t lpi_pend_pa;  /* LPI 挂起表 */
 static unsigned int cq_byte_off;  /* 命令队列写偏移（字节） */
 
-/* LPI 分配游标（简单递增分配） */
-static unsigned int next_lpi = LPI_INTID_BASE;
+#define ITS_PCI_LPI_LIMIT 9000
+#define ITS_MSI_MAX_ALLOCATIONS 16
+
+struct its_msi_allocation {
+    uint32_t devid;
+    unsigned int lpi_base;
+    unsigned int num_vectors;
+    void *itt_page;
+    uint8_t valid;
+};
+
+static struct its_msi_allocation msi_allocations[ITS_MSI_MAX_ALLOCATIONS];
+static uint8_t pci_lpi_used[ITS_PCI_LPI_LIMIT - LPI_INTID_BASE];
+
+static int its_alloc_lpi_range(unsigned int num_vectors)
+{
+    unsigned int limit = ITS_PCI_LPI_LIMIT - LPI_INTID_BASE;
+
+    for (unsigned int start = 0; start + num_vectors <= limit; start++) {
+        unsigned int i;
+
+        for (i = 0; i < num_vectors; i++)
+            if (pci_lpi_used[start + i])
+                break;
+        if (i != num_vectors) {
+            start += i;
+            continue;
+        }
+        for (i = 0; i < num_vectors; i++)
+            pci_lpi_used[start + i] = 1;
+        return LPI_INTID_BASE + start;
+    }
+    return 0;
+}
+
+static void its_free_lpi_range(unsigned int lpi_base,
+                               unsigned int num_vectors)
+{
+    if (lpi_base < LPI_INTID_BASE ||
+        lpi_base + num_vectors > ITS_PCI_LPI_LIMIT)
+        return;
+    for (unsigned int i = 0; i < num_vectors; i++)
+        pci_lpi_used[lpi_base - LPI_INTID_BASE + i] = 0;
+}
 
 /* ---------- 命令发送 ---------- */
 
@@ -152,67 +194,105 @@ unsigned int its_setup_pci_msi(unsigned int bus, unsigned int dev,
     if (num_vectors > ITS_ITT_MAX_EVENTS)
         num_vectors = ITS_ITT_MAX_EVENTS;
 
+    int slot = -1;
+    for (unsigned int i = 0; i < ITS_MSI_MAX_ALLOCATIONS; i++) {
+        if (msi_allocations[i].valid &&
+            msi_allocations[i].devid == devid) {
+            WARN("ITS: MSI allocation already exists for devid=%u", devid);
+            return 0;
+        }
+        if (!msi_allocations[i].valid && slot < 0)
+            slot = i;
+    }
+    if (slot < 0) {
+        WARN("ITS: MSI allocation table full");
+        return 0;
+    }
+
+    unsigned int lpi_base = its_alloc_lpi_range(num_vectors);
+    if (!lpi_base) {
+        WARN("ITS: no contiguous LPI range for %u vectors", num_vectors);
+        return 0;
+    }
+
+    void *itt_page = allocate_page();
+    if (!itt_page) {
+        its_free_lpi_range(lpi_base, num_vectors);
+        WARN("ITS: failed to allocate ITT");
+        return 0;
+    }
+    paddr_t itt_pa = (paddr_t)(uintptr_t)itt_page;
+
     /* 1. MAPC：collection 0 -> procnum target_cpu
      *    dw2 = V[63] | procnum[47:16] | ICID[15:0] */
     its_send_cmd(ITS_CMD_MAPC, 0,
                  (1ULL << 63) | ((uint64_t)target_cpu << 16) | 0, 0);
 
-    /* 2. 分配 ITT 页（MAPD 的地址字段按 256 字节对齐解码，页池 4K 对齐满足） */
-    paddr_t itt_pa = (paddr_t)(uintptr_t)allocate_page();
-    if (!itt_pa) {
-        WARN("ITS: failed to allocate ITT");
-        return 0;
-    }
-
-    /* 3. MAPD：devid -> ITT，size = 3（16 个 event）
+    /* 2. MAPD：devid -> ITT，size = 3（16 个 event）
      *    dw1 = size[4:0]；dw2 = V[63] | ITT 地址[51:8] */
     its_send_cmd(ITS_CMD_MAPD | ((uint64_t)devid << 32),
                  ITS_ITT_SIZE_SHIFT,
                  (1ULL << 63) | (itt_pa & ~0xFFULL), 0);
 
-    /* 4. MAPTI：eventid i -> LPI（pINTID >= 8192），collection 0
-     *    dw1 = pINTID[63:32] | EventID[31:0]；dw2 = ICID[15:0]
-     *    同时配置 LPI 属性表（索引 = LPI - 8192）：优先级 + 使能 */
-    unsigned int lpi_base = next_lpi;
+    /* 3. MAPTI：eventid i -> LPI（pINTID >= 8192），collection 0 */
     for (unsigned int i = 0; i < num_vectors; i++) {
-        unsigned int lpi = next_lpi++;
-
-        /* LPI 配置表按 (LPI - 8192) 索引（QEMU gicv3_redist_check_lpi_priority） */
+        unsigned int lpi = lpi_base + i;
         volatile uint8_t *cfg =
-            (volatile uint8_t *)(uintptr_t)lpi_prop_pa + (lpi - LPI_INTID_BASE);
+            (volatile uint8_t *)(uintptr_t)lpi_prop_pa +
+            (lpi - LPI_INTID_BASE);
         *cfg = LPI_PROP_PRIO | LPI_PROP_ENABLE;
-
         its_send_cmd(ITS_CMD_MAPTI | ((uint64_t)devid << 32),
-                     ((uint64_t)lpi << 32) | i,
-                     0, 0);
+                     ((uint64_t)lpi << 32) | i, 0, 0);
     }
-
-    /* 5. SYNC（QEMU 忽略其语义——命令本身就是同步处理的，发一条收尾） */
     its_send_cmd(ITS_CMD_SYNC, 0, 0, 0);
 
+    msi_allocations[slot] = (struct its_msi_allocation){
+        .devid = devid,
+        .lpi_base = lpi_base,
+        .num_vectors = num_vectors,
+        .itt_page = itt_page,
+        .valid = 1,
+    };
     INFO("ITS: MSI map devid=%u vec=%u lpi=%u..%u -> cpu%u",
          devid, num_vectors, lpi_base, lpi_base + num_vectors - 1, target_cpu);
     return lpi_base;
 }
 
-void its_teardown_pci_msi(unsigned int devid, unsigned int lpi_base,
-                          unsigned int num_vectors)
+int its_teardown_pci_msi(unsigned int devid, unsigned int lpi_base,
+                         unsigned int num_vectors)
 {
+    struct its_msi_allocation *allocation = NULL;
+
     if (!lpi_base)
-        return;
-    if (num_vectors > ITS_ITT_MAX_EVENTS)
-        num_vectors = ITS_ITT_MAX_EVENTS;
+        return -1;
+    for (unsigned int i = 0; i < ITS_MSI_MAX_ALLOCATIONS; i++)
+        if (msi_allocations[i].valid &&
+            msi_allocations[i].devid == devid &&
+            msi_allocations[i].lpi_base == lpi_base) {
+            allocation = &msi_allocations[i];
+            break;
+        }
+    if (!allocation || allocation->num_vectors != num_vectors) {
+        WARN("ITS: teardown mismatch devid=%u lpi=%u vectors=%u",
+             devid, lpi_base, num_vectors);
+        return -1;
+    }
+
     if (lpi_prop_pa) {
         volatile uint8_t *cfg = (volatile uint8_t *)(uintptr_t)lpi_prop_pa;
-        for (unsigned int i = 0; i < num_vectors; i++) {
-            unsigned int lpi = lpi_base + i;
-            if (lpi >= LPI_INTID_BASE)
-                cfg[lpi - LPI_INTID_BASE] = 0;
-        }
+        for (unsigned int i = 0; i < num_vectors; i++)
+            cfg[lpi_base + i - LPI_INTID_BASE] = 0;
     }
     asm volatile("dsb sy" ::: "memory");
     its_send_cmd(ITS_CMD_MAPD | ((uint64_t)devid << 32), 0, 0, 0);
     its_send_cmd(ITS_CMD_SYNC, 0, 0, 0);
+
+    deallocate_page(allocation->itt_page);
+    its_free_lpi_range(allocation->lpi_base, allocation->num_vectors);
+    allocation->valid = 0;
+    INFO("ITS: MSI resources released devid=%u lpi=%u..%u",
+         devid, lpi_base, lpi_base + num_vectors - 1);
+    return 0;
 }
 
 /* ---------- 初始化 ---------- */
