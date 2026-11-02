@@ -929,6 +929,89 @@ static int pci_bar_in_window(const struct pci_bar_resource *bar,
     return base >= window->base && base + bar->size - 1 <= window->limit;
 }
 
+static int pci_bar_resource_audit(void)
+{
+    unsigned int bar_count = 0;
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        struct pci_device_resource *resource = &pci_devices[i];
+        for (unsigned int b = 0; b < PCI_MAX_BARS; b++) {
+            struct pci_bar_resource *bar = &resource->bars[b];
+            if (!bar->valid)
+                continue;
+            unsigned int reg = PCI_BAR0 + b * 4;
+            uint32_t low = pci_config_read(resource->bus, resource->dev,
+                                           resource->func, reg);
+            int is_io = !!(low & 1);
+            int is_64bit = !is_io && (((low >> 1) & 3) == 2);
+            uint64_t address = is_io ?
+                VIRT_PCIE_IO_BASE + (low & ~3U) : (low & ~0xfU);
+            if (is_64bit) {
+                if (b + 1 >= PCI_MAX_BARS) {
+                    WARN("PCI: %02x:%02x.%u BAR%u invalid 64-bit pair",
+                         resource->bus, resource->dev, resource->func, b);
+                    return -1;
+                }
+                address |= (uint64_t)pci_config_read(
+                    resource->bus, resource->dev, resource->func, reg + 4)
+                    << 32;
+            }
+            uint32_t flag_mask = is_io ? 3U : 0xfU;
+            if (is_io != bar->is_io || is_64bit != bar->is_64bit ||
+                (low & flag_mask) != (bar->flags & flag_mask) ||
+                address != bar->address || !bar->size ||
+                (bar->size & (bar->size - 1)) ||
+                (bar->address & (bar->size - 1)) ||
+                bar->address > UINT64_MAX - bar->size) {
+                WARN("PCI: %02x:%02x.%u BAR%u resource mismatch config=0x%lx metadata=0x%lx/0x%lx",
+                     resource->bus, resource->dev, resource->func, b,
+                     (unsigned long)address, (unsigned long)bar->address,
+                     (unsigned long)bar->size);
+                return -1;
+            }
+            uint64_t aperture_base = bar->is_io ?
+                VIRT_PCIE_IO_BASE : VIRT_PCIE_MMIO_BASE;
+            uint64_t aperture_size = bar->is_io ?
+                VIRT_PCIE_IO_SIZE : VIRT_PCIE_MMIO_SIZE;
+            if (bar->address < aperture_base ||
+                bar->size > aperture_size ||
+                bar->address - aperture_base > aperture_size - bar->size) {
+                WARN("PCI: %02x:%02x.%u BAR%u outside %s aperture",
+                     resource->bus, resource->dev, resource->func, b,
+                     bar->is_io ? "I/O" : "MMIO");
+                return -1;
+            }
+            bar_count++;
+        }
+    }
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        for (unsigned int a = 0; a < PCI_MAX_BARS; a++) {
+            struct pci_bar_resource *left = &pci_devices[i].bars[a];
+            if (!left->valid)
+                continue;
+            uint64_t left_end = left->address + left->size;
+            for (unsigned int j = i; j < pci_device_count; j++) {
+                unsigned int first = j == i ? a + 1 : 0;
+                for (unsigned int b = first; b < PCI_MAX_BARS; b++) {
+                    struct pci_bar_resource *right = &pci_devices[j].bars[b];
+                    if (!right->valid || left->is_io != right->is_io)
+                        continue;
+                    uint64_t right_end = right->address + right->size;
+                    if (left->address < right_end &&
+                        right->address < left_end) {
+                        WARN("PCI: BAR overlap %02x:%02x.%u BAR%u and %02x:%02x.%u BAR%u",
+                             pci_devices[i].bus, pci_devices[i].dev,
+                             pci_devices[i].func, a, pci_devices[j].bus,
+                             pci_devices[j].dev, pci_devices[j].func, b);
+                        return -1;
+                    }
+                }
+            }
+        }
+    }
+    INFO("PCI: BAR resource audit PASSED bars=%u", bar_count);
+    return 0;
+}
+
 static int pci_topology_audit(void)
 {
     unsigned int bridge_count = 0;
@@ -1320,6 +1403,10 @@ static int pci_enumerate(void)
     pool_init(&io_pool, 0, PCI_IO_ALLOC_END, PCI_ALLOC_FIRST_FIT);
     if (pci_scan_bus(0) < 0 || !edu_found)
         return -1;
+    if (pci_bar_resource_audit() < 0) {
+        WARN("PCI: BAR resource audit failed");
+        return -1;
+    }
     if (pci_topology_audit() < 0) {
         WARN("PCI: topology audit failed");
         return -1;
