@@ -54,6 +54,8 @@
 #define VIRT_PCIE_ECAM_SIZE  0x01000000UL   /* ECAM 大小 (16MB) */
 #define VIRT_PCIE_MMIO_BASE  0x10000000UL   /* PCI MMIO 窗口基址 */
 #define VIRT_PCIE_MMIO_SIZE  0x2eff0000UL   /* PCI MMIO 窗口大小 (752MB) */
+#define VIRT_PCIE_IO_BASE   0x3eff0000UL   /* PCI I/O port aperture */
+#define VIRT_PCIE_IO_SIZE   0x00010000UL   /* 64KB I/O port aperture */
 
 /*
  * edu 教育设备（QEMU -device edu）直通参数

@@ -842,6 +842,8 @@ int platform_apply_runtime_mappings(void)
 	    (map_runtime_range(VIRT_PCIE_MMIO_BASE, SECTION_SIZE,
 			       MMU_DEVICE_FLAGS) < 0 ||
 	     map_runtime_range(VIRT_PCIE_ECAM_BASE, VIRT_PCIE_ECAM_SIZE,
+			       MMU_DEVICE_FLAGS) < 0 ||
+	     map_runtime_range(VIRT_PCIE_IO_BASE, VIRT_PCIE_IO_SIZE,
 			       MMU_DEVICE_FLAGS) < 0))
 		return -1;
 

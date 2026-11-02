@@ -1,0 +1,53 @@
+Phase 108: PCI bridge recursion and I/O BAR allocation
+Date: 2026-11-02
+Platform: QEMU virt, AArch64, EL2, GICv3, ITS
+
+Build
+-----
+Command: make -f Makefile.virt -j$(nproc)
+Result: PASS
+
+Basic topology
+--------------
+Command: timeout 65 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase108-basic-final.log
+Exit: 124 (expected timeout termination)
+
+Observed resources:
+- virtio-net 00:01.0 BAR0: I/O port 0x0, CPU aperture 0x3eff0000/0x20
+- virtio-net BAR1: MMIO 0x10000000/0x1000
+- virtio-net BAR4: MMIO 0x10004000/0x4000
+- edu 00:02.0 BAR0: MMIO 0x10100000/0x100000
+
+Nested bridge topology
+----------------------
+QEMU command configured edu, bridge 00:03.0, bridge 01:01.0 and e1000 02:02.0.
+Command used two standard pci-bridge devices with explicit nonzero slots and e1000 at slot 2.
+Serial log: /tmp/avisor-phase108-nested-final.log
+Exit: 124 (expected timeout termination)
+
+Observed:
+- Recursive topology: 00:03.0 -> 01:01.0 -> 02:02.0
+- Both bridge subordinate bus values were tightened to 2
+- e1000 BAR0: MMIO 0x10200000/0x20000
+- e1000 BAR1: I/O port 0x40, CPU aperture 0x3eff0040/0x40
+- Both bridge memory windows: 0x10200000-0x102fffff
+- Both bridge I/O windows: 0x0-0xfff
+- Bridge I/O and Memory forwarding command bits enabled
+
+Guest regression markers
+------------------------
+[vm1] PCI enumeration/BAR discovery PASSED
+[vm1] edu: factorial PASSED
+[vm1] vITS: PASSED! Received vSPI 72 (vLPI 8200)
+[vm1] vITS: edu function reset + MSI reinit PASSED
+
+Failure scans
+-------------
+Basic and nested logs scanned for PANIC, ASSERT, Data Abort, Unknown IRQ and no ownership; no such markers found.
+The complete guest log contains the existing Phase 44 task-slot reuse self-test failure:
+`FAIL: task 槽位未被实际复用` (first-pid and second-pid both reported as -1).
+This matches the Phase 107 recorded limitation and is unrelated to PCI; the phase does not claim that test or the complete guest suite passed.
+
+Known limits
+------------
+16-bit I/O ports only; bridge 32-bit I/O upper registers, prefetchable windows, bridge hotplug, downstream device passthrough/ownership and multi-level INTx swizzling are not implemented. No deliberate maximum-depth or maximum-device-capacity stress run was performed.

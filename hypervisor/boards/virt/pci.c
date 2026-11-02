@@ -84,14 +84,22 @@
 #define PCI_MAX_BARS 6
 #define PCI_HEADER_TYPE 0x0e
 #define PCI_HEADER_MULTI 0x80
+#define PCI_HEADER_BRIDGE 1
 #define PCI_BAR0 0x10
+#define PCI_BRIDGE_BUS_NUMBERS 0x18
+#define PCI_BRIDGE_IO_BASE_LIMIT 0x1c
+#define PCI_BRIDGE_MEMORY_BASE_LIMIT 0x20
+#define PCI_IO_ALLOC_END (VIRT_PCIE_IO_SIZE)
 #define PCI_MMIO_ALLOC_END (VIRT_PCIE_MMIO_BASE + VIRT_PCIE_MMIO_SIZE)
+#define PCI_BRIDGE_MEMORY_GRANULARITY 0x100000
+#define PCI_BRIDGE_IO_GRANULARITY 0x1000
 
 struct pci_bar_resource {
     uint64_t address;
     uint64_t size;
     uint32_t flags;
     uint8_t is_64bit;
+    uint8_t is_io;
     uint8_t valid;
 };
 
@@ -103,12 +111,17 @@ struct pci_device_resource {
     uint8_t func;
     uint8_t header_type;
     uint8_t owner_vmid;
+    uint8_t primary_bus;
+    uint8_t secondary_bus;
+    uint8_t subordinate_bus;
     struct pci_bar_resource bars[PCI_MAX_BARS];
 };
 
 static struct pci_device_resource pci_devices[PCI_MAX_DEVICES];
 static unsigned int pci_device_count;
 static uint64_t pci_mmio_next = VIRT_PCIE_MMIO_BASE;
+static uint32_t pci_io_next;
+static unsigned int pci_next_bus = 1;
 static unsigned int edu_bus;
 static unsigned int edu_dev;
 static unsigned int edu_func;
@@ -182,6 +195,19 @@ static uint64_t pci_allocate_mmio(uint64_t size)
     return aligned;
 }
 
+static uint32_t pci_allocate_io(uint32_t size)
+{
+    if (!size || (size & (size - 1)))
+        return 0xffffffff;
+    uint32_t aligned = (pci_io_next + size - 1) & ~(size - 1);
+
+    if (aligned < pci_io_next || aligned >= PCI_IO_ALLOC_END ||
+        size > PCI_IO_ALLOC_END - aligned)
+        return 0xffffffff;
+    pci_io_next = aligned + size;
+    return aligned;
+}
+
 static void pci_probe_bars(struct pci_device_resource *resource,
                            unsigned int bar_count)
 {
@@ -219,14 +245,31 @@ static void pci_probe_bars(struct pci_device_resource *resource,
 
         struct pci_bar_resource *bar = &resource->bars[i];
         bar->flags = original & 0xf;
+        unsigned int bar_index = i;
+        uint64_t size;
         if (original & 1) {
-            WARN("PCI: I/O BAR not allocated at %02x:%02x.%u BAR%u",
-                 resource->bus, resource->dev, resource->func, i);
+            size = (uint32_t)(~(mask & ~3U) + 1U);
+            if (!size || (size & (size - 1)))
+                continue;
+            uint32_t port = pci_allocate_io(size);
+            if (port == 0xffffffff) {
+                WARN("PCI: I/O BAR allocation failed at %02x:%02x.%u BAR%u size=0x%lx",
+                     resource->bus, resource->dev, resource->func, i,
+                     (unsigned long)size);
+                continue;
+            }
+            bar->address = VIRT_PCIE_IO_BASE + port;
+            bar->size = size;
+            bar->is_io = 1;
+            bar->valid = 1;
+            pci_config_write(resource->bus, resource->dev, resource->func,
+                             reg, port | (original & 3));
+            INFO("PCI: %02x:%02x.%u BAR%u I/O port=0x%x CPU=0x%lx/0x%lx",
+                 resource->bus, resource->dev, resource->func, bar_index, port,
+                 (unsigned long)bar->address, (unsigned long)size);
             continue;
         }
 
-        unsigned int bar_index = i;
-        uint64_t size;
         if (is_64bit) {
             size = ~(((uint64_t)mask_hi << 32) | (mask & ~0xfULL)) + 1;
             bar->is_64bit = 1;
@@ -260,54 +303,118 @@ static void pci_probe_bars(struct pci_device_resource *resource,
                      PCI_CFG_COMMAND, command);
 }
 
-static int pci_enumerate(void)
+static int pci_scan_bus(unsigned int bus)
 {
-    for (unsigned int bus = 0; bus < PCI_MAX_BUSES; bus++) {
-        for (unsigned int dev = 0; dev < 32; dev++) {
-            uint32_t id0 = pci_config_read(bus, dev, 0, PCI_CFG_VENDOR_ID);
-            if ((id0 & 0xffff) == 0xffff)
+    for (unsigned int dev = 0; dev < 32; dev++) {
+        uint32_t id0 = pci_config_read(bus, dev, 0, PCI_CFG_VENDOR_ID);
+        if ((id0 & 0xffff) == 0xffff)
+            continue;
+        uint8_t header0 = (uint8_t)pci_config_read(bus, dev, 0,
+                                                   PCI_HEADER_TYPE);
+        unsigned int functions = (header0 & PCI_HEADER_MULTI) ? 8 : 1;
+        for (unsigned int func = 0; func < functions; func++) {
+            uint32_t id = pci_config_read(bus, dev, func, PCI_CFG_VENDOR_ID);
+            uint16_t vendor = id & 0xffff;
+            uint16_t device = id >> 16;
+            if (vendor == 0xffff)
                 continue;
-            uint8_t header0 = (uint8_t)pci_config_read(
-                bus, dev, 0, PCI_HEADER_TYPE);
-            unsigned int functions = (header0 & PCI_HEADER_MULTI) ? 8 : 1;
-            for (unsigned int func = 0; func < functions; func++) {
-                uint32_t id = pci_config_read(bus, dev, func, PCI_CFG_VENDOR_ID);
-                uint16_t vendor = id & 0xffff;
-                uint16_t device = id >> 16;
-                if (vendor == 0xffff)
+            if (pci_device_count == PCI_MAX_DEVICES)
+                return -1;
+            struct pci_device_resource *resource =
+                &pci_devices[pci_device_count++];
+            resource->vendor = vendor;
+            resource->device = device;
+            resource->bus = bus;
+            resource->dev = dev;
+            resource->func = func;
+            resource->header_type = (uint8_t)pci_config_read(
+                bus, dev, func, PCI_HEADER_TYPE) & 0x7f;
+            if (vendor == PCI_EDU_VENDOR && device == PCI_EDU_DEVICE) {
+                resource->owner_vmid = 1;
+                edu_bus = bus;
+                edu_dev = dev;
+                edu_func = func;
+                edu_found = 1;
+            }
+            INFO("PCI: enumerated %02x:%02x.%u id=%04x:%04x header=%u",
+                 bus, dev, func, vendor, device, resource->header_type);
+            if (resource->header_type == 0) {
+                pci_probe_bars(resource, PCI_MAX_BARS);
+            } else if (resource->header_type == PCI_HEADER_BRIDGE) {
+                if (pci_next_bus >= PCI_MAX_BUSES) {
+                    WARN("PCI: no secondary bus available for %02x:%02x.%u",
+                         bus, dev, func);
                     continue;
-                if (pci_device_count == PCI_MAX_DEVICES)
-                    return -1;
-                struct pci_device_resource *resource =
-                    &pci_devices[pci_device_count++];
-                resource->vendor = vendor;
-                resource->device = device;
-                resource->bus = bus;
-                resource->dev = dev;
-                resource->func = func;
-                resource->header_type = (uint8_t)pci_config_read(
-                    bus, dev, func, PCI_HEADER_TYPE) & 0x7f;
-                if (vendor == PCI_EDU_VENDOR && device == PCI_EDU_DEVICE) {
-                    resource->owner_vmid = 1;
-                    edu_bus = bus;
-                    edu_dev = dev;
-                    edu_func = func;
-                    edu_found = 1;
                 }
-                INFO("PCI: enumerated %02x:%02x.%u id=%04x:%04x header=%u",
-                     bus, dev, func, vendor, device, resource->header_type);
-                if (resource->header_type == 0)
-                    pci_probe_bars(resource, PCI_MAX_BARS);
+                unsigned int secondary = pci_next_bus++;
+                uint32_t bridge_command = pci_config_read(
+                    bus, dev, func, PCI_CFG_COMMAND);
+                pci_config_write(bus, dev, func, PCI_CFG_COMMAND,
+                                 bridge_command | PCI_CMD_IO | PCI_CMD_MEMORY);
+                resource->primary_bus = bus;
+                resource->secondary_bus = secondary;
+                uint32_t bus_numbers = (bus & 0xff) | (secondary << 8) |
+                                       (0xff << 16);
+                pci_config_write(bus, dev, func, PCI_BRIDGE_BUS_NUMBERS,
+                                 bus_numbers);
+                uint64_t mmio_start = pci_mmio_next;
+                uint32_t io_start = pci_io_next;
+                if (pci_scan_bus(secondary) < 0)
+                    return -1;
+                unsigned int subordinate = pci_next_bus - 1;
+                resource->subordinate_bus = subordinate;
+                bus_numbers = (bus & 0xff) | (secondary << 8) |
+                              (subordinate << 16);
+                pci_config_write(bus, dev, func, PCI_BRIDGE_BUS_NUMBERS,
+                                 bus_numbers);
+
+                if (pci_mmio_next > mmio_start) {
+                    uint64_t base = mmio_start &
+                        ~(uint64_t)(PCI_BRIDGE_MEMORY_GRANULARITY - 1);
+                    uint64_t limit = (pci_mmio_next - 1) &
+                        ~(uint64_t)(PCI_BRIDGE_MEMORY_GRANULARITY - 1);
+                    uint32_t window = (uint32_t)((base >> 16) & 0xfff0) |
+                        (uint32_t)((limit >> 16) << 16 & 0xfff00000);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_MEMORY_BASE_LIMIT, window);
+                    INFO("PCI: bridge %02x:%02x.%u memory window 0x%lx-0x%lx",
+                         bus, dev, func, (unsigned long)base,
+                         (unsigned long)(limit + PCI_BRIDGE_MEMORY_GRANULARITY - 1));
+                } else {
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_MEMORY_BASE_LIMIT, 0x0000fff0);
+                }
+                if (pci_io_next > io_start) {
+                    uint32_t base = io_start &
+                        ~(PCI_BRIDGE_IO_GRANULARITY - 1);
+                    uint32_t limit = (pci_io_next - 1) &
+                        ~(PCI_BRIDGE_IO_GRANULARITY - 1);
+                    uint32_t io_window = ((base >> 8) & 0xf0) |
+                        (limit & 0xf000);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_IO_BASE_LIMIT, io_window);
+                    INFO("PCI: bridge %02x:%02x.%u I/O window 0x%x-0x%x",
+                         bus, dev, func, base,
+                         limit + PCI_BRIDGE_IO_GRANULARITY - 1);
+                } else {
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_IO_BASE_LIMIT, 0x000000f0);
+                }
             }
         }
     }
-    if (!edu_found)
+    return 0;
+}
+
+static int pci_enumerate(void)
+{
+    if (pci_scan_bus(0) < 0 || !edu_found)
         return -1;
     for (unsigned int i = 0; i < pci_device_count; i++) {
         struct pci_device_resource *resource = &pci_devices[i];
         if (resource->owner_vmid == 1) {
             for (unsigned int bar = 0; bar < PCI_MAX_BARS; bar++)
-                if (resource->bars[bar].valid) {
+                if (resource->bars[bar].valid && !resource->bars[bar].is_io) {
                     edu_bar0 = resource->bars[bar].address;
                     edu_bar0_size = resource->bars[bar].size;
                     break;
