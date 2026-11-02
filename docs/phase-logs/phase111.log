@@ -1,0 +1,28 @@
+Phase 111 vMSI state and PCI MSI write interception
+
+Build:
+- make -f Makefile.virt -j$(nproc): PASS
+- Existing guest compiler warnings remain; no Phase 111 build errors.
+
+Default topology:
+- Command: timeout 65 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase111-basic.log
+- edu MSI capability discovered at 0x40: 64-bit, one physical vector.
+- Guest-visible MSI control retains read-only capability bits and enable state.
+- Guest write to virtual Message Address (0xdead0000) reads back the physical ITS doorbell 0x08090040 while physical device address remains protected.
+- Guest Message Data write to eventID 1 routes through ITS/vITS; received vSPI 72 (vLPI 8200): PASS.
+- edu reset identity/state and reset + MSI reinit: PASS.
+
+Nested bridge topology:
+- edu at 00:03.0, nested bridges at 00:04.0 and 01:01.0, e1000 at 02:02.0.
+- Dynamic requester ID 24; vMSI virtual-address protection, eventID delivery and reset + MSI reinit: PASS.
+- QEMU exited by timeout as expected.
+
+Known existing regression:
+- Full guest output includes `FAIL: task 槽位未被实际复用`, as recorded in prior phase logs. No full-suite pass is claimed.
+- No PANIC, ASSERT or Data Abort observed in either topology.
+
+Coverage limits:
+- Only the owner edu MSI capability is virtualized; other device MSI is outside this phase.
+- MSI-X is not emulated.
+- Mask/Pending Bits are software state and are not synchronized to physical masking behavior.
+- PCI DMA remains without SMMU/IOMMU isolation.

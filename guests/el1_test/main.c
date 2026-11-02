@@ -3976,7 +3976,7 @@ static void vits_test(void)
     vits_sync();
 
     /* 5. 修改 edu 的 MSI data 为 1（EventID = 1）
-     * 通过 PCI ECAM 直接写配置空间。
+         * 通过 PCI ECAM trap-and-emulate 写配置空间。
      * edu 在 bus 0, dev 2, func 0。
      * MSI Capability 在 pci_init 里探测过，偏移由 QEMU 决定。
      * 简化：从 Cap Pointer 开始遍历，找到 MSI Capability。
@@ -3984,7 +3984,7 @@ static void vits_test(void)
     {
         #define PCI_CFG_CAP_PTR  0x34
         #define PCI_CAP_ID_MSI   0x05
-        #define PCI_MSI_DATA_OFF 0x0C  /* 32-bit 地址模式下 data 寄存器偏移 */
+        #define PCI_MSI_DATA_OFF 0x0C  /* QEMU edu 64-bit MSI data offset */
 
         u64 ecam_addr = edu_ecam_base;
         u8 cap_ptr = (u8)mmio_read32(ecam_addr + PCI_CFG_CAP_PTR);
@@ -4009,11 +4009,29 @@ static void vits_test(void)
         puts_hex(msi_cap_off, 2);
         guest_puts("\n");
 
+        u32 msi_ctrl = mmio_read32(ecam_addr + msi_cap_off);
+        u32 msi_addr = mmio_read32(ecam_addr + msi_cap_off + 4);
+        u32 msi_addr_hi = mmio_read32(ecam_addr + msi_cap_off + 8);
+        if (!(msi_ctrl & (1U << 16)) || !(msi_ctrl & (1U << 23)) ||
+            msi_addr != 0x08090040 || msi_addr_hi != 0) {
+            guest_puts("vMSI: capability/address virtualization FAILED\n");
+            return;
+        }
+
         /* 读当前 MSI data（应该是 0，即 EventID = 0） */
         u32 msi_data = mmio_read32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF);
         guest_puts("vITS: current MSI data = 0x");
         puts_hex(msi_data & 0xFFFF, 4);
         guest_puts("\n");
+
+        /* Guest address writes are virtual and cannot replace the ITS doorbell. */
+        mmio_write32(ecam_addr + msi_cap_off + 4, 0xdead0000);
+        if (mmio_read32(ecam_addr + msi_cap_off + 4) != 0x08090040 ||
+            mmio_read32(ecam_addr + msi_cap_off + 8) != 0) {
+            guest_puts("vMSI: virtual address write FAILED\n");
+            return;
+        }
+        guest_puts("vMSI: virtual address write PASSED\n");
 
         /* 修改 MSI data 为 1（EventID = 1） */
         mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF,

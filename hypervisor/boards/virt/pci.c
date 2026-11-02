@@ -78,6 +78,8 @@
 #define PCI_MSI_CTRL_MME_SHIFT   4          /* Multiple Message Enable */
 #define PCI_MSI_CTRL_64BIT       (1 << 7)   /* 64-bit Address */
 #define PCI_MSI_CTRL_MASK        (1 << 8)   /* Per-vector Masking */
+#define PCI_MSI_CTRL_MMC_MASK    (0x7 << PCI_MSI_CTRL_MMC_SHIFT)
+#define PCI_MSI_CTRL_MME_MASK    (0x7 << PCI_MSI_CTRL_MME_SHIFT)
 
 #define PCI_MAX_BUSES 16
 #define PCI_MAX_DEVICES 128
@@ -176,6 +178,11 @@ static int edu_msi_cap_off = 0;   /* MSI Capability 在配置空间中的偏移�
 static int edu_pcie_cap_off = 0;   /* PCIe Capability 偏移（0=不存在） */
 static int edu_flr_supported = 0;
 static unsigned int edu_msi_max_vectors = 1;
+static uint16_t edu_vmsi_ctrl;
+static uint64_t edu_vmsi_addr;
+static uint16_t edu_vmsi_data;
+static uint32_t edu_vmsi_mask;
+static uint32_t edu_vmsi_pending;
 unsigned int pci_edu_lpi_base = 0;  /* edu MSI 对应的 LPI 基址（0=未配置） */
 unsigned int pci_edu_msi_enabled = 0; /* MSI 是否已启用 */
 
@@ -597,6 +604,9 @@ void pci_init(void)
         int mme_shift = (msi_ctrl >> PCI_MSI_CTRL_MMC_SHIFT) & 0x7;
         unsigned int max_vectors = 1 << mme_shift;
         edu_msi_max_vectors = max_vectors;
+        edu_vmsi_ctrl = msi_ctrl & 0xffff;
+        edu_vmsi_mask = 0;
+        edu_vmsi_pending = 0;
 
         INFO("PCI: edu MSI cap at 0x%x (%s-bit, max %u vectors)",
              edu_msi_cap_off, is_64bit ? "64" : "32", max_vectors);
@@ -621,6 +631,8 @@ void pci_init(void)
         pci_config_write(edu_bus, edu_dev, edu_func, data_off,
                          (old & 0xFFFF0000) | (msi_data & 0xFFFF));
 
+        edu_vmsi_addr = msi_addr;
+        edu_vmsi_data = msi_data & 0xffff;
         if (is_64bit) {
             /* 64 位地址：ADDR_LO 在 0x04，ADDR_HI 在 0x08 */
             pci_config_write(edu_bus, edu_dev, edu_func,
@@ -639,9 +651,11 @@ void pci_init(void)
         /* 5.6 使能 MSI，同时禁用 INTx（置位 INTx Disable 位） */
         msi_ctrl = pci_config_read(edu_bus, edu_dev, edu_func,
                                    edu_msi_cap_off + PCI_MSI_CTRL);
-        /* MME = 0（1 个向量），MSI Enable = 1 */
-        msi_ctrl &= ~(0x7 << PCI_MSI_CTRL_MME_SHIFT);
+        /* Physical MME remains zero; the guest-visible value is virtual. */
+        msi_ctrl &= ~(PCI_MSI_CTRL_MME_MASK);
         msi_ctrl |= PCI_MSI_CTRL_EN;
+        edu_vmsi_ctrl = (edu_vmsi_ctrl & ~PCI_MSI_CTRL_EN) |
+                        PCI_MSI_CTRL_EN;
         pci_config_write(edu_bus, edu_dev, edu_func,
                          edu_msi_cap_off + PCI_MSI_CTRL, msi_ctrl);
         unsigned int owned_vectors = max_vectors > 16 ? 16 : max_vectors;
@@ -682,7 +696,8 @@ static int pci_edu_quiesce(void)
                                        edu_msi_cap_off + PCI_MSI_CTRL);
         pci_config_write(edu_bus, edu_dev, edu_func,
                          edu_msi_cap_off + PCI_MSI_CTRL,
-                         msi & ~PCI_MSI_CTRL_EN);
+                         msi | PCI_MSI_CTRL_EN);
+        edu_vmsi_ctrl &= ~PCI_MSI_CTRL_EN;
     }
     while (timeout-- &&
            ((get32(edu_bar0 + EDU_REG_STATUS) & 1) ||
@@ -733,6 +748,10 @@ static int pci_edu_reinit_msi(void)
     uint32_t old_data = pci_config_read(edu_bus, edu_dev, edu_func, data_off);
     pci_config_write(edu_bus, edu_dev, edu_func, data_off,
                      (old_data & 0xffff0000) | (its_get_msi_data(0) & 0xffff));
+    edu_vmsi_addr = msi_addr;
+    edu_vmsi_data = its_get_msi_data(0) & 0xffff;
+    edu_vmsi_ctrl = (edu_vmsi_ctrl & ~PCI_MSI_CTRL_EN) |
+                    PCI_MSI_CTRL_EN;
     pci_config_write(edu_bus, edu_dev, edu_func,
                      edu_msi_cap_off + PCI_MSI_ADDR_LO, (uint32_t)msi_addr);
     if (pci_config_read(edu_bus, edu_dev, edu_func,
@@ -740,6 +759,8 @@ static int pci_edu_reinit_msi(void)
         pci_config_write(edu_bus, edu_dev, edu_func,
                          edu_msi_cap_off + PCI_MSI_ADDR_LO + 4,
                          (uint32_t)(msi_addr >> 32));
+    pci_config_write(edu_bus, edu_dev, edu_func,
+                     edu_msi_cap_off + data_off, edu_vmsi_data);
     uint32_t msi_ctrl = pci_config_read(edu_bus, edu_dev, edu_func,
                                         edu_msi_cap_off + PCI_MSI_CTRL);
     msi_ctrl &= ~(0x7 << PCI_MSI_CTRL_MME_SHIFT);
@@ -840,6 +861,8 @@ int pci_edu_function_reset(struct task_struct *vm)
                      PCI_CMD_INTX_DIS);
     pci_edu_lpi_base = 0;
     pci_edu_msi_enabled = 0;
+    edu_vmsi_mask = 0;
+    edu_vmsi_pending = 0;
     if (pci_edu_reinit_msi() < 0) {
         WARN("PCI: edu MSI reinitialization failed after reset");
         return -1;
@@ -971,6 +994,110 @@ rollback:
     return -1;
 }
 
+static uint8_t pci_vmsi_read_byte(unsigned int reg)
+{
+    unsigned int off = reg - edu_msi_cap_off;
+    unsigned int addr_size = (edu_vmsi_ctrl & PCI_MSI_CTRL_64BIT) ? 8 : 4;
+    unsigned int data_off = 4 + addr_size;
+    unsigned int mask_off = data_off + 4;
+    unsigned int pend_off = mask_off + 4;
+
+    if (off == 0)
+        return (uint8_t)(pci_config_read(edu_bus, edu_dev, edu_func,
+                                         edu_msi_cap_off) & 0xff);
+    if (off == 1)
+        return (uint8_t)(pci_config_read(edu_bus, edu_dev, edu_func,
+                                         edu_msi_cap_off) >> 8);
+    if (off == 2)
+            return (uint8_t)edu_vmsi_ctrl;
+    if (off == 3)
+        return (uint8_t)(edu_vmsi_ctrl >> 8);
+    if (off >= 4 && off < 4 + addr_size) {
+        uint64_t addr = (edu_vmsi_ctrl & PCI_MSI_CTRL_EN) ?
+                        its_get_msi_address() : edu_vmsi_addr;
+        return (uint8_t)(addr >> ((off - 4) * 8));
+    }
+    if (off >= data_off && off < data_off + 2)
+        return (uint8_t)(edu_vmsi_data >> ((off - data_off) * 8));
+    if ((edu_vmsi_ctrl & PCI_MSI_CTRL_MASK) && off >= mask_off &&
+        off < mask_off + 4)
+        return (uint8_t)(edu_vmsi_mask >> ((off - mask_off) * 8));
+    if ((edu_vmsi_ctrl & PCI_MSI_CTRL_MASK) && off >= pend_off &&
+        off < pend_off + 4)
+        return (uint8_t)(edu_vmsi_pending >> ((off - pend_off) * 8));
+    return (uint8_t)(pci_config_read(edu_bus, edu_dev, edu_func, reg) & 0xff);
+}
+
+static void pci_vmsi_write_byte(unsigned int reg, uint8_t value)
+{
+    unsigned int off = reg - edu_msi_cap_off;
+    unsigned int addr_size = (edu_vmsi_ctrl & PCI_MSI_CTRL_64BIT) ? 8 : 4;
+    unsigned int data_off = 4 + addr_size;
+    unsigned int mask_off = data_off + 4;
+
+    if (off == 2) {
+        edu_vmsi_ctrl = (edu_vmsi_ctrl & ~PCI_MSI_CTRL_EN) |
+                        (value & PCI_MSI_CTRL_EN);
+        uint32_t physical = pci_config_read(edu_bus, edu_dev, edu_func,
+                                             edu_msi_cap_off + PCI_MSI_CTRL);
+        pci_config_write(edu_bus, edu_dev, edu_func,
+                         edu_msi_cap_off + PCI_MSI_CTRL,
+                         physical | PCI_MSI_CTRL_EN);
+        return;
+    }
+    if (off == 3) {
+        unsigned int mme = (value >> 4) & 0x7;
+        unsigned int mmc = (edu_vmsi_ctrl & PCI_MSI_CTRL_MMC_MASK) >>
+                           PCI_MSI_CTRL_MMC_SHIFT;
+        if (mme > mmc)
+            mme = mmc;
+        edu_vmsi_ctrl = (edu_vmsi_ctrl & ~PCI_MSI_CTRL_MME_MASK) |
+                        (mme << PCI_MSI_CTRL_MME_SHIFT);
+        return;
+    }
+    if (off >= 4 && off < 4 + addr_size) {
+        unsigned int shift = (off - 4) * 8;
+        uint64_t mask = 0xffULL << shift;
+        edu_vmsi_addr = (edu_vmsi_addr & ~mask) | ((uint64_t)value << shift);
+        return;
+    }
+    if (off >= data_off && off < data_off + 2) {
+        unsigned int shift = (off - data_off) * 8;
+        edu_vmsi_data = (edu_vmsi_data & ~(0xffU << shift)) |
+                        ((uint16_t)value << shift);
+        pci_config_write(edu_bus, edu_dev, edu_func,
+                         edu_msi_cap_off + data_off, edu_vmsi_data);
+        return;
+    }
+    if ((edu_vmsi_ctrl & PCI_MSI_CTRL_MASK) && off >= mask_off &&
+        off < mask_off + 4) {
+        unsigned int shift = (off - mask_off) * 8;
+        edu_vmsi_mask = (edu_vmsi_mask & ~(0xffU << shift)) |
+                        ((uint32_t)value << shift);
+    }
+}
+
+static int pci_vmsi_access(unsigned int reg, unsigned int size, int write,
+                           uint64_t *value)
+{
+    unsigned int data_off = 4 +
+        ((edu_vmsi_ctrl & PCI_MSI_CTRL_64BIT) ? 8 : 4);
+    unsigned int length = (edu_vmsi_ctrl & PCI_MSI_CTRL_MASK) ?
+                          data_off + 12 : data_off + 4;
+    if (!edu_msi_cap_off || reg < edu_msi_cap_off ||
+        reg + size > edu_msi_cap_off + length)
+        return 0;
+    if (write) {
+        for (unsigned int i = 0; i < size; i++)
+            pci_vmsi_write_byte(reg + i, (*value >> (i * 8)) & 0xff);
+    } else {
+        *value = 0;
+        for (unsigned int i = 0; i < size; i++)
+            *value |= (uint64_t)pci_vmsi_read_byte(reg + i) << (i * 8);
+    }
+    return 1;
+}
+
 static uint32_t pci_config_read_width(unsigned int bus, unsigned int dev,
                                       unsigned int func, unsigned int reg,
                                       unsigned int size)
@@ -1026,6 +1153,9 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
         return 1;
     }
     if (!write) {
+        if (resource == pci_find_resource(edu_bus, edu_dev, edu_func) &&
+            pci_vmsi_access(reg, size, 0, value))
+            return 1;
         *value = pci_config_read_width(bus, dev, func, reg, size);
         return 1;
     }
@@ -1033,6 +1163,9 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
         return 1;
     if (reg < PCI_BAR0 + PCI_MAX_BARS * 4 &&
         reg + size > PCI_BAR0)
+        return 1;
+    if (resource == pci_find_resource(edu_bus, edu_dev, edu_func) &&
+        pci_vmsi_access(reg, size, 1, value))
         return 1;
     if (reg < PCI_CFG_COMMAND + 2 && reg + size > PCI_CFG_COMMAND) {
         uint32_t command = pci_config_read(bus, dev, func, PCI_CFG_COMMAND);
