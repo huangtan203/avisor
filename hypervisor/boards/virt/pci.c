@@ -269,23 +269,35 @@ static void pool_init(struct pci_resource_pool *pool, uint64_t base,
     pool->count = 1;
 }
 
+static int pool_range_valid(const struct pci_resource_pool *pool,
+                            uint64_t base, uint64_t size)
+{
+    if (!pool || !size || base < pool->base ||
+        base > UINT64_MAX - size || size > pool->size ||
+        base - pool->base > pool->size - size)
+        return 0;
+    return 1;
+}
+
 static int pool_alloc(struct pci_resource_pool *pool, uint64_t size,
                       uint64_t *address)
 {
-    if (!size || (size & (size - 1)))
+    if (!pool || !address || !size || (size & (size - 1)) ||
+        pool->count > PCI_FREE_LIST_MAX)
         return -1;
     int best = -1;
     uint64_t best_waste = UINT64_MAX;
     uint64_t best_base = 0;
     for (unsigned int i = 0; i < pool->count; i++) {
         struct pci_free_range *range = &pool->ranges[i];
+        if (!range->size || range->base > UINT64_MAX - range->size)
+            continue;
         if (range->base > UINT64_MAX - (size - 1))
             continue;
         uint64_t aligned = (range->base + size - 1) & ~(size - 1);
-        if (range->base > UINT64_MAX - range->size)
-            continue;
-        if (aligned < range->base || aligned > range->base + range->size ||
-            size > range->base + range->size - aligned)
+        uint64_t end = range->base + range->size;
+        if (aligned < range->base || aligned > end ||
+            size > end - aligned || (aligned & (size - 1)))
             continue;
         uint64_t waste = range->size - size;
         if (waste < best_waste) {
@@ -294,7 +306,7 @@ static int pool_alloc(struct pci_resource_pool *pool, uint64_t size,
             best_base = aligned;
         }
     }
-    if (best < 0)
+    if (best < 0 || best_base > UINT64_MAX - size)
         return -1;
 
     struct pci_free_range range = pool->ranges[best];
@@ -308,20 +320,172 @@ static int pool_alloc(struct pci_resource_pool *pool, uint64_t size,
     for (unsigned int i = (unsigned int)best; i + 1 < pool->count; i++)
         pool->ranges[i] = pool->ranges[i + 1];
     pool->count--;
-    if (left.size)
-        pool->ranges[pool->count++] = left;
-    if (right.size)
-        pool->ranges[pool->count++] = right;
+    if (right.size) {
+        unsigned int pos = 0;
+        while (pos < pool->count && pool->ranges[pos].base < right.base)
+            pos++;
+        for (unsigned int i = pool->count; i > pos; i--)
+            pool->ranges[i] = pool->ranges[i - 1];
+        pool->ranges[pos] = right;
+        pool->count++;
+    }
+    if (left.size) {
+        unsigned int pos = 0;
+        while (pos < pool->count && pool->ranges[pos].base < left.base)
+            pos++;
+        for (unsigned int i = pool->count; i > pos; i--)
+            pool->ranges[i] = pool->ranges[i - 1];
+        pool->ranges[pos] = left;
+        pool->count++;
+    }
     *address = best_base;
+    return 0;
+}
+
+static int pool_free(struct pci_resource_pool *pool, uint64_t base,
+                     uint64_t size)
+{
+    if (!pool_range_valid(pool, base, size) ||
+        pool->count > PCI_FREE_LIST_MAX)
+        return -1;
+    uint64_t end = base + size;
+    unsigned int pos = 0;
+    while (pos < pool->count && pool->ranges[pos].base < base) {
+        uint64_t range_end = pool->ranges[pos].base + pool->ranges[pos].size;
+        if (range_end > base)
+            return -1;
+        pos++;
+    }
+    if (pos < pool->count && end > pool->ranges[pos].base)
+        return -1;
+    int merge_prev = pos &&
+        pool->ranges[pos - 1].base + pool->ranges[pos - 1].size == base;
+    int merge_next = pos < pool->count && end == pool->ranges[pos].base;
+    if (merge_prev && merge_next) {
+        pool->ranges[pos - 1].size += size + pool->ranges[pos].size;
+        for (unsigned int i = pos; i + 1 < pool->count; i++)
+            pool->ranges[i] = pool->ranges[i + 1];
+        pool->count--;
+    } else if (merge_prev) {
+        pool->ranges[pos - 1].size += size;
+    } else if (merge_next) {
+        pool->ranges[pos].base = base;
+        pool->ranges[pos].size += size;
+    } else {
+        if (pool->count == PCI_FREE_LIST_MAX)
+            return -1;
+        for (unsigned int i = pool->count; i > pos; i--)
+            pool->ranges[i] = pool->ranges[i - 1];
+        pool->ranges[pos] = (struct pci_free_range) { base, size };
+        pool->count++;
+    }
+    return 0;
+}
+
+static int pool_reserve_range(struct pci_resource_pool *pool, uint64_t base,
+                              uint64_t size)
+{
+    if (!pool_range_valid(pool, base, size) ||
+        pool->count > PCI_FREE_LIST_MAX)
+        return -1;
+    uint64_t end = base + size;
+    for (unsigned int i = 0; i < pool->count;) {
+        struct pci_free_range *range = &pool->ranges[i];
+        uint64_t range_end;
+        if (!range->size || range->base > UINT64_MAX - range->size) {
+            i++;
+            continue;
+        }
+        range_end = range->base + range->size;
+        if (range_end <= base) {
+            i++;
+            continue;
+        }
+        if (range->base >= end)
+            break;
+        if (base <= range->base && end >= range_end) {
+            for (unsigned int j = i; j + 1 < pool->count; j++)
+                pool->ranges[j] = pool->ranges[j + 1];
+            pool->count--;
+            continue;
+        }
+        if (base <= range->base) {
+            range->base = end;
+            range->size = range_end - end;
+            i++;
+            continue;
+        }
+        if (end >= range_end) {
+            range->size = base - range->base;
+            i++;
+            continue;
+        }
+        if (pool->count == PCI_FREE_LIST_MAX)
+            return -1;
+        for (unsigned int j = pool->count; j > i + 1; j--)
+            pool->ranges[j] = pool->ranges[j - 1];
+        pool->ranges[i + 1] = (struct pci_free_range) {
+            end, range_end - end
+        };
+        range->size = base - range->base;
+        pool->count++;
+        i += 2;
+    }
     return 0;
 }
 
 static uint64_t pool_used(const struct pci_resource_pool *pool)
 {
     uint64_t free_size = 0;
+    if (!pool || pool->count > PCI_FREE_LIST_MAX)
+        return 0;
     for (unsigned int i = 0; i < pool->count; i++)
         free_size += pool->ranges[i].size;
     return pool->size - free_size;
+}
+
+static int pool_selftest(void)
+{
+    struct pci_resource_pool pool;
+    uint64_t first, second;
+    pool_init(&pool, 0x1000, 0x10000);
+    if (pool_alloc(&pool, 0x1000, &first) < 0 || first != 0x1000 ||
+        pool_alloc(&pool, 0x2000, &second) < 0 || second != 0x2000 ||
+        pool_free(&pool, first, 0x1000) < 0 ||
+        pool_free(&pool, second, 0x2000) < 0 || pool.count != 1 ||
+        pool.ranges[0].base != 0x1000 || pool.ranges[0].size != 0x10000)
+        return -1;
+    if (pool_reserve_range(&pool, 0x3000, 0x2000) < 0 || pool.count != 2 ||
+        pool.ranges[0].base != 0x1000 || pool.ranges[0].size != 0x2000 ||
+        pool.ranges[1].base != 0x5000 || pool.ranges[1].size != 0xc000)
+        return -1;
+    if (pool_reserve_range(&pool, 0x2000, 0x6000) < 0 || pool.count != 2 ||
+        pool.ranges[0].base != 0x1000 || pool.ranges[0].size != 0x1000 ||
+        pool.ranges[1].base != 0x8000 || pool.ranges[1].size != 0x9000)
+        return -1;
+    return 0;
+}
+
+static uint64_t pool_largest_free(const struct pci_resource_pool *pool)
+{
+    uint64_t largest = 0;
+    if (!pool || pool->count > PCI_FREE_LIST_MAX)
+        return 0;
+    for (unsigned int i = 0; i < pool->count; i++)
+        if (pool->ranges[i].size > largest)
+            largest = pool->ranges[i].size;
+    return largest;
+}
+
+static void pool_dump_stats(const char *name,
+                            const struct pci_resource_pool *pool)
+{
+    INFO("PCI: %s total=0x%lx used=0x%lx free=0x%lx fragments=%u largest=0x%lx base=0x%lx",
+         name, (unsigned long)pool->size,
+         (unsigned long)pool_used(pool),
+         (unsigned long)(pool->size - pool_used(pool)), pool->count,
+         (unsigned long)pool_largest_free(pool),
+         (unsigned long)pool->base);
 }
 
 static int pci_allocate_mmio(uint64_t size, uint64_t *address)
@@ -501,6 +665,16 @@ rollback:
             (((original_bars[i] >> 1) & 3) == 2) && i + 1 < bar_count)
             pci_config_write(resource->bus, resource->dev, resource->func,
                              PCI_BAR0 + (i + 1) * 4, original_bars_hi[i]);
+        struct pci_bar_resource *bar = &resource->bars[i];
+        if (bar->valid && bar->address >= VIRT_PCIE_IO_BASE &&
+            bar->is_io) {
+            if (pool_free(&io_pool, bar->address - VIRT_PCIE_IO_BASE,
+                          bar->size) < 0)
+                WARN("PCI: failed to free I/O BAR during rollback");
+        } else if (bar->valid && !bar->is_io) {
+            if (pool_free(&mmio_pool, bar->address, bar->size) < 0)
+                WARN("PCI: failed to free MMIO BAR during rollback");
+        }
         resource->bars[i] = saved_resources[i];
     }
     mmio_pool = saved_mmio_pool;
@@ -789,11 +963,36 @@ static int pci_scan_bus(unsigned int bus)
                     pci_config_write(bus, dev, func,
                                      PCI_BRIDGE_PREFETCH_LIMIT_UPPER, 0);
                 }
+                int reserve_failed = 0;
+                if (mmio_base != UINT64_MAX) {
+                    uint64_t base = mmio_base &
+                        ~(uint64_t)(PCI_BRIDGE_MEMORY_GRANULARITY - 1);
+                    uint64_t limit = mmio_limit &
+                        ~(uint64_t)(PCI_BRIDGE_MEMORY_GRANULARITY - 1);
+                    uint64_t reserve_size = limit - base +
+                        PCI_BRIDGE_MEMORY_GRANULARITY;
+                    if (pool_reserve_range(&mmio_pool, base, reserve_size) < 0)
+                        reserve_failed = 1;
+                }
+                if (prefetch_base != UINT64_MAX) {
+                    uint64_t base = prefetch_base &
+                        ~(uint64_t)(PCI_BRIDGE_MEMORY_GRANULARITY - 1);
+                    uint64_t limit = prefetch_limit &
+                        ~(uint64_t)(PCI_BRIDGE_MEMORY_GRANULARITY - 1);
+                    uint64_t reserve_size = limit - base +
+                        PCI_BRIDGE_MEMORY_GRANULARITY;
+                    if (pool_reserve_range(&mmio_pool, base, reserve_size) < 0)
+                        reserve_failed = 1;
+                }
                 if (io_base != UINT32_MAX) {
                     uint32_t base = io_base &
                         ~(PCI_BRIDGE_IO_GRANULARITY - 1);
                     uint32_t limit = io_limit &
                         ~(PCI_BRIDGE_IO_GRANULARITY - 1);
+                    uint32_t reserve_size = limit - base +
+                        PCI_BRIDGE_IO_GRANULARITY;
+                    if (pool_reserve_range(&io_pool, base, reserve_size) < 0)
+                        reserve_failed = 1;
                     uint32_t io_type = 1U;
                     uint32_t io_window = ((base >> 8) & 0xf0) |
                         (limit & 0xf000) | io_type | (io_type << 8);
@@ -817,6 +1016,35 @@ static int pci_scan_bus(unsigned int bus)
                     pci_config_write(bus, dev, func,
                                      PCI_BRIDGE_IO_BASE_UPPER, 0);
                 }
+                if (reserve_failed) {
+                    mmio_pool = saved_mmio;
+                    io_pool = saved_io;
+                    pci_next_bus = saved_next_bus;
+                    pci_device_count = saved_count;
+                    pci_config_write(bus, dev, func, PCI_BRIDGE_BUS_NUMBERS,
+                                     saved_bus_numbers);
+                    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_LIMIT,
+                                     saved_io_window);
+                    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER,
+                                     saved_io_upper);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_MEMORY_BASE_LIMIT,
+                                     saved_mmio_window);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_BASE_LIMIT,
+                                     saved_prefetch_window);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_BASE_UPPER,
+                                     saved_prefetch_base_hi);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_LIMIT_UPPER,
+                                     saved_prefetch_limit_hi);
+                    pci_config_write(bus, dev, func, PCI_CFG_COMMAND,
+                                     bridge_command);
+                    WARN("PCI: bridge window reservation failed for %02x:%02x.%u",
+                         bus, dev, func);
+                    return -1;
+                }
             }
             pci_init_vmsi(resource);
             if (resource->msi_cap_off && resource->owner_vmid == 1 &&
@@ -834,13 +1062,17 @@ static int pci_scan_bus(unsigned int bus)
 
 static int pci_enumerate(void)
 {
+    if (pool_selftest() < 0) {
+        WARN("PCI: resource pool selftest failed");
+        return -1;
+    }
+    INFO("PCI: resource pool selftest PASSED");
     pool_init(&mmio_pool, VIRT_PCIE_MMIO_BASE, VIRT_PCIE_MMIO_SIZE);
     pool_init(&io_pool, 0, PCI_IO_ALLOC_END);
     if (pci_scan_bus(0) < 0 || !edu_found)
         return -1;
-    INFO("PCI: resource use MMIO=0x%lx I/O=0x%lx",
-         (unsigned long)pool_used(&mmio_pool),
-         (unsigned long)pool_used(&io_pool));
+    pool_dump_stats("MMIO", &mmio_pool);
+    pool_dump_stats("I/O", &io_pool);
     for (unsigned int i = 0; i < pci_device_count; i++) {
         struct pci_device_resource *resource = &pci_devices[i];
         if (resource->msix_cap_off) {

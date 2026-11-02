@@ -1,0 +1,24 @@
+Phase 115 PCI resource pool hardening and bridge window reservation
+
+Build:
+- Command: make -f Makefile.virt -j2
+- Result: PASS; kernel linked successfully without pool helper warnings.
+
+Default QEMU topology:
+- Command: timeout 65 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase115-basic.log
+- PCI resource pool selftest: PASS.
+- MMIO: total=0x2eff0000 used=0x105000 free=0x2eeeb000 fragments=2 largest=0x2edf0000 base=0x10000000.
+- I/O: total=0x10000 used=0x20 free=0xffe0 fragments=1 largest=0xffe0 base=0.
+- I/O port 0 allocation, both guest virtio-net loopback suites, edu liveness, factorial(10)=3628800, function reset and MSI reinitialization passed.
+- QEMU terminated by timeout as expected.
+
+Nested bridge topology:
+- Command: timeout 75 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=off -cpu max -smp 2 -m 1G -device edu,bus=pcie.0,addr=0x3 -device pci-bridge,id=br1,bus=pcie.0,addr=0x4,chassis_nr=1 -device pci-bridge,id=br2,bus=br1,addr=0x1,chassis_nr=2 -device e1000,bus=br2,addr=0x2 -kernel bin_virt/kernel8.img -display none -monitor none -serial file:/tmp/avisor-phase115-nested.log
+- PCI resource pool selftest: PASS. Recursive scan reached bus 2; e1000 BAR0 MMIO 0x20000 and BAR1 I/O 0x40 allocated.
+- Both bridges configured MMIO and I/O windows. After reservation, MMIO used=0x200000, fragments=1; I/O used=0x1000, fragments=1.
+- No reservation failure, rollback warning, PANIC or ASSERT appeared; QEMU terminated by timeout as expected.
+
+Coverage limits:
+- Did not inject pool exhaustion, free-list capacity exhaustion, overlapping free, or bridge reservation failure.
+- Available QEMU devices expose no prefetchable BAR, so the prefetch window path was not exercised in this phase.
+- Reservations account for currently free space; they do not relocate BARs allocated before a bridge window is known.
