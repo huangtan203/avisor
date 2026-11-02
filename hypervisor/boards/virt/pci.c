@@ -79,10 +79,41 @@
 #define PCI_MSI_CTRL_64BIT       (1 << 7)   /* 64-bit Address */
 #define PCI_MSI_CTRL_MASK        (1 << 8)   /* Per-vector Masking */
 
-/* edu 设备位置（枚举时填充） */
+#define PCI_MAX_BUSES 16
+#define PCI_MAX_DEVICES 128
+#define PCI_MAX_BARS 6
+#define PCI_HEADER_TYPE 0x0e
+#define PCI_HEADER_MULTI 0x80
+#define PCI_BAR0 0x10
+#define PCI_MMIO_ALLOC_END (VIRT_PCIE_MMIO_BASE + VIRT_PCIE_MMIO_SIZE)
+
+struct pci_bar_resource {
+    uint64_t address;
+    uint64_t size;
+    uint32_t flags;
+    uint8_t is_64bit;
+    uint8_t valid;
+};
+
+struct pci_device_resource {
+    uint16_t vendor;
+    uint16_t device;
+    uint8_t bus;
+    uint8_t dev;
+    uint8_t func;
+    uint8_t header_type;
+    uint8_t owner_vmid;
+    struct pci_bar_resource bars[PCI_MAX_BARS];
+};
+
+static struct pci_device_resource pci_devices[PCI_MAX_DEVICES];
+static unsigned int pci_device_count;
+static uint64_t pci_mmio_next = VIRT_PCIE_MMIO_BASE;
 static unsigned int edu_bus;
 static unsigned int edu_dev;
 static unsigned int edu_func;
+static uint64_t edu_bar0;
+static uint64_t edu_bar0_size;
 static int edu_found = 0;
 
 static unsigned int pci_edu_requester_id(void)
@@ -140,48 +171,165 @@ static void pci_config_write(unsigned int bus, unsigned int dev,
     put32(ecam_addr(bus, dev, func, reg), val);
 }
 
-/*
- * 枚举 bus 0，找到 edu 设备（vendor 0x1234 / device 0x11e8）
- */
-static int pci_find_edu(void)
+static uint64_t pci_allocate_mmio(uint64_t size)
 {
-    for (unsigned int dev = 0; dev < 32; dev++) {
-        /* 先看 function 0：若不存在（vendor == 0xffff）则跳过该 dev */
-        uint32_t id0 = pci_config_read(0, dev, 0, PCI_CFG_VENDOR_ID);
-        if ((id0 & 0xffff) == 0xffff)
+    uint64_t aligned = (pci_mmio_next + size - 1) & ~(size - 1);
+
+    if (!size || (size & (size - 1)) || aligned < pci_mmio_next ||
+        aligned > PCI_MMIO_ALLOC_END || size > PCI_MMIO_ALLOC_END - aligned)
+        return 0;
+    pci_mmio_next = aligned + size;
+    return aligned;
+}
+
+static void pci_probe_bars(struct pci_device_resource *resource,
+                           unsigned int bar_count)
+{
+    uint32_t command = pci_config_read(resource->bus, resource->dev,
+                                       resource->func, PCI_CFG_COMMAND);
+
+    pci_config_write(resource->bus, resource->dev, resource->func,
+                     PCI_CFG_COMMAND, command & ~(PCI_CMD_IO | PCI_CMD_MEMORY));
+    for (unsigned int i = 0; i < bar_count; i++) {
+        unsigned int reg = PCI_BAR0 + i * 4;
+        uint32_t original = pci_config_read(resource->bus, resource->dev,
+                                            resource->func, reg);
+        uint32_t original_hi = 0;
+        int is_64bit = !(original & 1) && (((original >> 1) & 3) == 2) &&
+                      i + 1 < bar_count;
+        if (is_64bit)
+            original_hi = pci_config_read(resource->bus, resource->dev,
+                                          resource->func, reg + 4);
+        pci_config_write(resource->bus, resource->dev, resource->func, reg,
+                         0xffffffff);
+        if (is_64bit)
+            pci_config_write(resource->bus, resource->dev, resource->func,
+                             reg + 4, 0xffffffff);
+        uint32_t mask = pci_config_read(resource->bus, resource->dev,
+                                        resource->func, reg);
+        uint32_t mask_hi = is_64bit ? pci_config_read(
+            resource->bus, resource->dev, resource->func, reg + 4) : 0;
+        pci_config_write(resource->bus, resource->dev, resource->func, reg,
+                         original);
+        if (is_64bit)
+            pci_config_write(resource->bus, resource->dev, resource->func,
+                             reg + 4, original_hi);
+        if (!mask || mask == 0xffffffff)
             continue;
 
-        for (unsigned int func = 0; func < 8; func++) {
-            uint32_t id = pci_config_read(0, dev, func, PCI_CFG_VENDOR_ID);
-            uint16_t vendor = (uint16_t)(id & 0xffff);
-            uint16_t device = (uint16_t)((id >> 16) & 0xffff);
+        struct pci_bar_resource *bar = &resource->bars[i];
+        bar->flags = original & 0xf;
+        if (original & 1) {
+            WARN("PCI: I/O BAR not allocated at %02x:%02x.%u BAR%u",
+                 resource->bus, resource->dev, resource->func, i);
+            continue;
+        }
 
-            if (vendor == PCI_EDU_VENDOR && device == PCI_EDU_DEVICE) {
-                edu_bus = 0;
-                edu_dev = dev;
-                edu_func = func;
-                return 1;
+        unsigned int bar_index = i;
+        uint64_t size;
+        if (is_64bit) {
+            size = ~(((uint64_t)mask_hi << 32) | (mask & ~0xfULL)) + 1;
+            bar->is_64bit = 1;
+        } else {
+            size = (uint32_t)(~(mask & ~0xfU) + 1U);
+        }
+        if (!size || (size & (size - 1)))
+            continue;
+        uint64_t assigned = pci_allocate_mmio(size);
+        if (!assigned) {
+            WARN("PCI: MMIO BAR allocation failed at %02x:%02x.%u BAR%u size=0x%lx",
+                 resource->bus, resource->dev, resource->func, i,
+                 (unsigned long)size);
+            continue;
+        }
+        bar->address = assigned;
+        bar->size = size;
+        bar->valid = 1;
+        pci_config_write(resource->bus, resource->dev, resource->func, reg,
+                         (uint32_t)assigned | bar->flags);
+        if (bar->is_64bit)
+            pci_config_write(resource->bus, resource->dev, resource->func,
+                             reg + 4, (uint32_t)(assigned >> 32));
+        INFO("PCI: %02x:%02x.%u BAR%u MMIO 0x%lx/0x%lx",
+             resource->bus, resource->dev, resource->func, bar_index,
+             (unsigned long)assigned, (unsigned long)size);
+        if (bar->is_64bit)
+            i++;
+    }
+    pci_config_write(resource->bus, resource->dev, resource->func,
+                     PCI_CFG_COMMAND, command);
+}
+
+static int pci_enumerate(void)
+{
+    for (unsigned int bus = 0; bus < PCI_MAX_BUSES; bus++) {
+        for (unsigned int dev = 0; dev < 32; dev++) {
+            uint32_t id0 = pci_config_read(bus, dev, 0, PCI_CFG_VENDOR_ID);
+            if ((id0 & 0xffff) == 0xffff)
+                continue;
+            uint8_t header0 = (uint8_t)pci_config_read(
+                bus, dev, 0, PCI_HEADER_TYPE);
+            unsigned int functions = (header0 & PCI_HEADER_MULTI) ? 8 : 1;
+            for (unsigned int func = 0; func < functions; func++) {
+                uint32_t id = pci_config_read(bus, dev, func, PCI_CFG_VENDOR_ID);
+                uint16_t vendor = id & 0xffff;
+                uint16_t device = id >> 16;
+                if (vendor == 0xffff)
+                    continue;
+                if (pci_device_count == PCI_MAX_DEVICES)
+                    return -1;
+                struct pci_device_resource *resource =
+                    &pci_devices[pci_device_count++];
+                resource->vendor = vendor;
+                resource->device = device;
+                resource->bus = bus;
+                resource->dev = dev;
+                resource->func = func;
+                resource->header_type = (uint8_t)pci_config_read(
+                    bus, dev, func, PCI_HEADER_TYPE) & 0x7f;
+                if (vendor == PCI_EDU_VENDOR && device == PCI_EDU_DEVICE) {
+                    resource->owner_vmid = 1;
+                    edu_bus = bus;
+                    edu_dev = dev;
+                    edu_func = func;
+                    edu_found = 1;
+                }
+                INFO("PCI: enumerated %02x:%02x.%u id=%04x:%04x header=%u",
+                     bus, dev, func, vendor, device, resource->header_type);
+                if (resource->header_type == 0)
+                    pci_probe_bars(resource, PCI_MAX_BARS);
             }
         }
     }
-    return 0;
+    if (!edu_found)
+        return -1;
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        struct pci_device_resource *resource = &pci_devices[i];
+        if (resource->owner_vmid == 1) {
+            for (unsigned int bar = 0; bar < PCI_MAX_BARS; bar++)
+                if (resource->bars[bar].valid) {
+                    edu_bar0 = resource->bars[bar].address;
+                    edu_bar0_size = resource->bars[bar].size;
+                    break;
+                }
+            break;
+        }
+    }
+    return edu_bar0 != 0;
 }
 
 void pci_init(void)
 {
-    if (!pci_find_edu()) {
-        WARN("PCI: edu device not found (vendor=0x%lx device=0x%lx)",
+    if (pci_enumerate() < 0) {
+        WARN("PCI: edu device enumeration failed (vendor=0x%lx device=0x%lx)",
              (unsigned long)PCI_EDU_VENDOR, (unsigned long)PCI_EDU_DEVICE);
         return;
     }
-    edu_found = 1;
-    INFO("PCI: edu found at %02x:%02x.%x", edu_bus, edu_dev, edu_func);
+    INFO("PCI: edu found at %02x:%02x.%x BAR0=0x%lx size=0x%lx",
+         edu_bus, edu_dev, edu_func, (unsigned long)edu_bar0,
+         (unsigned long)edu_bar0_size);
 
-    /* 1. 编程 BAR0 = 0x10000000（PCI MMIO 窗口起始） */
-    pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_BAR0,
-                     (uint32_t)PCI_EDU_BAR0_IPA);
-    uint32_t bar0 = pci_config_read(edu_bus, edu_dev, edu_func, PCI_CFG_BAR0);
-    INFO("PCI: edu BAR0 = 0x%x", bar0);
+    /* 1. BAR 已由启动期 resource allocator 编程。 */
 
     /* 2. 使能 memory space + bus master */
     uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND);
@@ -382,21 +530,21 @@ static int pci_edu_quiesce(void)
                          msi & ~PCI_MSI_CTRL_EN);
     }
     while (timeout-- &&
-           ((get32(PCI_EDU_BAR0_IPA + EDU_REG_STATUS) & 1) ||
-            (get32(PCI_EDU_BAR0_IPA + EDU_REG_DMA_CMD) & 1)))
+           ((get32(edu_bar0 + EDU_REG_STATUS) & 1) ||
+            (get32(edu_bar0 + EDU_REG_DMA_CMD) & 1)))
         wait_msec(1);
     return timeout ? 0 : -1;
 }
 
 static void pci_edu_internal_reset(void)
 {
-    put32(PCI_EDU_BAR0_IPA + EDU_REG_IRQ_ACK, 0xffffffff);
-    put32(PCI_EDU_BAR0_IPA + EDU_REG_DMA_CMD, 0);
-    put32(PCI_EDU_BAR0_IPA + EDU_REG_DMA_SRC, 0);
-    put32(PCI_EDU_BAR0_IPA + EDU_REG_DMA_DST, 0);
-    put32(PCI_EDU_BAR0_IPA + EDU_REG_DMA_COUNT, 0);
-    put32(PCI_EDU_BAR0_IPA + EDU_REG_LIVENESS, 0);
-    put32(PCI_EDU_BAR0_IPA + EDU_REG_FACTORIAL, 0);
+    put32(edu_bar0 + EDU_REG_IRQ_ACK, 0xffffffff);
+    put32(edu_bar0 + EDU_REG_DMA_CMD, 0);
+    put32(edu_bar0 + EDU_REG_DMA_SRC, 0);
+    put32(edu_bar0 + EDU_REG_DMA_DST, 0);
+    put32(edu_bar0 + EDU_REG_DMA_COUNT, 0);
+    put32(edu_bar0 + EDU_REG_LIVENESS, 0);
+    put32(edu_bar0 + EDU_REG_FACTORIAL, 0);
     asm volatile("dsb sy" ::: "memory");
 }
 
@@ -504,9 +652,34 @@ int pci_edu_function_reset(struct task_struct *vm)
     } else {
         pci_edu_internal_reset();
     }
-    pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_BAR0,
-                     (uint32_t)PCI_EDU_BAR0_IPA);
+    struct pci_device_resource *edu_resource = NULL;
+    for (unsigned int i = 0; i < pci_device_count; i++)
+        if (pci_devices[i].bus == edu_bus && pci_devices[i].dev == edu_dev &&
+            pci_devices[i].func == edu_func) {
+            edu_resource = &pci_devices[i];
+            break;
+        }
+    if (!edu_resource || !edu_resource->bars[0].valid)
+        return -1;
     uint32_t cmd = pci_config_read(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND);
+    pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
+                     cmd & ~(PCI_CMD_IO | PCI_CMD_MEMORY));
+    for (unsigned int i = 0; i < PCI_MAX_BARS; i++) {
+        struct pci_bar_resource *bar = &edu_resource->bars[i];
+        if (!bar->valid)
+            continue;
+        unsigned int reg = PCI_BAR0 + i * 4;
+        pci_config_write(edu_bus, edu_dev, edu_func, reg,
+                         (uint32_t)bar->address | bar->flags);
+        if (bar->is_64bit) {
+            pci_config_write(edu_bus, edu_dev, edu_func, reg + 4,
+                             (uint32_t)(bar->address >> 32));
+            i++;
+        }
+    }
+    edu_bar0 = edu_resource->bars[0].address;
+    edu_bar0_size = edu_resource->bars[0].size;
+    pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND, cmd);
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
                      cmd | PCI_CMD_MEMORY | PCI_CMD_BUSMASTER |
                      PCI_CMD_INTX_DIS);
@@ -526,25 +699,16 @@ void pci_passthrough_map(struct task_struct *vm)
     if (!edu_found)
         return;
 
-    /*
-     * 映射 ECAM（16MB）为 device 内存，Guest 可自行枚举配置空间。
-     * 等值映射：IPA == PA。
-     */
-    for (uint64_t off = 0; off < VIRT_PCIE_ECAM_SIZE; off += PAGE_SIZE) {
-        map_stage2_page(vm, VIRT_PCIE_ECAM_BASE + off,
-                        VIRT_PCIE_ECAM_BASE + off,
+    if (vm->vmid != 1)
+        return;
+    uint64_t ecam = ecam_addr(edu_bus, edu_dev, edu_func, 0) & ~(PAGE_SIZE - 1);
+    map_stage2_page(vm, ecam, ecam, MMU_STAGE2_DEVICE_PAGE_FLAGS);
+    for (uint64_t off = 0; off < edu_bar0_size; off += PAGE_SIZE)
+        map_stage2_page(vm, edu_bar0 + off, edu_bar0 + off,
                         MMU_STAGE2_DEVICE_PAGE_FLAGS);
-    }
-
-    /* 映射 BAR0（1MB）为 device 内存 */
-    for (uint64_t off = 0; off < PCI_EDU_BAR0_SIZE; off += PAGE_SIZE) {
-        map_stage2_page(vm, PCI_EDU_BAR0_IPA + off,
-                        PCI_EDU_BAR0_IPA + off,
-                        MMU_STAGE2_DEVICE_PAGE_FLAGS);
-    }
-
-    INFO("PCI: passthrough mapped into VM%lu (ECAM 16MB + BAR0 1MB)",
-         (unsigned long)vm->vmid);
+    INFO("PCI: passthrough mapped into VM%lu (ECAM page=0x%lx BAR0=0x%lx/0x%lx)",
+         (unsigned long)vm->vmid, (unsigned long)ecam,
+         (unsigned long)edu_bar0, (unsigned long)edu_bar0_size);
 }
 
 /*
@@ -566,7 +730,7 @@ void pci_debug_dump(void)
     }
     if (edu_found)
         INFO("PCI dbg: edu irq_status=0x%x",
-             get32(PCI_EDU_BAR0_IPA + 0x24));
+             get32(edu_bar0 + EDU_REG_IRQ_STATUS));
     INFO("PCI dbg: LR0=0x%lx LR1=0x%lx",
          READ_SYSREG64(ICH_LR0_EL2), READ_SYSREG64(ICH_LR1_EL2));
     INFO("PCI dbg: RPR=0x%02x PMR=0x%02x HPPIR=%u",

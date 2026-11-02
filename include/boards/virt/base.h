@@ -68,7 +68,6 @@
  */
 #define PCI_EDU_VENDOR       0x1234UL
 #define PCI_EDU_DEVICE       0x11e8UL
-#define PCI_EDU_BAR0_IPA     0x10000000UL   /* 编程到 BAR0 的地址 */
 #define PCI_EDU_BAR0_SIZE    0x00100000UL   /* edu BAR0 大小 (1MB) */
 
 /* virt 主桥 INTA 对应的 GIC SPI 号（INTA/B/C/D = SPI 3/4/5/6） */

@@ -1229,7 +1229,7 @@ static void ivshmem_pingpong_test(void)
 
 /* ---------- PCI 直通 edu 驱动 ---------- */
 
-#define EDU_BAR0_BASE      0x10000000UL   /* edu BAR0 (直通映射) */
+static u64 edu_bar0_base;
 #define EDU_ID_REG         0x00
 #define EDU_LIVENESS_REG   0x04
 #define EDU_FACTORIAL_REG  0x08
@@ -1452,10 +1452,18 @@ static void edu_test(void)
     u32 id, live, fact;
     int timeout;
 
-    guest_puts("edu: probing device at BAR0=0x10000000...\n");
+    u64 ecam = 0x3f000000UL + ((u64)2 << 15);
+    u32 bar0 = mmio_read32(ecam + 0x10);
+    edu_bar0_base = bar0 & ~0xfU;
+    guest_puts("edu: discovered BAR0=0x");
+    puts_hex(edu_bar0_base, 8);
+    guest_puts("\n");
+    if (!edu_bar0_base)
+        return;
+    guest_puts("PCI enumeration/BAR discovery PASSED\n");
 
     /* 1. identification（应为 0x010000ed） */
-    id = mmio_read32(EDU_BAR0_BASE + EDU_ID_REG);
+    id = mmio_read32(edu_bar0_base + EDU_ID_REG);
     guest_puts("edu: identification=0x");
     puts_hex(id, 8);
     guest_puts("\n");
@@ -1465,8 +1473,8 @@ static void edu_test(void)
     }
 
     /* 2. liveness：写入读回按位取反 */
-    mmio_write32(EDU_BAR0_BASE + EDU_LIVENESS_REG, 0xdeadbeef);
-    live = mmio_read32(EDU_BAR0_BASE + EDU_LIVENESS_REG);
+    mmio_write32(edu_bar0_base + EDU_LIVENESS_REG, 0xdeadbeef);
+    live = mmio_read32(edu_bar0_base + EDU_LIVENESS_REG);
     if (live == ~0xdeadbeefu) {
         guest_puts("edu: liveness PASSED (0x");
         puts_hex(live, 8);
@@ -1479,11 +1487,11 @@ static void edu_test(void)
     }
 
     /* 3. factorial：计算 10! = 3628800 */
-    mmio_write32(EDU_BAR0_BASE + EDU_FACTORIAL_REG, 10);
+    mmio_write32(edu_bar0_base + EDU_FACTORIAL_REG, 10);
     timeout = 10000000;
-    while ((mmio_read32(EDU_BAR0_BASE + EDU_STATUS_REG) & 0x1) && timeout-- > 0)
+    while ((mmio_read32(edu_bar0_base + EDU_STATUS_REG) & 0x1) && timeout-- > 0)
         asm volatile("nop");
-    fact = mmio_read32(EDU_BAR0_BASE + EDU_FACTORIAL_REG);
+    fact = mmio_read32(edu_bar0_base + EDU_FACTORIAL_REG);
     guest_puts("edu: factorial(10)=");
     puts_dec(fact);
     guest_puts(" (expect 3628800)\n");
@@ -1496,10 +1504,10 @@ static void edu_test(void)
     guest_puts("edu: starting interrupt test (MSI)...\n");
     edu_irq_received = 0;
     /* 清残留 irq_status */
-    mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, 0xffffffff);
+    mmio_write32(edu_bar0_base + EDU_IRQ_ACK, 0xffffffff);
     /* 写非零值到 raise 寄存器 -> 设备发 MSI -> ITS 翻译成 LPI 8192
      * -> Hypervisor 应答后注入虚拟 SPI 50 */
-    mmio_write32(EDU_BAR0_BASE + EDU_IRQ_RAISE, 0x12345678);
+    mmio_write32(edu_bar0_base + EDU_IRQ_RAISE, 0x12345678);
 
     timeout = 10000000;
     while (!edu_irq_received && timeout-- > 0)
@@ -3998,10 +4006,10 @@ static void vits_test(void)
         vits_irq_intid = 0;
 
         /* 清残留 irq_status */
-        mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, 0xffffffff);
+        mmio_write32(edu_bar0_base + EDU_IRQ_ACK, 0xffffffff);
 
         /* 触发 edu 中断（写非零值到 IRQ_RAISE 寄存器） */
-        mmio_write32(EDU_BAR0_BASE + EDU_IRQ_RAISE, 0xabcdef01);
+        mmio_write32(edu_bar0_base + EDU_IRQ_RAISE, 0xabcdef01);
 
         /* 等待中断 */
         int timeout = 10000000;
@@ -4029,11 +4037,11 @@ static void vits_test(void)
         if (hvc_call(HVC_PCI_RESET, 0) == 0) {
             u32 pci_id = mmio_read32(ecam_addr);
             u32 bar0 = mmio_read32(ecam_addr + 0x10);
-            u32 reset_id = mmio_read32(EDU_BAR0_BASE + EDU_ID_REG);
-            u32 reset_live = mmio_read32(EDU_BAR0_BASE + EDU_LIVENESS_REG);
-            u32 reset_fact = mmio_read32(EDU_BAR0_BASE + EDU_FACTORIAL_REG);
+            u32 reset_id = mmio_read32(edu_bar0_base + EDU_ID_REG);
+            u32 reset_live = mmio_read32(edu_bar0_base + EDU_LIVENESS_REG);
+            u32 reset_fact = mmio_read32(edu_bar0_base + EDU_FACTORIAL_REG);
             if ((pci_id & 0xffffffff) != 0x11e81234 ||
-                bar0 != EDU_BAR0_BASE || reset_id != 0x010000ed ||
+                bar0 != edu_bar0_base || reset_id != 0x010000ed ||
                 reset_live != 0xffffffff || reset_fact != 1) {
                 guest_puts("vITS: edu reset identity/state FAILED (pci=0x");
                 puts_hex(pci_id, 8);
@@ -4055,8 +4063,8 @@ static void vits_test(void)
                          (msi_data & 0xFFFF0000) | 1);
             vits_irq_received = 0;
             vits_irq_intid = 0;
-            mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, 0xffffffff);
-            mmio_write32(EDU_BAR0_BASE + EDU_IRQ_RAISE, 0xfeedbabe);
+            mmio_write32(edu_bar0_base + EDU_IRQ_ACK, 0xffffffff);
+            mmio_write32(edu_bar0_base + EDU_IRQ_RAISE, 0xfeedbabe);
             timeout = 10000000;
             while (!vits_irq_received && timeout-- > 0)
                 asm volatile("nop");
@@ -4098,16 +4106,16 @@ void guest_irq_handler(void)
     } else if (intid == PCI_EDU_IRQ) {
         /* 清设备侧 irq_status（MSI 模式下设备看到状态归零即安静，
          * 之后走末尾统一虚拟 EOI 结束软件注入的虚拟中断） */
-        edu_irq_status_val = mmio_read32(EDU_BAR0_BASE + EDU_IRQ_STATUS);
-        mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK, edu_irq_status_val);
+        edu_irq_status_val = mmio_read32(edu_bar0_base + EDU_IRQ_STATUS);
+        mmio_write32(edu_bar0_base + EDU_IRQ_ACK, edu_irq_status_val);
         edu_irq_received = 1;
     } else if (intid == VITS_TEST_VSPI) {
         /* vITS 映射的 MSI 中断（Phase 9 测试） */
         vits_irq_intid = intid;
         vits_irq_received = 1;
         /* 清设备侧 IRQ status */
-        mmio_write32(EDU_BAR0_BASE + EDU_IRQ_ACK,
-                     mmio_read32(EDU_BAR0_BASE + EDU_IRQ_STATUS));
+        mmio_write32(edu_bar0_base + EDU_IRQ_ACK,
+                     mmio_read32(edu_bar0_base + EDU_IRQ_STATUS));
     } else if (intid == SHM_NOTIFY_VIRQ) {
         /* 共享内存通知中断（Phase 10） */
         shm_notify_received = 1;

@@ -1,0 +1,51 @@
+Phase 107: PCI enumeration and BAR resource mapping
+Date: 2026-11-02
+Platform: QEMU virt, AArch64, EL2, GICv3, ITS
+
+Build
+-----
+Command: make -f Makefile.virt -j$(nproc)
+Result: PASS
+Hypervisor image: bin_virt/kernel8.img
+Guest image: guests/el1_test/el1_test.bin
+Guest build emitted existing warnings outside this phase's scope.
+
+QEMU regression
+---------------
+Command: timeout 70 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase107-final.log
+Exit: 124 (expected timeout termination)
+Serial log: /tmp/avisor-phase107-final.log
+
+PCI enumeration and allocation
+------------------------------
+Enumerated QEMU virt functions:
+00:00.0 1b36:0008 header=0
+00:01.0 1af4:1000 header=0
+00:02.0 1234:11e8 header=0
+
+Allocated MMIO BARs:
+00:01.0 BAR1 0x10000000/0x1000
+00:01.0 BAR4 0x10004000/0x4000
+00:02.0 BAR0 0x10100000/0x100000 (edu)
+
+Observed PASS markers
+---------------------
+[vm1] PCI enumeration/BAR discovery PASSED
+[vm1] edu: identification=0x010000ed
+[vm1] edu: factorial PASSED
+[vm1] vITS: PASSED! Received vSPI 72 (vLPI 8200)
+[vm1] vITS: edu reset identity/state PASSED
+[vm1] vITS: edu function reset + MSI reinit PASSED
+[vm1] sched: vCPU migration CPU0->CPU1->CPU0 PASSED
+[vm1] gicd: LR overflow queue delivered all 4 interrupts PASSED
+[vm2] gicd: LR overflow queue delivered all 4 interrupts PASSED
+[vm3] PASSED: 双 vCPU Live Migration 成功（VM2 -> VM3）
+
+Failure scan
+------------
+Scanned for PANIC, ASSERT, FAILED, Data Abort, Unknown IRQ, and no ownership.
+No matching failure/drop markers found.
+
+Coverage limits
+---------------
+The standard run enumerated three bus-0 functions. The code scans the configured 16-bus ECAM span and honors multifunction header bits, but nonzero-bus/multifunction topology was not exercised in this run. I/O BARs are recognized but not allocated; bridge recursion/window programming is deferred to Phase 108. ECAM is still guest-writable for the assigned function.
