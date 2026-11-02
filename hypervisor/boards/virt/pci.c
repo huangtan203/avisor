@@ -80,6 +80,12 @@
 #define PCI_MSI_CTRL_MASK        (1 << 8)   /* Per-vector Masking */
 #define PCI_MSI_CTRL_MMC_MASK    (0x7 << PCI_MSI_CTRL_MMC_SHIFT)
 #define PCI_MSI_CTRL_MME_MASK    (0x7 << PCI_MSI_CTRL_MME_SHIFT)
+#define PCI_MSIX_CTRL            0x02
+#define PCI_MSIX_CTRL_TABLE_SIZE 0x07ff
+#define PCI_MSIX_CTRL_FUNC_MASK  (1U << 14)
+#define PCI_MSIX_CTRL_ENABLE     (1U << 15)
+#define PCI_MSIX_TABLE           0x04
+#define PCI_MSIX_PBA             0x08
 
 #define PCI_MAX_BUSES 16
 #define PCI_MAX_DEVICES 128
@@ -91,6 +97,12 @@
 #define PCI_BRIDGE_BUS_NUMBERS 0x18
 #define PCI_BRIDGE_IO_BASE_LIMIT 0x1c
 #define PCI_BRIDGE_MEMORY_BASE_LIMIT 0x20
+#define PCI_BRIDGE_IO_BASE_UPPER 0x30
+#define PCI_BRIDGE_IO_LIMIT_UPPER 0x34
+#define PCI_BRIDGE_PREFETCH_BASE_LIMIT 0x24
+#define PCI_BRIDGE_PREFETCH_BASE_UPPER 0x28
+#define PCI_BRIDGE_PREFETCH_LIMIT_UPPER 0x2c
+#define PCI_FREE_LIST_MAX 64
 #define PCI_IO_ALLOC_END (VIRT_PCIE_IO_SIZE)
 #define PCI_MMIO_ALLOC_END (VIRT_PCIE_MMIO_BASE + VIRT_PCIE_MMIO_SIZE)
 #define PCI_BRIDGE_MEMORY_GRANULARITY 0x100000
@@ -105,6 +117,29 @@ struct pci_bar_resource {
     uint8_t valid;
 };
 
+struct pci_free_range {
+    uint64_t base;
+    uint64_t size;
+};
+
+struct pci_resource_pool {
+    struct pci_free_range ranges[PCI_FREE_LIST_MAX];
+    unsigned int count;
+    uint64_t base;
+    uint64_t size;
+};
+
+struct bar_probe_entry {
+    uint64_t size;
+    uint32_t original;
+    uint32_t original_hi;
+    uint32_t mask;
+    uint32_t mask_hi;
+    uint8_t index;
+    uint8_t is_64bit;
+    uint8_t is_io;
+};
+
 struct pci_device_resource {
     uint16_t vendor;
     uint16_t device;
@@ -116,13 +151,32 @@ struct pci_device_resource {
     uint8_t primary_bus;
     uint8_t secondary_bus;
     uint8_t subordinate_bus;
+    uint8_t msi_cap_off;
+    uint8_t msi_is_64bit;
+    uint8_t msix_cap_off;
+    uint8_t msix_bir;
+    uint8_t msix_pba_bir;
+    uint8_t msi_mask_capable;
+    uint16_t msi_ctrl;
+    uint16_t msix_ctrl;
+    uint16_t msix_max_vectors;
+    uint64_t msi_addr;
+    uint16_t msi_data;
+    uint32_t msi_mask;
+    uint32_t msi_pend;
+    uint32_t msix_table_offset;
+    uint32_t msix_pba_offset;
     struct pci_bar_resource bars[PCI_MAX_BARS];
 };
 
 static struct pci_device_resource pci_devices[PCI_MAX_DEVICES];
 static unsigned int pci_device_count;
-static uint64_t pci_mmio_next = VIRT_PCIE_MMIO_BASE;
-static uint32_t pci_io_next;
+
+static struct pci_device_resource *pci_find_resource(unsigned int bus,
+                                                      unsigned int dev,
+                                                      unsigned int func);
+static struct pci_resource_pool mmio_pool;
+static struct pci_resource_pool io_pool;
 static unsigned int pci_next_bus = 1;
 static unsigned int edu_bus;
 static unsigned int edu_dev;
@@ -178,11 +232,6 @@ static int edu_msi_cap_off = 0;   /* MSI Capability 在配置空间中的偏移�
 static int edu_pcie_cap_off = 0;   /* PCIe Capability 偏移（0=不存在） */
 static int edu_flr_supported = 0;
 static unsigned int edu_msi_max_vectors = 1;
-static uint16_t edu_vmsi_ctrl;
-static uint64_t edu_vmsi_addr;
-static uint16_t edu_vmsi_data;
-static uint32_t edu_vmsi_mask;
-static uint32_t edu_vmsi_pending;
 unsigned int pci_edu_lpi_base = 0;  /* edu MSI 对应的 LPI 基址（0=未配置） */
 unsigned int pci_edu_msi_enabled = 0; /* MSI 是否已启用 */
 
@@ -210,28 +259,105 @@ static void pci_config_write(unsigned int bus, unsigned int dev,
     put32(ecam_addr(bus, dev, func, reg), val);
 }
 
-static uint64_t pci_allocate_mmio(uint64_t size)
+static void pool_init(struct pci_resource_pool *pool, uint64_t base,
+                      uint64_t size)
 {
-    uint64_t aligned = (pci_mmio_next + size - 1) & ~(size - 1);
-
-    if (!size || (size & (size - 1)) || aligned < pci_mmio_next ||
-        aligned > PCI_MMIO_ALLOC_END || size > PCI_MMIO_ALLOC_END - aligned)
-        return 0;
-    pci_mmio_next = aligned + size;
-    return aligned;
+    memzero(pool, sizeof(*pool));
+    pool->base = base;
+    pool->size = size;
+    pool->ranges[0] = (struct pci_free_range) { base, size };
+    pool->count = 1;
 }
 
-static uint32_t pci_allocate_io(uint32_t size)
+static int pool_alloc(struct pci_resource_pool *pool, uint64_t size,
+                      uint64_t *address)
 {
     if (!size || (size & (size - 1)))
-        return 0xffffffff;
-    uint32_t aligned = (pci_io_next + size - 1) & ~(size - 1);
+        return -1;
+    int best = -1;
+    uint64_t best_waste = UINT64_MAX;
+    uint64_t best_base = 0;
+    for (unsigned int i = 0; i < pool->count; i++) {
+        struct pci_free_range *range = &pool->ranges[i];
+        if (range->base > UINT64_MAX - (size - 1))
+            continue;
+        uint64_t aligned = (range->base + size - 1) & ~(size - 1);
+        if (range->base > UINT64_MAX - range->size)
+            continue;
+        if (aligned < range->base || aligned > range->base + range->size ||
+            size > range->base + range->size - aligned)
+            continue;
+        uint64_t waste = range->size - size;
+        if (waste < best_waste) {
+            best = i;
+            best_waste = waste;
+            best_base = aligned;
+        }
+    }
+    if (best < 0)
+        return -1;
 
-    if (aligned < pci_io_next || aligned >= PCI_IO_ALLOC_END ||
-        size > PCI_IO_ALLOC_END - aligned)
-        return 0xffffffff;
-    pci_io_next = aligned + size;
-    return aligned;
+    struct pci_free_range range = pool->ranges[best];
+    uint64_t end = range.base + range.size;
+    uint64_t alloc_end = best_base + size;
+    struct pci_free_range left = { range.base, best_base - range.base };
+    struct pci_free_range right = { alloc_end, end - alloc_end };
+    unsigned int pieces = !!left.size + !!right.size;
+    if (pool->count - 1 + pieces > PCI_FREE_LIST_MAX)
+        return -1;
+    for (unsigned int i = (unsigned int)best; i + 1 < pool->count; i++)
+        pool->ranges[i] = pool->ranges[i + 1];
+    pool->count--;
+    if (left.size)
+        pool->ranges[pool->count++] = left;
+    if (right.size)
+        pool->ranges[pool->count++] = right;
+    *address = best_base;
+    return 0;
+}
+
+static uint64_t pool_used(const struct pci_resource_pool *pool)
+{
+    uint64_t free_size = 0;
+    for (unsigned int i = 0; i < pool->count; i++)
+        free_size += pool->ranges[i].size;
+    return pool->size - free_size;
+}
+
+static int pci_allocate_mmio(uint64_t size, uint64_t *address)
+{
+    return pool_alloc(&mmio_pool, size, address);
+}
+
+static int pci_allocate_io(uint32_t size, uint32_t *port)
+{
+    uint64_t address;
+    if (pool_alloc(&io_pool, size, &address) < 0)
+        return -1;
+    *port = (uint32_t)address;
+    return 0;
+}
+
+static int bar_size_compare_desc(const struct bar_probe_entry *a,
+                                 const struct bar_probe_entry *b)
+{
+    if (a->size != b->size)
+        return a->size > b->size;
+    return a->is_64bit > b->is_64bit;
+}
+
+static void bar_probes_sort(struct bar_probe_entry *entries,
+                            unsigned int count)
+{
+    for (unsigned int i = 1; i < count; i++) {
+        struct bar_probe_entry entry = entries[i];
+        unsigned int j = i;
+        while (j && bar_size_compare_desc(&entry, &entries[j - 1])) {
+            entries[j] = entries[j - 1];
+            j--;
+        }
+        entries[j] = entry;
+    }
 }
 
 static int pci_probe_bars(struct pci_device_resource *resource,
@@ -240,12 +366,21 @@ static int pci_probe_bars(struct pci_device_resource *resource,
     uint32_t command = pci_config_read(resource->bus, resource->dev,
                                        resource->func, PCI_CFG_COMMAND);
     uint32_t original_bars[PCI_MAX_BARS];
-    uint64_t saved_mmio_next = pci_mmio_next;
-    uint32_t saved_io_next = pci_io_next;
+    struct pci_resource_pool saved_mmio_pool = mmio_pool;
+    struct pci_resource_pool saved_io_pool = io_pool;
+    uint32_t original_bars_hi[PCI_MAX_BARS] = { 0 };
     struct pci_bar_resource saved_resources[PCI_MAX_BARS];
+    struct bar_probe_entry entries[PCI_MAX_BARS];
+    unsigned int entry_count = 0;
+    memzero(entries, sizeof(entries));
     for (unsigned int i = 0; i < bar_count; i++) {
         original_bars[i] = pci_config_read(resource->bus, resource->dev,
                                            resource->func, PCI_BAR0 + i * 4);
+        if (!(original_bars[i] & 1) &&
+            (((original_bars[i] >> 1) & 3) == 2) && i + 1 < bar_count)
+            original_bars_hi[i] = pci_config_read(
+                resource->bus, resource->dev, resource->func,
+                PCI_BAR0 + (i + 1) * 4);
         saved_resources[i] = resource->bars[i];
     }
 
@@ -281,61 +416,78 @@ static int pci_probe_bars(struct pci_device_resource *resource,
             continue;
         }
 
-        struct pci_bar_resource *bar = &resource->bars[i];
-        bar->flags = original & 0xf;
-        unsigned int bar_index = i;
         uint64_t size;
-        if (original & 1) {
+        int is_io = original & 1;
+        if (is_io) {
             size = (uint32_t)(~(mask & ~3U) + 1U);
-            if (!size || (size & (size - 1)))
+        } else if (is_64bit) {
+            uint64_t mask64 = ((uint64_t)mask_hi << 32) | (mask & ~0xfULL);
+            size = ~mask64 + 1;
+            if (size > UINT32_MAX)
                 goto rollback;
-            uint32_t port = pci_allocate_io(size);
-            if (port == 0xffffffff) {
-                WARN("PCI: I/O BAR allocation failed at %02x:%02x.%u BAR%u size=0x%lx",
-                     resource->bus, resource->dev, resource->func, i,
-                     (unsigned long)size);
-                goto rollback;
-            }
-            bar->address = VIRT_PCIE_IO_BASE + port;
-            bar->size = size;
-            bar->is_io = 1;
-            bar->valid = 1;
-            pci_config_write(resource->bus, resource->dev, resource->func,
-                             reg, port | (original & 3));
-            INFO("PCI: %02x:%02x.%u BAR%u I/O port=0x%x CPU=0x%lx/0x%lx",
-                 resource->bus, resource->dev, resource->func, bar_index, port,
-                 (unsigned long)bar->address, (unsigned long)size);
-            continue;
-        }
-
-        if (is_64bit) {
-            size = ~(((uint64_t)mask_hi << 32) | (mask & ~0xfULL)) + 1;
-            bar->is_64bit = 1;
         } else {
             size = (uint32_t)(~(mask & ~0xfU) + 1U);
         }
         if (!size || (size & (size - 1)))
             goto rollback;
-        uint64_t assigned = pci_allocate_mmio(size);
-        if (!assigned) {
+        entries[entry_count++] = (struct bar_probe_entry) {
+            .size = size,
+            .original = original,
+            .original_hi = original_hi,
+            .mask = mask,
+            .mask_hi = mask_hi,
+            .index = i,
+            .is_64bit = is_64bit,
+            .is_io = is_io,
+        };
+        if (is_64bit)
+            i++;
+    }
+
+    bar_probes_sort(entries, entry_count);
+    for (unsigned int n = 0; n < entry_count; n++) {
+        struct bar_probe_entry *probe = &entries[n];
+        unsigned int i = probe->index;
+        unsigned int reg = PCI_BAR0 + i * 4;
+        struct pci_bar_resource *bar = &resource->bars[i];
+        bar->flags = probe->original & 0xf;
+        bar->is_64bit = probe->is_64bit;
+        bar->is_io = probe->is_io;
+        bar->size = probe->size;
+        if (probe->is_io) {
+            uint32_t port;
+            if (pci_allocate_io(probe->size, &port) < 0) {
+                WARN("PCI: I/O BAR allocation failed at %02x:%02x.%u BAR%u size=0x%lx",
+                     resource->bus, resource->dev, resource->func, i,
+                     (unsigned long)probe->size);
+                goto rollback;
+            }
+            bar->address = VIRT_PCIE_IO_BASE + port;
+            bar->valid = 1;
+            pci_config_write(resource->bus, resource->dev, resource->func,
+                             reg, port | (probe->original & 3));
+            INFO("PCI: %02x:%02x.%u BAR%u I/O port=0x%x CPU=0x%lx/0x%lx",
+                 resource->bus, resource->dev, resource->func, i, port,
+                 (unsigned long)bar->address, (unsigned long)bar->size);
+            continue;
+        }
+        uint64_t assigned;
+        if (pci_allocate_mmio(probe->size, &assigned) < 0) {
             WARN("PCI: MMIO BAR allocation failed at %02x:%02x.%u BAR%u size=0x%lx",
                  resource->bus, resource->dev, resource->func, i,
-                 (unsigned long)size);
+                 (unsigned long)probe->size);
             goto rollback;
         }
         bar->address = assigned;
-        bar->size = size;
         bar->valid = 1;
         pci_config_write(resource->bus, resource->dev, resource->func, reg,
                          (uint32_t)assigned | bar->flags);
-        if (bar->is_64bit)
+        if (probe->is_64bit)
             pci_config_write(resource->bus, resource->dev, resource->func,
                              reg + 4, (uint32_t)(assigned >> 32));
         INFO("PCI: %02x:%02x.%u BAR%u MMIO 0x%lx/0x%lx",
-             resource->bus, resource->dev, resource->func, bar_index,
-             (unsigned long)assigned, (unsigned long)size);
-        if (bar->is_64bit)
-            i++;
+             resource->bus, resource->dev, resource->func, i,
+             (unsigned long)assigned, (unsigned long)probe->size);
     }
     pci_config_write(resource->bus, resource->dev, resource->func,
                      PCI_CFG_COMMAND, command);
@@ -345,15 +497,104 @@ rollback:
     for (unsigned int i = 0; i < bar_count; i++) {
         pci_config_write(resource->bus, resource->dev, resource->func,
                          PCI_BAR0 + i * 4, original_bars[i]);
+        if (!(original_bars[i] & 1) &&
+            (((original_bars[i] >> 1) & 3) == 2) && i + 1 < bar_count)
+            pci_config_write(resource->bus, resource->dev, resource->func,
+                             PCI_BAR0 + (i + 1) * 4, original_bars_hi[i]);
         resource->bars[i] = saved_resources[i];
     }
-    pci_mmio_next = saved_mmio_next;
-    pci_io_next = saved_io_next;
+    mmio_pool = saved_mmio_pool;
+    io_pool = saved_io_pool;
     pci_config_write(resource->bus, resource->dev, resource->func,
                      PCI_CFG_COMMAND, command);
     WARN("PCI: BAR transaction rolled back for %02x:%02x.%u",
          resource->bus, resource->dev, resource->func);
     return -1;
+}
+
+static void pci_init_vmsi(struct pci_device_resource *resource)
+{
+    uint32_t status = pci_config_read(resource->bus, resource->dev,
+                                      resource->func, PCI_CFG_STATUS);
+    if (!(status & PCI_STAT_CAP_LIST))
+        return;
+
+    uint8_t cap = pci_config_read(resource->bus, resource->dev,
+                                  resource->func, PCI_CFG_CAP_PTR) & 0xff;
+    unsigned int guard = 0;
+    while (cap && cap != 0xff && guard++ < 48) {
+        if (cap < 0x40 || cap > 0xfc || (cap & 3)) {
+            WARN("PCI: %02x:%02x.%u invalid capability pointer 0x%x",
+                 resource->bus, resource->dev, resource->func, cap);
+            break;
+        }
+        uint32_t header = pci_config_read(resource->bus, resource->dev,
+                                          resource->func, cap);
+        uint8_t id = header & 0xff;
+        if (id == PCI_CAP_ID_MSI) {
+            resource->msi_cap_off = cap;
+            resource->msi_ctrl = (header >> 16) & 0xffff;
+            uint16_t physical_ctrl = resource->msi_ctrl &
+                ~(PCI_MSI_CTRL_EN | PCI_MSI_CTRL_MME_MASK);
+            resource->msi_ctrl &= ~PCI_MSI_CTRL_EN;
+            pci_config_write(resource->bus, resource->dev, resource->func,
+                             cap, (header & 0x0000ffffU) |
+                             ((uint32_t)physical_ctrl << 16));
+            resource->msi_is_64bit = !!(resource->msi_ctrl &
+                                        PCI_MSI_CTRL_64BIT);
+            resource->msi_mask_capable = !!(resource->msi_ctrl &
+                                            PCI_MSI_CTRL_MASK);
+            unsigned int data_off = cap +
+                (resource->msi_is_64bit ? 12 : 8);
+            uint32_t address = pci_config_read(resource->bus, resource->dev,
+                                               resource->func, cap + 4);
+            resource->msi_addr = address;
+            if (resource->msi_is_64bit) {
+                uint32_t address_high = pci_config_read(
+                    resource->bus, resource->dev, resource->func, cap + 8);
+                resource->msi_addr |= (uint64_t)address_high << 32;
+            }
+            uint32_t data = pci_config_read(resource->bus, resource->dev,
+                                            resource->func, data_off);
+            resource->msi_data = data & 0xffff;
+            resource->msi_mask = 0;
+            resource->msi_pend = 0;
+            INFO("PCI: %02x:%02x.%u vMSI cap=0x%x %s-bit mask=%u",
+                 resource->bus, resource->dev, resource->func, cap,
+                 resource->msi_is_64bit ? "64" : "32",
+                 resource->msi_mask_capable);
+        } else if (id == PCI_CAP_ID_MSIX) {
+            uint32_t table = pci_config_read(resource->bus, resource->dev,
+                                             resource->func,
+                                             cap + PCI_MSIX_TABLE);
+            uint32_t pba = pci_config_read(resource->bus, resource->dev,
+                                           resource->func,
+                                           cap + PCI_MSIX_PBA);
+            resource->msix_cap_off = cap;
+            resource->msix_ctrl = (header >> 16) & 0xffff;
+            resource->msix_ctrl &= ~PCI_MSIX_CTRL_ENABLE;
+            resource->msix_max_vectors =
+                (resource->msix_ctrl & PCI_MSIX_CTRL_TABLE_SIZE) + 1;
+            resource->msix_bir = table & 7;
+            resource->msix_table_offset = table & ~7U;
+            resource->msix_pba_bir = pba & 7;
+            resource->msix_pba_offset = pba & ~7U;
+            uint32_t physical = header &
+                ~((uint32_t)PCI_MSIX_CTRL_ENABLE << 16);
+            pci_config_write(resource->bus, resource->dev, resource->func,
+                             cap, physical);
+            uint32_t verify = pci_config_read(resource->bus, resource->dev,
+                                              resource->func, cap);
+            if (verify & ((uint32_t)PCI_MSIX_CTRL_ENABLE << 16))
+                WARN("PCI: %02x:%02x.%u failed to disable physical MSI-X",
+                     resource->bus, resource->dev, resource->func);
+            INFO("PCI: %02x:%02x.%u vMSI-X cap=0x%x vectors=%u table=BAR%u+0x%x physical=off",
+                 resource->bus, resource->dev, resource->func, cap,
+                 resource->msix_max_vectors, resource->msix_bir,
+                 resource->msix_table_offset);
+        }
+        cap = (header >> 8) & 0xff;
+    }
 }
 
 static int pci_scan_bus(unsigned int bus)
@@ -404,6 +645,24 @@ static int pci_scan_bus(unsigned int bus)
                 unsigned int secondary = pci_next_bus++;
                 uint32_t bridge_command = pci_config_read(
                     bus, dev, func, PCI_CFG_COMMAND);
+                uint32_t saved_bus_numbers = pci_config_read(
+                    bus, dev, func, PCI_BRIDGE_BUS_NUMBERS);
+                uint32_t saved_io_window = pci_config_read(
+                    bus, dev, func, PCI_BRIDGE_IO_BASE_LIMIT);
+                uint32_t saved_io_upper = pci_config_read(
+                    bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER);
+                uint32_t saved_mmio_window = pci_config_read(
+                    bus, dev, func, PCI_BRIDGE_MEMORY_BASE_LIMIT);
+                uint32_t saved_prefetch_window = pci_config_read(
+                    bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_LIMIT);
+                uint32_t saved_prefetch_base_hi = pci_config_read(
+                    bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_UPPER);
+                uint32_t saved_prefetch_limit_hi = pci_config_read(
+                    bus, dev, func, PCI_BRIDGE_PREFETCH_LIMIT_UPPER);
+                struct pci_resource_pool saved_mmio = mmio_pool;
+                struct pci_resource_pool saved_io = io_pool;
+                unsigned int saved_next_bus = pci_next_bus - 1;
+                unsigned int saved_count = pci_device_count;
                 pci_config_write(bus, dev, func, PCI_CFG_COMMAND,
                                  bridge_command | PCI_CMD_IO | PCI_CMD_MEMORY);
                 resource->primary_bus = bus;
@@ -412,10 +671,39 @@ static int pci_scan_bus(unsigned int bus)
                                        (0xff << 16);
                 pci_config_write(bus, dev, func, PCI_BRIDGE_BUS_NUMBERS,
                                  bus_numbers);
-                uint64_t mmio_start = pci_mmio_next;
-                uint32_t io_start = pci_io_next;
-                if (pci_scan_bus(secondary) < 0)
+                unsigned int child_start = pci_device_count;
+                if (pci_scan_bus(secondary) < 0) {
+                    mmio_pool = saved_mmio;
+                    io_pool = saved_io;
+                    pci_next_bus = saved_next_bus;
+                    pci_device_count = saved_count;
+                    pci_config_write(bus, dev, func, PCI_BRIDGE_BUS_NUMBERS,
+                                     saved_bus_numbers);
+                    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_LIMIT,
+                                     saved_io_window);
+                    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER,
+                                     saved_io_upper);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_MEMORY_BASE_LIMIT,
+                                     saved_mmio_window);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_BASE_LIMIT,
+                                     saved_prefetch_window);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_BASE_UPPER,
+                                     saved_prefetch_base_hi);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_LIMIT_UPPER,
+                                     saved_prefetch_limit_hi);
+                    pci_config_write(bus, dev, func, PCI_CFG_COMMAND,
+                                     bridge_command);
+                    resource->primary_bus = 0;
+                    resource->secondary_bus = 0;
+                    resource->subordinate_bus = 0;
+                    WARN("PCI: bridge scan rolled back for %02x:%02x.%u",
+                         bus, dev, func);
                     return -1;
+                }
                 unsigned int subordinate = pci_next_bus - 1;
                 resource->subordinate_bus = subordinate;
                 bus_numbers = (bus & 0xff) | (secondary << 8) |
@@ -423,10 +711,34 @@ static int pci_scan_bus(unsigned int bus)
                 pci_config_write(bus, dev, func, PCI_BRIDGE_BUS_NUMBERS,
                                  bus_numbers);
 
-                if (pci_mmio_next > mmio_start) {
-                    uint64_t base = mmio_start &
+                uint64_t mmio_base = UINT64_MAX, mmio_limit = 0;
+                uint64_t prefetch_base = UINT64_MAX, prefetch_limit = 0;
+                uint32_t io_base = UINT32_MAX, io_limit = 0;
+                for (unsigned int i = child_start; i < pci_device_count; i++) {
+                    struct pci_device_resource *child = &pci_devices[i];
+                    for (unsigned int b = 0; b < PCI_MAX_BARS; b++) {
+                        struct pci_bar_resource *bar = &child->bars[b];
+                        if (!bar->valid)
+                            continue;
+                        uint64_t start = bar->is_io ?
+                            bar->address - VIRT_PCIE_IO_BASE : bar->address;
+                        uint64_t end = start + bar->size - 1;
+                        if (bar->is_io) {
+                            if (start < io_base) io_base = start;
+                            if (end > io_limit) io_limit = end;
+                        } else if (bar->flags & PCI_BAR_PREFETCH) {
+                            if (start < prefetch_base) prefetch_base = start;
+                            if (end > prefetch_limit) prefetch_limit = end;
+                        } else {
+                            if (start < mmio_base) mmio_base = start;
+                            if (end > mmio_limit) mmio_limit = end;
+                        }
+                    }
+                }
+                if (mmio_base != UINT64_MAX) {
+                    uint64_t base = mmio_base &
                         ~(uint64_t)(PCI_BRIDGE_MEMORY_GRANULARITY - 1);
-                    uint64_t limit = (pci_mmio_next - 1) &
+                    uint64_t limit = mmio_limit &
                         ~(uint64_t)(PCI_BRIDGE_MEMORY_GRANULARITY - 1);
                     uint32_t window = (uint32_t)((base >> 16) & 0xfff0) |
                         (uint32_t)((limit >> 16) << 16 & 0xfff00000);
@@ -439,22 +751,81 @@ static int pci_scan_bus(unsigned int bus)
                     pci_config_write(bus, dev, func,
                                      PCI_BRIDGE_MEMORY_BASE_LIMIT, 0x0000fff0);
                 }
-                if (pci_io_next > io_start) {
-                    uint32_t base = io_start &
+                if (prefetch_base != UINT64_MAX) {
+                    uint64_t base = prefetch_base &
+                        ~(uint64_t)(PCI_BRIDGE_MEMORY_GRANULARITY - 1);
+                    uint64_t limit = prefetch_limit &
+                        ~(uint64_t)(PCI_BRIDGE_MEMORY_GRANULARITY - 1);
+                    uint32_t window = ((base >> 16) & 0xfff0) |
+                        (((limit >> 16) & 0xfff0) << 16) |
+                        (1U << 0) | (1U << 16);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_BASE_LIMIT, window);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_BASE_UPPER,
+                                     base >> 32);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_LIMIT_UPPER,
+                                     limit >> 32);
+                    uint32_t verify_window = pci_config_read(
+                        bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_LIMIT);
+                    uint32_t verify_base_hi = pci_config_read(
+                        bus, dev, func, PCI_BRIDGE_PREFETCH_BASE_UPPER);
+                    uint32_t verify_limit_hi = pci_config_read(
+                        bus, dev, func, PCI_BRIDGE_PREFETCH_LIMIT_UPPER);
+                    if (verify_window != window ||
+                        verify_base_hi != (uint32_t)(base >> 32) ||
+                        verify_limit_hi != (uint32_t)(limit >> 32))
+                        WARN("PCI: bridge %02x:%02x.%u prefetch window mismatch",
+                             bus, dev, func);
+                    INFO("PCI: bridge %02x:%02x.%u prefetch window 0x%lx-0x%lx",
+                         bus, dev, func, (unsigned long)base,
+                         (unsigned long)(limit + PCI_BRIDGE_MEMORY_GRANULARITY - 1));
+                } else {
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_BASE_LIMIT, 0x0000fff0);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_BASE_UPPER, 0);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_PREFETCH_LIMIT_UPPER, 0);
+                }
+                if (io_base != UINT32_MAX) {
+                    uint32_t base = io_base &
                         ~(PCI_BRIDGE_IO_GRANULARITY - 1);
-                    uint32_t limit = (pci_io_next - 1) &
+                    uint32_t limit = io_limit &
                         ~(PCI_BRIDGE_IO_GRANULARITY - 1);
+                    uint32_t io_type = 1U;
                     uint32_t io_window = ((base >> 8) & 0xf0) |
-                        (limit & 0xf000);
+                        (limit & 0xf000) | io_type | (io_type << 8);
                     pci_config_write(bus, dev, func,
                                      PCI_BRIDGE_IO_BASE_LIMIT, io_window);
+                    pci_config_write(bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER,
+                                     ((base >> 16) & 0xffff) |
+                                     ((limit >> 16) << 16));
+                    uint32_t verify = pci_config_read(
+                        bus, dev, func, PCI_BRIDGE_IO_BASE_UPPER);
+                    if (verify != (((base >> 16) & 0xffff) |
+                                   ((limit >> 16) << 16)))
+                        WARN("PCI: bridge %02x:%02x.%u I/O upper window mismatch",
+                             bus, dev, func);
                     INFO("PCI: bridge %02x:%02x.%u I/O window 0x%x-0x%x",
                          bus, dev, func, base,
                          limit + PCI_BRIDGE_IO_GRANULARITY - 1);
                 } else {
                     pci_config_write(bus, dev, func,
                                      PCI_BRIDGE_IO_BASE_LIMIT, 0x000000f0);
+                    pci_config_write(bus, dev, func,
+                                     PCI_BRIDGE_IO_BASE_UPPER, 0);
                 }
+            }
+            pci_init_vmsi(resource);
+            if (resource->msi_cap_off && resource->owner_vmid == 1 &&
+                resource->bus == edu_bus && resource->dev == edu_dev &&
+                resource->func == edu_func) {
+                edu_msi_cap_off = resource->msi_cap_off;
+                edu_msi_max_vectors = 1U <<
+                    ((resource->msi_ctrl & PCI_MSI_CTRL_MMC_MASK) >>
+                     PCI_MSI_CTRL_MMC_SHIFT);
             }
         }
     }
@@ -463,8 +834,24 @@ static int pci_scan_bus(unsigned int bus)
 
 static int pci_enumerate(void)
 {
+    pool_init(&mmio_pool, VIRT_PCIE_MMIO_BASE, VIRT_PCIE_MMIO_SIZE);
+    pool_init(&io_pool, 0, PCI_IO_ALLOC_END);
     if (pci_scan_bus(0) < 0 || !edu_found)
         return -1;
+    INFO("PCI: resource use MMIO=0x%lx I/O=0x%lx",
+         (unsigned long)pool_used(&mmio_pool),
+         (unsigned long)pool_used(&io_pool));
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        struct pci_device_resource *resource = &pci_devices[i];
+        if (resource->msix_cap_off) {
+            uint32_t ctrl = pci_config_read(resource->bus, resource->dev,
+                                            resource->func,
+                                            resource->msix_cap_off);
+            if (ctrl & ((uint32_t)PCI_MSIX_CTRL_ENABLE << 16))
+                WARN("PCI: %02x:%02x.%u physical MSI-X unexpectedly enabled",
+                     resource->bus, resource->dev, resource->func);
+        }
+    }
     for (unsigned int i = 0; i < pci_device_count; i++) {
         struct pci_device_resource *resource = &pci_devices[i];
         if (resource->owner_vmid == 1) {
@@ -604,9 +991,6 @@ void pci_init(void)
         int mme_shift = (msi_ctrl >> PCI_MSI_CTRL_MMC_SHIFT) & 0x7;
         unsigned int max_vectors = 1 << mme_shift;
         edu_msi_max_vectors = max_vectors;
-        edu_vmsi_ctrl = msi_ctrl & 0xffff;
-        edu_vmsi_mask = 0;
-        edu_vmsi_pending = 0;
 
         INFO("PCI: edu MSI cap at 0x%x (%s-bit, max %u vectors)",
              edu_msi_cap_off, is_64bit ? "64" : "32", max_vectors);
@@ -631,8 +1015,12 @@ void pci_init(void)
         pci_config_write(edu_bus, edu_dev, edu_func, data_off,
                          (old & 0xFFFF0000) | (msi_data & 0xFFFF));
 
-        edu_vmsi_addr = msi_addr;
-        edu_vmsi_data = msi_data & 0xffff;
+        struct pci_device_resource *edu_resource =
+            pci_find_resource(edu_bus, edu_dev, edu_func);
+        if (edu_resource) {
+            edu_resource->msi_addr = msi_addr;
+            edu_resource->msi_data = msi_data & 0xffff;
+        }
         if (is_64bit) {
             /* 64 位地址：ADDR_LO 在 0x04，ADDR_HI 在 0x08 */
             pci_config_write(edu_bus, edu_dev, edu_func,
@@ -654,8 +1042,8 @@ void pci_init(void)
         /* Physical MME remains zero; the guest-visible value is virtual. */
         msi_ctrl &= ~(PCI_MSI_CTRL_MME_MASK);
         msi_ctrl |= PCI_MSI_CTRL_EN;
-        edu_vmsi_ctrl = (edu_vmsi_ctrl & ~PCI_MSI_CTRL_EN) |
-                        PCI_MSI_CTRL_EN;
+        edu_resource->msi_ctrl = (edu_resource->msi_ctrl &
+                                  ~PCI_MSI_CTRL_EN) | PCI_MSI_CTRL_EN;
         pci_config_write(edu_bus, edu_dev, edu_func,
                          edu_msi_cap_off + PCI_MSI_CTRL, msi_ctrl);
         unsigned int owned_vectors = max_vectors > 16 ? 16 : max_vectors;
@@ -697,7 +1085,10 @@ static int pci_edu_quiesce(void)
         pci_config_write(edu_bus, edu_dev, edu_func,
                          edu_msi_cap_off + PCI_MSI_CTRL,
                          msi | PCI_MSI_CTRL_EN);
-        edu_vmsi_ctrl &= ~PCI_MSI_CTRL_EN;
+        struct pci_device_resource *resource =
+            pci_find_resource(edu_bus, edu_dev, edu_func);
+        if (resource)
+            resource->msi_ctrl &= ~PCI_MSI_CTRL_EN;
     }
     while (timeout-- &&
            ((get32(edu_bar0 + EDU_REG_STATUS) & 1) ||
@@ -748,10 +1139,16 @@ static int pci_edu_reinit_msi(void)
     uint32_t old_data = pci_config_read(edu_bus, edu_dev, edu_func, data_off);
     pci_config_write(edu_bus, edu_dev, edu_func, data_off,
                      (old_data & 0xffff0000) | (its_get_msi_data(0) & 0xffff));
-    edu_vmsi_addr = msi_addr;
-    edu_vmsi_data = its_get_msi_data(0) & 0xffff;
-    edu_vmsi_ctrl = (edu_vmsi_ctrl & ~PCI_MSI_CTRL_EN) |
-                    PCI_MSI_CTRL_EN;
+    struct pci_device_resource *edu_resource =
+        pci_find_resource(edu_bus, edu_dev, edu_func);
+    if (edu_resource) {
+        edu_resource->msi_addr = msi_addr;
+        edu_resource->msi_data = its_get_msi_data(0) & 0xffff;
+        edu_resource->msi_ctrl = (edu_resource->msi_ctrl &
+            ~PCI_MSI_CTRL_EN) | PCI_MSI_CTRL_EN;
+        edu_resource->msi_mask = 0;
+        edu_resource->msi_pend = 0;
+    }
     pci_config_write(edu_bus, edu_dev, edu_func,
                      edu_msi_cap_off + PCI_MSI_ADDR_LO, (uint32_t)msi_addr);
     if (pci_config_read(edu_bus, edu_dev, edu_func,
@@ -760,7 +1157,8 @@ static int pci_edu_reinit_msi(void)
                          edu_msi_cap_off + PCI_MSI_ADDR_LO + 4,
                          (uint32_t)(msi_addr >> 32));
     pci_config_write(edu_bus, edu_dev, edu_func,
-                     edu_msi_cap_off + data_off, edu_vmsi_data);
+                     edu_msi_cap_off + data_off,
+                     its_get_msi_data(0) & 0xffff);
     uint32_t msi_ctrl = pci_config_read(edu_bus, edu_dev, edu_func,
                                         edu_msi_cap_off + PCI_MSI_CTRL);
     msi_ctrl &= ~(0x7 << PCI_MSI_CTRL_MME_SHIFT);
@@ -861,8 +1259,6 @@ int pci_edu_function_reset(struct task_struct *vm)
                      PCI_CMD_INTX_DIS);
     pci_edu_lpi_base = 0;
     pci_edu_msi_enabled = 0;
-    edu_vmsi_mask = 0;
-    edu_vmsi_pending = 0;
     if (pci_edu_reinit_msi() < 0) {
         WARN("PCI: edu MSI reinitialization failed after reset");
         return -1;
@@ -994,106 +1390,184 @@ rollback:
     return -1;
 }
 
-static uint8_t pci_vmsi_read_byte(unsigned int reg)
+static uint8_t pci_vmsi_read_byte(struct pci_device_resource *resource,
+                                  unsigned int reg)
 {
-    unsigned int off = reg - edu_msi_cap_off;
-    unsigned int addr_size = (edu_vmsi_ctrl & PCI_MSI_CTRL_64BIT) ? 8 : 4;
+    unsigned int off = reg - resource->msi_cap_off;
+    unsigned int addr_size = resource->msi_is_64bit ? 8 : 4;
     unsigned int data_off = 4 + addr_size;
     unsigned int mask_off = data_off + 4;
     unsigned int pend_off = mask_off + 4;
 
     if (off == 0)
-        return (uint8_t)(pci_config_read(edu_bus, edu_dev, edu_func,
-                                         edu_msi_cap_off) & 0xff);
+        return (uint8_t)(pci_config_read(resource->bus, resource->dev,
+                                         resource->func, resource->msi_cap_off) & 0xff);
     if (off == 1)
-        return (uint8_t)(pci_config_read(edu_bus, edu_dev, edu_func,
-                                         edu_msi_cap_off) >> 8);
+        return (uint8_t)(pci_config_read(resource->bus, resource->dev,
+                                         resource->func, resource->msi_cap_off) >> 8);
     if (off == 2)
-            return (uint8_t)edu_vmsi_ctrl;
+        return (uint8_t)resource->msi_ctrl;
     if (off == 3)
-        return (uint8_t)(edu_vmsi_ctrl >> 8);
+        return (uint8_t)(resource->msi_ctrl >> 8);
     if (off >= 4 && off < 4 + addr_size) {
-        uint64_t addr = (edu_vmsi_ctrl & PCI_MSI_CTRL_EN) ?
-                        its_get_msi_address() : edu_vmsi_addr;
+        uint64_t addr = (resource->owner_vmid == 1 &&
+                         resource->bus == edu_bus && resource->dev == edu_dev &&
+                         resource->func == edu_func) ?
+                        its_get_msi_address() : resource->msi_addr;
         return (uint8_t)(addr >> ((off - 4) * 8));
     }
     if (off >= data_off && off < data_off + 2)
-        return (uint8_t)(edu_vmsi_data >> ((off - data_off) * 8));
-    if ((edu_vmsi_ctrl & PCI_MSI_CTRL_MASK) && off >= mask_off &&
+        return (uint8_t)(resource->msi_data >> ((off - data_off) * 8));
+    if (resource->msi_mask_capable && off >= mask_off &&
         off < mask_off + 4)
-        return (uint8_t)(edu_vmsi_mask >> ((off - mask_off) * 8));
-    if ((edu_vmsi_ctrl & PCI_MSI_CTRL_MASK) && off >= pend_off &&
+        return (uint8_t)(resource->msi_mask >> ((off - mask_off) * 8));
+    if (resource->msi_mask_capable && off >= pend_off &&
         off < pend_off + 4)
-        return (uint8_t)(edu_vmsi_pending >> ((off - pend_off) * 8));
-    return (uint8_t)(pci_config_read(edu_bus, edu_dev, edu_func, reg) & 0xff);
+        return (uint8_t)(resource->msi_pend >> ((off - pend_off) * 8));
+    return pci_config_read(resource->bus, resource->dev, resource->func,
+                           reg & ~3U) >> ((reg & 3U) * 8);
 }
 
-static void pci_vmsi_write_byte(unsigned int reg, uint8_t value)
+static void pci_vmsi_write_byte(struct pci_device_resource *resource,
+                                unsigned int reg, uint8_t value)
 {
-    unsigned int off = reg - edu_msi_cap_off;
-    unsigned int addr_size = (edu_vmsi_ctrl & PCI_MSI_CTRL_64BIT) ? 8 : 4;
+    unsigned int off = reg - resource->msi_cap_off;
+    unsigned int addr_size = resource->msi_is_64bit ? 8 : 4;
     unsigned int data_off = 4 + addr_size;
     unsigned int mask_off = data_off + 4;
 
     if (off == 2) {
-        edu_vmsi_ctrl = (edu_vmsi_ctrl & ~PCI_MSI_CTRL_EN) |
-                        (value & PCI_MSI_CTRL_EN);
-        uint32_t physical = pci_config_read(edu_bus, edu_dev, edu_func,
-                                             edu_msi_cap_off + PCI_MSI_CTRL);
-        pci_config_write(edu_bus, edu_dev, edu_func,
-                         edu_msi_cap_off + PCI_MSI_CTRL,
-                         physical | PCI_MSI_CTRL_EN);
+        resource->msi_ctrl = (resource->msi_ctrl & ~PCI_MSI_CTRL_EN) |
+                             (value & PCI_MSI_CTRL_EN);
+        uint32_t physical = pci_config_read(resource->bus, resource->dev,
+                                             resource->func,
+                                             resource->msi_cap_off + PCI_MSI_CTRL);
+        if (value & PCI_MSI_CTRL_EN)
+            physical |= PCI_MSI_CTRL_EN;
+        else
+            physical &= ~PCI_MSI_CTRL_EN;
+        pci_config_write(resource->bus, resource->dev, resource->func,
+                         resource->msi_cap_off + PCI_MSI_CTRL, physical);
         return;
     }
     if (off == 3) {
         unsigned int mme = (value >> 4) & 0x7;
-        unsigned int mmc = (edu_vmsi_ctrl & PCI_MSI_CTRL_MMC_MASK) >>
+        unsigned int mmc = (resource->msi_ctrl & PCI_MSI_CTRL_MMC_MASK) >>
                            PCI_MSI_CTRL_MMC_SHIFT;
         if (mme > mmc)
             mme = mmc;
-        edu_vmsi_ctrl = (edu_vmsi_ctrl & ~PCI_MSI_CTRL_MME_MASK) |
-                        (mme << PCI_MSI_CTRL_MME_SHIFT);
+        resource->msi_ctrl = (resource->msi_ctrl & ~PCI_MSI_CTRL_MME_MASK) |
+                             (mme << PCI_MSI_CTRL_MME_SHIFT);
         return;
     }
     if (off >= 4 && off < 4 + addr_size) {
         unsigned int shift = (off - 4) * 8;
         uint64_t mask = 0xffULL << shift;
-        edu_vmsi_addr = (edu_vmsi_addr & ~mask) | ((uint64_t)value << shift);
+        resource->msi_addr = (resource->msi_addr & ~mask) |
+                             ((uint64_t)value << shift);
         return;
     }
     if (off >= data_off && off < data_off + 2) {
         unsigned int shift = (off - data_off) * 8;
-        edu_vmsi_data = (edu_vmsi_data & ~(0xffU << shift)) |
-                        ((uint16_t)value << shift);
-        pci_config_write(edu_bus, edu_dev, edu_func,
-                         edu_msi_cap_off + data_off, edu_vmsi_data);
+        resource->msi_data = (resource->msi_data & ~(0xffU << shift)) |
+                             ((uint16_t)value << shift);
+        pci_config_write(resource->bus, resource->dev, resource->func,
+                         resource->msi_cap_off + data_off,
+                         resource->msi_data);
         return;
     }
-    if ((edu_vmsi_ctrl & PCI_MSI_CTRL_MASK) && off >= mask_off &&
+    if (resource->msi_mask_capable && off >= mask_off &&
         off < mask_off + 4) {
         unsigned int shift = (off - mask_off) * 8;
-        edu_vmsi_mask = (edu_vmsi_mask & ~(0xffU << shift)) |
-                        ((uint32_t)value << shift);
+        resource->msi_mask = (resource->msi_mask & ~(0xffU << shift)) |
+                             ((uint32_t)value << shift);
+        uint32_t physical = pci_config_read(resource->bus, resource->dev,
+                                            resource->func,
+                                            resource->msi_cap_off + mask_off);
+        physical = (physical & ~(0xffU << shift)) |
+                   ((uint32_t)value << shift);
+        pci_config_write(resource->bus, resource->dev, resource->func,
+                         resource->msi_cap_off + mask_off, physical);
     }
 }
 
-static int pci_vmsi_access(unsigned int reg, unsigned int size, int write,
+static int pci_vmsi_access(struct pci_device_resource *resource,
+                           unsigned int reg, unsigned int size, int write,
                            uint64_t *value)
 {
-    unsigned int data_off = 4 +
-        ((edu_vmsi_ctrl & PCI_MSI_CTRL_64BIT) ? 8 : 4);
-    unsigned int length = (edu_vmsi_ctrl & PCI_MSI_CTRL_MASK) ?
+    unsigned int data_off = 4 + (resource->msi_is_64bit ? 8 : 4);
+    unsigned int length = resource->msi_mask_capable ?
                           data_off + 12 : data_off + 4;
-    if (!edu_msi_cap_off || reg < edu_msi_cap_off ||
-        reg + size > edu_msi_cap_off + length)
+    if (!resource->msi_cap_off || reg < resource->msi_cap_off ||
+        reg + size > resource->msi_cap_off + length)
         return 0;
     if (write) {
         for (unsigned int i = 0; i < size; i++)
-            pci_vmsi_write_byte(reg + i, (*value >> (i * 8)) & 0xff);
+            pci_vmsi_write_byte(resource, reg + i,
+                                (*value >> (i * 8)) & 0xff);
     } else {
         *value = 0;
         for (unsigned int i = 0; i < size; i++)
-            *value |= (uint64_t)pci_vmsi_read_byte(reg + i) << (i * 8);
+            *value |= (uint64_t)pci_vmsi_read_byte(resource, reg + i) <<
+                      (i * 8);
+    }
+    return 1;
+}
+
+static uint8_t pci_msix_read_byte(struct pci_device_resource *resource,
+                                  unsigned int reg)
+{
+    unsigned int off = reg - resource->msix_cap_off;
+    if (off < 2)
+        return (pci_config_read(resource->bus, resource->dev, resource->func,
+                                reg & ~3U) >> ((reg & 3U) * 8)) & 0xff;
+    if (off == 2)
+        return resource->msix_ctrl & 0xff;
+    if (off == 3)
+        return resource->msix_ctrl >> 8;
+    if (off >= 4 && off < 12)
+        return pci_config_read(resource->bus, resource->dev, resource->func,
+                               reg & ~3U) >> ((reg & 3U) * 8);
+    return 0xff;
+}
+
+static void pci_msix_write_byte(struct pci_device_resource *resource,
+                                unsigned int reg, uint8_t value)
+{
+    unsigned int off = reg - resource->msix_cap_off;
+    if (off == 2)
+        return;
+    if (off == 3) {
+        uint16_t writable = ((uint16_t)value << 8) &
+            (PCI_MSIX_CTRL_ENABLE | PCI_MSIX_CTRL_FUNC_MASK);
+        resource->msix_ctrl =
+            (resource->msix_ctrl & ~(PCI_MSIX_CTRL_ENABLE |
+                                     PCI_MSIX_CTRL_FUNC_MASK)) | writable;
+        uint32_t physical = pci_config_read(resource->bus, resource->dev,
+                                             resource->func,
+                                             resource->msix_cap_off);
+        physical &= ~((uint32_t)PCI_MSIX_CTRL_ENABLE << 16);
+        pci_config_write(resource->bus, resource->dev, resource->func,
+                         resource->msix_cap_off, physical);
+    }
+}
+
+static int pci_msix_access(struct pci_device_resource *resource,
+                           unsigned int reg, unsigned int size, int write,
+                           uint64_t *value)
+{
+    if (!resource->msix_cap_off || reg < resource->msix_cap_off ||
+        reg + size > resource->msix_cap_off + 12)
+        return 0;
+    if (write) {
+        for (unsigned int i = 0; i < size; i++)
+            pci_msix_write_byte(resource, reg + i,
+                                (*value >> (i * 8)) & 0xff);
+    } else {
+        *value = 0;
+        for (unsigned int i = 0; i < size; i++)
+            *value |= (uint64_t)pci_msix_read_byte(resource, reg + i) <<
+                      (i * 8);
     }
     return 1;
 }
@@ -1153,8 +1627,13 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
         return 1;
     }
     if (!write) {
-        if (resource == pci_find_resource(edu_bus, edu_dev, edu_func) &&
-            pci_vmsi_access(reg, size, 0, value))
+        if (pci_msix_access(resource, reg, size, 0, value))
+            return 1;
+        if (resource->msix_cap_off && reg < resource->msix_cap_off + 12 &&
+            reg + size > resource->msix_cap_off)
+            return 1;
+        if (resource->msi_cap_off &&
+            pci_vmsi_access(resource, reg, size, 0, value))
             return 1;
         *value = pci_config_read_width(bus, dev, func, reg, size);
         return 1;
@@ -1164,8 +1643,13 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
     if (reg < PCI_BAR0 + PCI_MAX_BARS * 4 &&
         reg + size > PCI_BAR0)
         return 1;
-    if (resource == pci_find_resource(edu_bus, edu_dev, edu_func) &&
-        pci_vmsi_access(reg, size, 1, value))
+    if (pci_msix_access(resource, reg, size, 1, value))
+        return 1;
+    if (resource->msix_cap_off && reg < resource->msix_cap_off + 12 &&
+        reg + size > resource->msix_cap_off)
+        return 1;
+    if (resource->msi_cap_off &&
+        pci_vmsi_access(resource, reg, size, 1, value))
         return 1;
     if (reg < PCI_CFG_COMMAND + 2 && reg + size > PCI_CFG_COMMAND) {
         uint32_t command = pci_config_read(bus, dev, func, PCI_CFG_COMMAND);

@@ -14,6 +14,8 @@
 
 struct task_struct;
 
+#define PCI_BAR_PREFETCH 0x8U
+
 /* 初始化 PCI：枚举 edu、编程 BAR0、使能 memory/bus master、路由并使能 INTx */
 void pci_init(void);
 

@@ -1,0 +1,27 @@
+Phase 114 PCI resource pools and prefetch bridge windows
+
+Build:
+- Command: make -f Makefile.virt -j2
+- Result: PASS; kernel linked successfully.
+
+Default QEMU topology:
+- Command: timeout 65 make -f Makefile.virt run-log QEMU_SERIAL_LOG=/tmp/avisor-phase114-final-basic.log
+- virtio-net BAR4 0x4000 and BAR1 0x1000 allocated from MMIO pool; its I/O BAR0 size 0x20 received port 0.
+- edu BAR0 allocated at 0x10100000; pool usage MMIO=0x105000, I/O=0x20.
+- Both guest virtio-net loopback suites passed. edu liveness, factorial(10)=3628800, function reset and MSI reinitialization passed.
+- QEMU terminated by timeout as expected.
+
+Nested bridge topology:
+- Command: timeout 75 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=off -cpu max -smp 2 -m 1G -device edu,bus=pcie.0,addr=0x3 -device pci-bridge,id=br1,bus=pcie.0,addr=0x4,chassis_nr=1 -device pci-bridge,id=br2,bus=br1,addr=0x1,chassis_nr=2 -device e1000,bus=br2,addr=0x2 -kernel bin_virt/kernel8.img -display none -monitor none -serial file:/tmp/avisor-phase114-final-nested.log
+- Recursive enumeration reached bus 2 and allocated e1000 BAR0 MMIO 0x20000 plus BAR1 I/O 0x40.
+- Both bridges configured MMIO and I/O windows; no window mismatch, allocation failure, rollback warning, PANIC or ASSERT appeared.
+- QEMU terminated by timeout as expected.
+
+Additional checks:
+- pci.c compiled as part of the virt build. Standalone compile also succeeded with pre-existing macro redefinition and MSI-X signedness warnings.
+- git diff --check passed for pci.c and pci.h before final documentation edits.
+- Root `make -j2` is not the virt target and remains blocked by existing `boot.S` assembler errors for `UL` literal suffixes.
+
+Coverage limits:
+- The available QEMU topologies have no prefetchable BAR, so the prefetch bridge register write/readback path was not exercised by hardware emulation.
+- Pool exhaustion and recursive scan failure were not injected; rollback paths were not runtime fault-injection tested.
