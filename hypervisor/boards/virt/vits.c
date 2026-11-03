@@ -231,10 +231,10 @@ static void vits_cmd_mapd(struct vits_state *vits, uint64_t cmd[4])
  * 处理：
  *   1. 分配一个物理 LPI 号（从 next_alloc_plpi 递增）
  *   2. 建立 pLPI → (vmid, vINTID) 映射
- *   3. 向物理 ITS 发 MAPTI 命令（使用物理 DevID + 分配的 pLPI）
- *   4. 配置 LPI 属性表（优先级 + 使能）
+ *   4. 配置 LPI 属性表并等待物理 ITS MAPTI 完成
+ *   5. 物理完成后提交 vITS shadow mapping
  */
-static void vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
+static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
 {
     uint32_t vdevid = (uint32_t)(cmd[0] >> 32);
     uint32_t veventid = (uint32_t)(cmd[1] & 0xFFFFFFFFULL);
@@ -247,7 +247,24 @@ static void vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
     if (!vits->vm || vits->vm->vmid != 1 ||
         !pci_edu_owns_requester(vdevid)) {
         WARN("vITS: MAPTI rejected for unowned requester %u", vdevid);
-        return;
+        return -1;
+    }
+    if (veventid == 0) {
+        unsigned int plpi = pci_edu_lpi_base;
+        if (!plpi || irq_domain_register(plpi, vits->vm->vmid, 0,
+                                         vintid) < 0)
+            return -1;
+        lpi_map[plpi - LPI_MAP_BASE].vmid = (uint16_t)vits->vm->vmid;
+        lpi_map[plpi - LPI_MAP_BASE].vintid = vintid;
+        if (vits_lpi_audit_owned_range(plpi, 1, vits->vm->vmid,
+                                       vintid) < 0) {
+            irq_domain_unregister_owned(plpi, vits->vm->vmid);
+            lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
+            lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
+            return -1;
+        }
+        INFO("vITS: MAPTI uses PCI MSI LPI %u for event 0", plpi);
+        return 0;
     }
 
     /*
@@ -265,105 +282,48 @@ static void vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
     /* 分配物理 LPI */
     if (next_alloc_plpi >= LPI_MAP_BASE + LPI_MAP_MAX) {
         WARN("vITS: no free physical LPI");
-        return;
+        return -1;
     }
     unsigned int plpi = next_alloc_plpi++;
 
     /* 记录映射 */
     if (irq_domain_register(plpi, vits->vm->vmid, 0, vintid) < 0) {
         WARN("vITS: LPI ownership registration failed for %u", plpi);
-        return;
-    }
-    lpi_map[plpi - LPI_MAP_BASE].vmid = (uint16_t)vits->vm->vmid;
-    lpi_map[plpi - LPI_MAP_BASE].vintid = vintid;
-
-    /*
-     * 配置物理 LPI 属性表 + 下发物理 MAPTI 命令。
-     *
-     * 注意：物理 ITS 的设备表已经有该 devid 的条目（Phase 8 MAPD 过了），
-     * 且 collection 0 也存在。直接发 MAPTI 即可。
-     *
-     * 但 its_setup_pci_msi() 已经用了 LPI 8192..8207 给 edu 的 16 个 vector。
-     * 我们现在分配的新 LPI 需要走完整的 MAPTI 路径。
-     *
-     * 为了避免重复造轮子，这里直接调用 its_send_cmd 的等价功能。
-     * 但 its.c 里的 its_send_cmd 是 static 的...
-     * 解决：直接读写物理 ITS 寄存器，发命令。
-     */
-
-    /* 物理 DevID = vDevID（直通场景，设备唯一） */
-    uint32_t pdevid = vdevid;
-    if (veventid == 0) {
-        unsigned int base = pci_edu_lpi_base;
-        unsigned int plpi_event = base + veventid;
-        if (!base || irq_domain_register(plpi_event, vits->vm->vmid, 0,
-                                         vintid) < 0) {
-            WARN("vITS: MSI event route registration failed");
-            return;
-        }
-        lpi_map[plpi_event - LPI_MAP_BASE].vmid =
-            (uint16_t)vits->vm->vmid;
-        lpi_map[plpi_event - LPI_MAP_BASE].vintid = vintid;
-        INFO("vITS: MAPTI uses PCI MSI LPI %u for event %u",
-             plpi_event, veventid);
-        return;
+        next_alloc_plpi--;
+        return -1;
     }
 
-    /*
-     * 1. 配置 LPI 属性表
-     *    （属性表基址在 its.c 里是 static 的，我们需要拿到它...
-     *     简化：直接读写 GICR PROPBASER 拿到基址。
-     *     或者：调用 its.c 暴露的接口。）
-     *
-     * 更好的方式：把 LPI 配置做成 its 层的公开 API。
-     * 先这样：从 GICR_PROPBASER 读出来。
-     */
     {
         uint64_t gicr = gic_get_redist_base(0);
         uint64_t propbaser = get64(gicr + 0x0070);
         uint64_t prop_base = propbaser & 0x000FFFFFFFFFF000ULL;
-
-        /* LPI 优先级 + 使能 */
         volatile uint8_t *cfg =
             (volatile uint8_t *)(uintptr_t)(prop_base + (plpi - LPI_MAP_BASE));
-        *cfg = 0x60 | 0x01;  /* prio=0x60, enable=1 */
+        *cfg = 0x60 | 0x01;
     }
+    asm volatile("dsb sy" ::: "memory");
 
-    /*
-     * 2. 发物理 MAPTI 命令
-     *    因为 its_send_cmd 是 static 的，我们这里复制一份实现？
-     *    不好。改为：在 its.h 增加一个 its_send_mapti 接口。
-     *
-     * 临时方案（MVP）：直接操作物理 ITS 寄存器，写命令到命令队列。
-     * 命令队列基址从 GITS_CBASER 读。
-     */
-    {
-        uint64_t cbaser = get64(0x08080000 + 0x0080);  /* GITS_CBASER */
-        uint64_t cmdq_pa = cbaser & 0x000FFFFFFFFFF000ULL;
-        uint64_t cwriter = get64(0x08080000 + 0x0088); /* GITS_CWRITER */
-
-        uint64_t *slot = (uint64_t *)(uintptr_t)(cmdq_pa + cwriter);
-        slot[0] = 0x0A | ((uint64_t)pdevid << 32);  /* MAPTI + DeviceID */
-        slot[1] = ((uint64_t)plpi << 32) | veventid; /* pINTID + EventID */
-        slot[2] = 0;  /* ICID = 0 */
-        slot[3] = 0;
-        asm volatile("dsb sy" ::: "memory");
-
-        cwriter += 32;
-        if (cwriter >= PAGE_SIZE)
-            cwriter = 0;
-        put64(0x08080000 + 0x0088, cwriter);
-
-        /* 等处理完成（CREADR == CWRITER） */
-        int timeout = 1000000;
-        while (get64(0x08080000 + 0x0090) != cwriter && --timeout > 0)
-            ;
-        if (timeout == 0)
-            WARN("vITS: physical MAPTI timeout");
+    if (its_send_mapti(vdevid, plpi, veventid, vicid) < 0) {
+        irq_domain_unregister_owned(plpi, vits->vm->vmid);
+        next_alloc_plpi--;
+        WARN("vITS: physical MAPTI failed, software route rolled back");
+        return -1;
+    }
+    lpi_map[plpi - LPI_MAP_BASE].vmid = (uint16_t)vits->vm->vmid;
+    lpi_map[plpi - LPI_MAP_BASE].vintid = vintid;
+    if (vits_lpi_audit_owned_range(plpi, 1, vits->vm->vmid,
+                                   vintid) < 0) {
+        irq_domain_unregister_owned(plpi, vits->vm->vmid);
+        lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
+        lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
+        next_alloc_plpi--;
+        WARN("vITS: MAPTI mapping audit failed; route rolled back");
+        return -1;
     }
 
     INFO("vITS: MAPTI done: vINTID=%u -> pLPI=%u (vmid=%u)",
          vintid, plpi, (unsigned)vits->vm->vmid);
+    return 0;
 }
 
 /*
@@ -389,7 +349,8 @@ static int vits_process_one(struct vits_state *vits, uint64_t offset)
         vits_cmd_mapd(vits, cmd);
         break;
     case VITS_CMD_MAPTI:
-        vits_cmd_mapti(vits, cmd);
+        if (vits_cmd_mapti(vits, cmd) < 0)
+            return -1;
         break;
     default:
         WARN("vITS: unknown command opcode 0x%02x", opcode);
@@ -408,86 +369,16 @@ static void vits_process_cmdq(struct vits_state *vits)
     uint64_t cr = vits->creadr;
 
     while (cr != cw) {
-        vits_process_one(vits, cr);
+        if (vits_process_one(vits, cr) < 0)
+            WARN("vITS: command at 0x%lx failed; advancing CREADR",
+                 (unsigned long)cr);
 
         cr += VITS_CMD_SIZE;
         if (cr >= vits->cmdq_bytes)
             cr = 0;
     }
 
-    /* 更新 CREADR = CWRITER（同步处理，读完了） */
     vits->creadr = cw;
-}
-
-/* ---------- MMIO 读 ---------- */
-
-/*
- * MMIO 读可能是 32 位或 64 位的。
- * Guest 可能分两次读 64 位寄存器（先读低 32 位，再读高 32 位）。
- * 我们把 offset 向下对齐到 8 字节，根据偏移判断是高/低 32 位。
- */
-uint64_t vits_mmio_read(struct vits_state *vits, uint32_t offset)
-{
-    uint32_t reg_off = offset & ~7;  /* 对齐到 8 字节 */
-    int hi_word = (offset & 4) ? 1 : 0;
-    uint64_t val = 0;
-
-    switch (reg_off) {
-    case VITS_CTLR:
-        val = vits->ctlr;
-        break;
-
-    case VITS_TYPER:
-        /*
-         * 简化的 TYPER 值：
-         *   bit0 = 1 (ITTyPIS, IMPDEF)
-         *   bit4 = 1 (CIL, collection is level-triggered)
-         *   bit12 = 1 (Physical LPI supported)
-         *   bits[10:8] = CIDbits=7 (256 collections)
-         *   bits[21:17] = DevBits=7 (256 devices)
-         *   bits[25:22] = IDBits=11 (4096 LPIs per device)
-         *   = 0x00A10E11
-         */
-        val = 0x00A10E11ULL;
-        break;
-
-    case VITS_CBASER:
-        val = vits->cbaser;
-        break;
-
-    case VITS_CWRITER:
-        val = vits->cwriter;
-        break;
-
-    case VITS_CREADR:
-        val = vits->creadr;
-        break;
-
-    case VITS_BASER(0):
-    case VITS_BASER(1):
-    case VITS_BASER(2):
-    case VITS_BASER(3):
-    case VITS_BASER(4):
-    case VITS_BASER(5):
-    case VITS_BASER(6):
-    case VITS_BASER(7): {
-        int n = (reg_off - VITS_BASER(0)) / 8;
-        val = vits->baser[n];
-        break;
-    }
-
-    case VITS_TRANSLATER:
-        val = 0;  /* WO，读返回 0 */
-        break;
-
-    default:
-        WARN("vITS: unknown read offset 0x%x", offset);
-        return 0;
-    }
-
-    if (hi_word)
-        return (val >> 32) & 0xFFFFFFFFULL;
-    return val & 0xFFFFFFFFULL;
 }
 
 /* ---------- MMIO 写 ---------- */
@@ -584,18 +475,7 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
     }
 
     case VITS_TRANSLATER:
-        /*
-         * Guest 写 MSI doorbell（EventID）。
-         * 但在直通场景下，是设备（如 edu）发起 MSI，不是 Guest 直接写。
-         * Guest 写 TRANSLATER 通常用于触发软件 MSI，这里忽略。
-         *
-         * 注意：真实的 MSI 路径是：
-         *   设备写 GITS_TRANSLATER（物理地址）
-         *   → 物理 ITS 翻译 → 物理 LPI → EL2 中断
-         *   → vits_lpi_to_virq 查表 → 注入 vINTID
-         *
-         * 所以这里不需要处理。
-         */
+        /* Guest software doorbell writes are ignored for passthrough devices. */
         break;
 
     default:
@@ -669,4 +549,56 @@ int vits_lpi_to_virq(unsigned int plpi, unsigned int *out_vmid,
     *out_vmid = (unsigned int)route.vmid;
     *out_vintid = route.vintid;
     return 0;
+}
+
+/* ---------- MMIO 读 ---------- */
+
+/*
+ * MMIO 读可能是 32 位或 64 位的。
+ * Guest 可能分两次读 64 位寄存器（先读低 32 位，再读高 32 位）。
+ * 我们把 offset 向下对齐到 8 字节，根据偏移判断是高/低 32 位。
+ */
+uint64_t vits_mmio_read(struct vits_state *vits, uint32_t offset)
+{
+    uint32_t reg_off = offset & ~7;
+    int hi_word = (offset & 4) ? 1 : 0;
+    uint64_t val = 0;
+
+    switch (reg_off) {
+    case VITS_CTLR:
+        val = vits->ctlr;
+        break;
+    case VITS_TYPER:
+        val = 0x00A10E11ULL;
+        break;
+    case VITS_CBASER:
+        val = vits->cbaser;
+        break;
+    case VITS_CWRITER:
+        val = vits->cwriter;
+        break;
+    case VITS_CREADR:
+        val = vits->creadr;
+        break;
+    case VITS_BASER(0):
+    case VITS_BASER(1):
+    case VITS_BASER(2):
+    case VITS_BASER(3):
+    case VITS_BASER(4):
+    case VITS_BASER(5):
+    case VITS_BASER(6):
+    case VITS_BASER(7):
+        val = vits->baser[(reg_off - VITS_BASER(0)) / 8];
+        break;
+    case VITS_TRANSLATER:
+        val = 0;
+        break;
+    default:
+        WARN("vITS: unknown read offset 0x%x", offset);
+        return 0;
+    }
+
+    if (hi_word)
+        return (val >> 32) & 0xFFFFFFFFULL;
+    return val & 0xFFFFFFFFULL;
 }

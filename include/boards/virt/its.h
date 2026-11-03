@@ -52,6 +52,8 @@ unsigned int its_setup_pci_msi(unsigned int bus, unsigned int dev,
                                unsigned int target_cpu);
 int its_teardown_pci_msi(unsigned int devid, unsigned int lpi_base,
                          unsigned int num_vectors);
+int its_send_mapti(unsigned int devid, unsigned int lpi,
+                   unsigned int eventid, unsigned int collection);
 
 /* MSI 消息地址：GITS_TRANSLATER 的物理地址（写入 PCI MSI Capability） */
 uint64_t its_get_msi_address(void);

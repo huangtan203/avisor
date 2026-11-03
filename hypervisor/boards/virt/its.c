@@ -158,6 +158,14 @@ static int its_send_cmd(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3)
     return 0;
 }
 
+int its_send_mapti(unsigned int devid, unsigned int lpi,
+                   unsigned int eventid, unsigned int collection)
+{
+    return its_send_cmd(ITS_CMD_MAPTI | ((uint64_t)devid << 32),
+                        ((uint64_t)lpi << 32) | eventid,
+                        collection, 0);
+}
+
 /* ---------- 对外接口 ---------- */
 
 /*

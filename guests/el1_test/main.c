@@ -3969,6 +3969,9 @@ static void vits_test(void)
     vits_mapd((u32)edu_requester_id + 1, (u64)vits_itt_buf, 3);
     vits_mapti((u32)edu_requester_id + 1, 1, VITS_TEST_VLPI + 1, 0);
 
+    /* 物理 MAPTI 完成前不得发布软件 route/shadow mapping。 */
+    vits_mapti((u32)edu_requester_id, 2, VITS_TEST_VLPI + 1, 0);
+
     /* 4. MAPTI: eventid=1 -> vLPI=VITS_TEST_VLPI, icid=0
      * 用 eventid=1 避免和 Phase 8 已配置的 eventid=0 冲突 */
     vits_mapti((u32)edu_requester_id, 1, VITS_TEST_VLPI, 0);
