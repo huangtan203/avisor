@@ -480,15 +480,24 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
         break;
     }
 
-    case VITS_CWRITER:
-        /* 写 CWRITER = Guest 提交了新命令，需要处理 */
-        vits->cwriter = val & 0x000FFFFFULL;  /* OFFSET [19:0] */
+    case VITS_CWRITER: {
+        uint64_t new_cwriter = val & 0x000FFFFFULL;  /* OFFSET [19:0] */
+
+        if (!vits->cmdq_bytes || new_cwriter >= vits->cmdq_bytes ||
+            new_cwriter % VITS_CMD_SIZE) {
+            WARN("vITS: reject invalid CWRITER=0x%lx size=%u",
+                 (unsigned long)new_cwriter, vits->cmdq_bytes);
+            break;
+        }
+
+        /* 发布有效 CWRITER 后，enabled 状态同步处理新命令。 */
+        vits->cwriter = new_cwriter;
         INFO("vITS: CWRITER = 0x%lx", (unsigned long)vits->cwriter);
 
-        if (vits->ctlr & 0x1) {
+        if (vits->ctlr & 0x1)
             vits_process_cmdq(vits);
-        }
         break;
+    }
 
     case VITS_CREADR:
         /* Guest 写 CREADR？一般不写。忽略。 */
