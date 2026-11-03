@@ -66,6 +66,30 @@ struct lpi_map_entry {
 };
 
 static struct lpi_map_entry lpi_map[LPI_MAP_MAX];
+static volatile unsigned int lpi_map_lock;
+
+static void lpi_map_acquire(void)
+{
+    unsigned int value, failed;
+
+    for (;;) {
+        asm volatile("1: ldaxr %w0, [%2]\n"
+                     "cbnz %w0, 1b\n"
+                     "mov %w0, #1\n"
+                     "stxr %w1, %w0, [%2]\n"
+                     "cbnz %w1, 1b\n"
+                     : "=&r"(value), "=&r"(failed)
+                     : "r"(&lpi_map_lock)
+                     : "memory");
+        if (!failed)
+            return;
+    }
+}
+
+static void lpi_map_release(void)
+{
+    asm volatile("stlr wzr, [%0]" :: "r"(&lpi_map_lock) : "memory");
+}
 
 /* 下一个可分配的物理 LPI（从 9000 开始，避开 Phase 8 的 edu 8192..8207） */
 static volatile unsigned int next_alloc_plpi = 9000;
@@ -99,6 +123,7 @@ static int vits_reserve_plpi(unsigned int *plpi)
 
 void vits_global_init(void)
 {
+    lpi_map_lock = 0;
     for (int i = 0; i < LPI_MAP_MAX; i++) {
         lpi_map[i].vmid = 0;
         lpi_map[i].vintid = 0;
@@ -319,13 +344,17 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
         if (!plpi || irq_domain_register(plpi, vits->vm->vmid, 0,
                                          vintid) < 0)
             return -1;
+        lpi_map_acquire();
         lpi_map[plpi - LPI_MAP_BASE].vmid = (uint16_t)vits->vm->vmid;
         lpi_map[plpi - LPI_MAP_BASE].vintid = vintid;
+        lpi_map_release();
         if (vits_lpi_audit_owned_range(plpi, 1, vits->vm->vmid,
                                        vintid) < 0) {
             irq_domain_unregister_owned(plpi, vits->vm->vmid);
+            lpi_map_acquire();
             lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
             lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
+            lpi_map_release();
             return -1;
         }
         INFO("vITS: MAPTI uses PCI MSI LPI %u for event 0", plpi);
@@ -372,13 +401,17 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
         WARN("vITS: physical MAPTI failed, software route rolled back");
         return -1;
     }
+    lpi_map_acquire();
     lpi_map[plpi - LPI_MAP_BASE].vmid = (uint16_t)vits->vm->vmid;
     lpi_map[plpi - LPI_MAP_BASE].vintid = vintid;
+    lpi_map_release();
     if (vits_lpi_audit_owned_range(plpi, 1, vits->vm->vmid,
                                    vintid) < 0) {
         irq_domain_unregister_owned(plpi, vits->vm->vmid);
+        lpi_map_acquire();
         lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
         lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
+        lpi_map_release();
         WARN("vITS: MAPTI mapping audit failed; route rolled back");
         return -1;
     }
@@ -601,8 +634,10 @@ int vits_lpi_revoke_owned(unsigned int plpi, unsigned long vmid)
     if (plpi < LPI_MAP_BASE || plpi >= LPI_MAP_BASE + LPI_MAP_MAX ||
         irq_domain_unregister_owned(plpi, vmid) < 0)
         return -1;
+    lpi_map_acquire();
     lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
     lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
+    lpi_map_release();
     return 0;
 }
 
@@ -613,10 +648,12 @@ int vits_lpi_revoke_range_owned(unsigned int first_plpi,
         count > LPI_MAP_BASE + LPI_MAP_MAX - first_plpi ||
         irq_domain_unregister_owned_range(first_plpi, count, vmid) < 0)
         return -1;
+    lpi_map_acquire();
     for (unsigned int i = 0; i < count; i++) {
         lpi_map[first_plpi + i - LPI_MAP_BASE].vmid = 0;
         lpi_map[first_plpi + i - LPI_MAP_BASE].vintid = 0;
     }
+    lpi_map_release();
     return 0;
 }
 
@@ -627,12 +664,19 @@ int vits_lpi_audit_owned_range(unsigned int first_plpi,
     if (!count || first_plpi < LPI_MAP_BASE ||
         count > LPI_MAP_BASE + LPI_MAP_MAX - first_plpi)
         return -1;
+    int shadow_valid = 1;
+    lpi_map_acquire();
     for (unsigned int i = 0; i < count; i++) {
         struct lpi_map_entry *entry =
             &lpi_map[first_plpi + i - LPI_MAP_BASE];
-        if (entry->vmid != vmid || entry->vintid != first_vintid + i)
-            return -1;
+        if (entry->vmid != vmid || entry->vintid != first_vintid + i) {
+            shadow_valid = 0;
+            break;
+        }
     }
+    lpi_map_release();
+    if (!shadow_valid)
+        return -1;
     return irq_domain_audit_owned_range(first_plpi, count, vmid,
                                         first_vintid);
 }
