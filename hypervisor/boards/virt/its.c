@@ -67,6 +67,7 @@ static paddr_t ct_pa;        /* 集合表（BASER1） */
 static paddr_t lpi_prop_pa;  /* LPI 配置表 */
 static paddr_t lpi_pend_pa;  /* LPI 挂起表 */
 static unsigned int cq_byte_off;  /* 命令队列写偏移（字节） */
+static int cq_stalled;
 
 #define ITS_PCI_LPI_LIMIT 9000
 #define ITS_MSI_MAX_ALLOCATIONS 16
@@ -132,6 +133,11 @@ static void its_free_lpi_range(unsigned int lpi_base,
  */
 static int its_send_cmd(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3)
 {
+    if (cq_stalled) {
+        WARN("ITS: command queue is stalled; rejecting command");
+        return -1;
+    }
+
     uint64_t *slot = (uint64_t *)(uintptr_t)cmdq_pa + (cq_byte_off / 8);
 
     slot[0] = d0;
@@ -151,7 +157,8 @@ static int its_send_cmd(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3)
     while (get64(GITS_CREADR) != cq_byte_off && --timeout > 0)
         ;
     if (timeout == 0) {
-        WARN("ITS: command queue stalled (CWR=%u CRR=%lu)",
+        cq_stalled = 1;
+        WARN("ITS: command queue stalled (CWR=%u CRR=%lu); future commands rejected",
              cq_byte_off, (unsigned long)get64(GITS_CREADR));
         return -1;
     }
@@ -377,6 +384,8 @@ void its_init(void)
      * 2. 分配 ITS 的三张表 + 命令队列。
      *    allocate_page() 已把页面清零。
      */
+    cq_byte_off = 0;
+    cq_stalled = 0;
     cmdq_pa = (paddr_t)(uintptr_t)allocate_page();
     dt_pa   = (paddr_t)(uintptr_t)allocate_page();
     ct_pa   = (paddr_t)(uintptr_t)allocate_page();
