@@ -444,12 +444,18 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
     }
 
     switch (reg_off) {
-    case VITS_CTLR:
+    case VITS_CTLR: {
+        uint32_t old_ctlr = vits->ctlr;
+
         for (unsigned int i = 0; i < ARRAY_SIZE(vits->write_lo_valid); i++)
             vits->write_lo_valid[i] = 0;
         vits->ctlr = val32 & 0x1;  /* 只保留 Enabled 位 */
         INFO("vITS: CTLR = %u", vits->ctlr);
+        if (!(old_ctlr & 0x1) && (vits->ctlr & 0x1) &&
+            vits->creadr != vits->cwriter)
+            vits_process_cmdq(vits);
         break;
+    }
 
     case VITS_CBASER: {
         if (vits->ctlr & 0x1) {
