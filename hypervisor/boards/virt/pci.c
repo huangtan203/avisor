@@ -1967,11 +1967,12 @@ int pci_edu_vm_reset(struct task_struct *vm)
         irq_domain_unregister(pci_edu_intx_irq);
     }
     if (pci_edu_lpi_base) {
-        its_teardown_pci_msi(pci_edu_requester_id(), pci_edu_lpi_base,
-                             edu_msi_max_vectors > 16 ? 16 :
-                             edu_msi_max_vectors);
-        for (unsigned int i = 0; i < (edu_msi_max_vectors > 16 ? 16 :
-                                     edu_msi_max_vectors); i++)
+        unsigned int vectors = edu_msi_max_vectors > 16 ? 16 :
+                               edu_msi_max_vectors;
+        if (its_teardown_pci_msi(pci_edu_requester_id(),
+                                 pci_edu_lpi_base, vectors) < 0)
+            return -1;
+        for (unsigned int i = 0; i < vectors; i++)
             vits_lpi_revoke(pci_edu_lpi_base + i);
     }
     pci_edu_lpi_base = 0;
@@ -1996,11 +1997,14 @@ int pci_edu_function_reset(struct task_struct *vm)
         irq_domain_unregister(pci_edu_intx_irq);
     }
     if (pci_edu_lpi_base) {
-        its_teardown_pci_msi(pci_edu_requester_id(), pci_edu_lpi_base,
-                             edu_msi_max_vectors > 16 ? 16 :
-                             edu_msi_max_vectors);
-        for (unsigned int i = 0; i < (edu_msi_max_vectors > 16 ? 16 :
-                                     edu_msi_max_vectors); i++)
+        unsigned int vectors = edu_msi_max_vectors > 16 ? 16 :
+                               edu_msi_max_vectors;
+        if (its_teardown_pci_msi(pci_edu_requester_id(),
+                                 pci_edu_lpi_base, vectors) < 0) {
+            WARN("PCI: edu reset aborted, ITS resources remain mapped");
+            return -1;
+        }
+        for (unsigned int i = 0; i < vectors; i++)
             vits_lpi_revoke(pci_edu_lpi_base + i);
     }
     if (edu_flr_supported && edu_pcie_cap_off) {

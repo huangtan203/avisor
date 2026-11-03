@@ -130,7 +130,7 @@ static void its_free_lpi_range(unsigned int lpi_base,
  * CWRITER.Offset 字段位于 [19:5]（命令 32 字节对齐），
  * 直接写 32 对齐的字节偏移即可正确编码。
  */
-static void its_send_cmd(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3)
+static int its_send_cmd(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3)
 {
     uint64_t *slot = (uint64_t *)(uintptr_t)cmdq_pa + (cq_byte_off / 8);
 
@@ -150,9 +150,12 @@ static void its_send_cmd(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3)
     int timeout = 1000000;
     while (get64(GITS_CREADR) != cq_byte_off && --timeout > 0)
         ;
-    if (timeout == 0)
+    if (timeout == 0) {
         WARN("ITS: command queue stalled (CWR=%u CRR=%lu)",
              cq_byte_off, (unsigned long)get64(GITS_CREADR));
+        return -1;
+    }
+    return 0;
 }
 
 /* ---------- 对外接口 ---------- */
@@ -223,16 +226,16 @@ unsigned int its_setup_pci_msi(unsigned int bus, unsigned int dev,
     }
     paddr_t itt_pa = (paddr_t)(uintptr_t)itt_page;
 
-    /* 1. MAPC：collection 0 -> procnum target_cpu
-     *    dw2 = V[63] | procnum[47:16] | ICID[15:0] */
-    its_send_cmd(ITS_CMD_MAPC, 0,
-                 (1ULL << 63) | ((uint64_t)target_cpu << 16) | 0, 0);
+    /* 1. MAPC：collection 0 -> procnum target_cpu */
+    if (its_send_cmd(ITS_CMD_MAPC, 0,
+                     (1ULL << 63) | ((uint64_t)target_cpu << 16), 0) < 0)
+        goto setup_release;
 
-    /* 2. MAPD：devid -> ITT，size = 3（16 个 event）
-     *    dw1 = size[4:0]；dw2 = V[63] | ITT 地址[51:8] */
-    its_send_cmd(ITS_CMD_MAPD | ((uint64_t)devid << 32),
-                 ITS_ITT_SIZE_SHIFT,
-                 (1ULL << 63) | (itt_pa & ~0xFFULL), 0);
+    /* 2. MAPD：devid -> ITT，size = 3（16 个 event） */
+    if (its_send_cmd(ITS_CMD_MAPD | ((uint64_t)devid << 32),
+                     ITS_ITT_SIZE_SHIFT,
+                     (1ULL << 63) | (itt_pa & ~0xFFULL), 0) < 0)
+        goto setup_invalidate;
 
     /* 3. MAPTI：eventid i -> LPI（pINTID >= 8192），collection 0 */
     for (unsigned int i = 0; i < num_vectors; i++) {
@@ -241,10 +244,12 @@ unsigned int its_setup_pci_msi(unsigned int bus, unsigned int dev,
             (volatile uint8_t *)(uintptr_t)lpi_prop_pa +
             (lpi - LPI_INTID_BASE);
         *cfg = LPI_PROP_PRIO | LPI_PROP_ENABLE;
-        its_send_cmd(ITS_CMD_MAPTI | ((uint64_t)devid << 32),
-                     ((uint64_t)lpi << 32) | i, 0, 0);
+        if (its_send_cmd(ITS_CMD_MAPTI | ((uint64_t)devid << 32),
+                         ((uint64_t)lpi << 32) | i, 0, 0) < 0)
+            goto setup_invalidate;
     }
-    its_send_cmd(ITS_CMD_SYNC, 0, 0, 0);
+    if (its_send_cmd(ITS_CMD_SYNC, 0, 0, 0) < 0)
+        goto setup_invalidate;
 
     msi_allocations[slot] = (struct its_msi_allocation){
         .devid = devid,
@@ -256,6 +261,26 @@ unsigned int its_setup_pci_msi(unsigned int bus, unsigned int dev,
     INFO("ITS: MSI map devid=%u vec=%u lpi=%u..%u -> cpu%u",
          devid, num_vectors, lpi_base, lpi_base + num_vectors - 1, target_cpu);
     return lpi_base;
+
+setup_invalidate:
+    for (unsigned int i = 0; i < num_vectors; i++) {
+        volatile uint8_t *cfg =
+            (volatile uint8_t *)(uintptr_t)lpi_prop_pa +
+            (lpi_base + i - LPI_INTID_BASE);
+        *cfg = 0;
+    }
+    asm volatile("dsb sy" ::: "memory");
+    if (its_send_cmd(ITS_CMD_MAPD | ((uint64_t)devid << 32),
+                     0, 0, 0) < 0 ||
+        its_send_cmd(ITS_CMD_SYNC, 0, 0, 0) < 0) {
+        WARN("ITS: setup rollback could not confirm MAPD invalid devid=%u",
+             devid);
+        return 0;
+    }
+setup_release:
+    deallocate_page(itt_page);
+    its_free_lpi_range(lpi_base, num_vectors);
+    return 0;
 }
 
 int its_teardown_pci_msi(unsigned int devid, unsigned int lpi_base,
@@ -278,14 +303,19 @@ int its_teardown_pci_msi(unsigned int devid, unsigned int lpi_base,
         return -1;
     }
 
+    if (its_send_cmd(ITS_CMD_MAPD | ((uint64_t)devid << 32),
+                     0, 0, 0) < 0 ||
+        its_send_cmd(ITS_CMD_SYNC, 0, 0, 0) < 0) {
+        WARN("ITS: teardown could not confirm MAPD invalid devid=%u",
+             devid);
+        return -1;
+    }
     if (lpi_prop_pa) {
         volatile uint8_t *cfg = (volatile uint8_t *)(uintptr_t)lpi_prop_pa;
         for (unsigned int i = 0; i < num_vectors; i++)
             cfg[lpi_base + i - LPI_INTID_BASE] = 0;
     }
     asm volatile("dsb sy" ::: "memory");
-    its_send_cmd(ITS_CMD_MAPD | ((uint64_t)devid << 32), 0, 0, 0);
-    its_send_cmd(ITS_CMD_SYNC, 0, 0, 0);
 
     deallocate_page(allocation->itt_page);
     its_free_lpi_range(allocation->lpi_base, allocation->num_vectors);
