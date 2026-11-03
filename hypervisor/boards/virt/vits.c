@@ -68,7 +68,32 @@ struct lpi_map_entry {
 static struct lpi_map_entry lpi_map[LPI_MAP_MAX];
 
 /* 下一个可分配的物理 LPI（从 9000 开始，避开 Phase 8 的 edu 8192..8207） */
-static unsigned int next_alloc_plpi = 9000;
+static volatile unsigned int next_alloc_plpi = 9000;
+
+static int vits_reserve_plpi(unsigned int *plpi)
+{
+    unsigned int observed, next, failed;
+
+    for (;;) {
+        asm volatile("ldaxr %w0, [%1]"
+                     : "=&r"(observed)
+                     : "r"(&next_alloc_plpi)
+                     : "memory");
+        if (observed >= LPI_MAP_BASE + LPI_MAP_MAX) {
+            asm volatile("clrex" ::: "memory");
+            return -1;
+        }
+        next = observed + 1;
+        asm volatile("stxr %w0, %w1, [%2]"
+                     : "=&r"(failed)
+                     : "r"(next), "r"(&next_alloc_plpi)
+                     : "memory");
+        if (!failed) {
+            *plpi = observed;
+            return 0;
+        }
+    }
+}
 
 /* ---------- 全局初始化 ---------- */
 
@@ -319,17 +344,16 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
      * 这里不做范围限制，Guest 传什么存什么。
      */
 
-    /* 分配物理 LPI */
-    if (next_alloc_plpi >= LPI_MAP_BASE + LPI_MAP_MAX) {
+    /* 原子保留一个唯一的物理 LPI；失败后不回退全局 cursor。 */
+    unsigned int plpi;
+    if (vits_reserve_plpi(&plpi) < 0) {
         WARN("vITS: no free physical LPI");
         return -1;
     }
-    unsigned int plpi = next_alloc_plpi++;
 
     /* 记录映射 */
     if (irq_domain_register(plpi, vits->vm->vmid, 0, vintid) < 0) {
         WARN("vITS: LPI ownership registration failed for %u", plpi);
-        next_alloc_plpi--;
         return -1;
     }
 
@@ -345,7 +369,6 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
 
     if (its_send_mapti(vdevid, plpi, veventid, vicid) < 0) {
         irq_domain_unregister_owned(plpi, vits->vm->vmid);
-        next_alloc_plpi--;
         WARN("vITS: physical MAPTI failed, software route rolled back");
         return -1;
     }
@@ -356,7 +379,6 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
         irq_domain_unregister_owned(plpi, vits->vm->vmid);
         lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
         lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
-        next_alloc_plpi--;
         WARN("vITS: MAPTI mapping audit failed; route rolled back");
         return -1;
     }
