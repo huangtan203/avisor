@@ -79,6 +79,9 @@ struct vits_state {
     /* 所属 VM */
     struct task_struct *vm;
 
+    /* Serialize shared per-VM MMIO state across vCPUs. */
+    volatile unsigned int lock;
+
     /* MMIO 写缓存：64 位寄存器分两次 32 位写时，缓存低 32 位 */
     uint32_t write_lo_cache[8];
     uint8_t write_lo_valid[8];

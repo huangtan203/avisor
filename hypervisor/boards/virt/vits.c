@@ -115,6 +115,26 @@ void vits_init_vm(struct vits_state *vits, struct task_struct *vm)
 
 /* ---------- 工具函数：读 Guest 命令队列 ---------- */
 
+static void vits_lock(struct vits_state *vits)
+{
+    unsigned int ok;
+
+    asm volatile(
+        "1: ldaxr w0, [%1]\n"
+        "   cbnz w0, 1b\n"
+        "   mov  w0, #1\n"
+        "   stxr %w0, w0, [%1]\n"
+        "   cbnz %w0, 1b\n"
+        : "=&r"(ok)
+        : "r"(&vits->lock)
+        : "x0", "memory");
+}
+
+static void vits_unlock(struct vits_state *vits)
+{
+    asm volatile("stlr wzr, [%0]" :: "r"(&vits->lock) : "memory");
+}
+
 static void vits_invalidate_cmd_range(void *start, size_t len)
 {
     uint64_t ctr;
@@ -444,17 +464,21 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
      *   - 写低 32 位：缓存起来
      *   - 写高 32 位：和缓存的低 32 位合并，然后执行实际写
      */
+    vits_lock(vits);
+
     int cache_idx = offset_to_cache_idx(reg_off);
 
     if (cache_idx >= 0) {
         if (!hi_word) {
             vits->write_lo_cache[cache_idx] = val32;
             vits->write_lo_valid[cache_idx] = 1;
+            vits_unlock(vits);
             return;
         }
         if (!vits->write_lo_valid[cache_idx]) {
             WARN("vITS: reject high-word write without low word (offset=0x%x)",
                  offset);
+            vits_unlock(vits);
             return;
         }
         val = ((uint64_t)val32 << 32) | vits->write_lo_cache[cache_idx];
@@ -544,6 +568,8 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
              offset, (unsigned long)val);
         break;
     }
+
+    vits_unlock(vits);
 }
 
 /* ---------- 中断注入查表 ---------- */
@@ -625,6 +651,8 @@ uint64_t vits_mmio_read(struct vits_state *vits, uint32_t offset)
     int hi_word = (offset & 4) ? 1 : 0;
     uint64_t val = 0;
 
+    vits_lock(vits);
+
     switch (reg_off) {
     case VITS_CTLR:
         val = vits->ctlr;
@@ -656,10 +684,15 @@ uint64_t vits_mmio_read(struct vits_state *vits, uint32_t offset)
         break;
     default:
         WARN("vITS: unknown read offset 0x%x", offset);
-        return 0;
+        val = 0;
+        break;
     }
 
     if (hi_word)
-        return (val >> 32) & 0xFFFFFFFFULL;
-    return val & 0xFFFFFFFFULL;
+        val = (val >> 32) & 0xFFFFFFFFULL;
+    else
+        val &= 0xFFFFFFFFULL;
+
+    vits_unlock(vits);
+    return val;
 }
