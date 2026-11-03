@@ -117,5 +117,8 @@ int vits_lpi_revoke(unsigned int plpi);
 int vits_lpi_revoke_owned(unsigned int plpi, unsigned long vmid);
 int vits_lpi_revoke_range_owned(unsigned int first_plpi,
                                  unsigned int count, unsigned long vmid);
+int vits_lpi_audit_owned_range(unsigned int first_plpi,
+                                unsigned int count, unsigned long vmid,
+                                unsigned int first_vintid);
 int vits_lpi_to_virq(unsigned int plpi, unsigned int *out_vmid,
                      unsigned int *out_vintid);

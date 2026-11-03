@@ -1912,7 +1912,8 @@ static int pci_edu_reinit_msi(uint32_t expected_generation)
                      edu_msi_cap_off + data_off,
                      its_get_msi_data(0) & 0xffff);
 
-    if (pci_dma_set_authorized(edu_resource, 1, 1,
+    if (vits_lpi_audit_owned_range(lpi_base, vectors, 1, 8192) < 0 ||
+        pci_dma_set_authorized(edu_resource, 1, 1,
                                expected_generation) < 0)
         goto rollback;
 
@@ -1972,7 +1973,9 @@ int pci_edu_vm_reset(struct task_struct *vm)
         if (its_teardown_pci_msi(pci_edu_requester_id(),
                                  pci_edu_lpi_base, vectors) < 0)
             return -1;
-        if (vits_lpi_revoke_range_owned(pci_edu_lpi_base, vectors, 1) < 0)
+        if (vits_lpi_audit_owned_range(pci_edu_lpi_base, vectors, 1,
+                                       8192) < 0 ||
+            vits_lpi_revoke_range_owned(pci_edu_lpi_base, vectors, 1) < 0)
             return -1;
     }
     pci_edu_lpi_base = 0;
@@ -2004,7 +2007,9 @@ int pci_edu_function_reset(struct task_struct *vm)
             WARN("PCI: edu reset aborted, ITS resources remain mapped");
             return -1;
         }
-        if (vits_lpi_revoke_range_owned(pci_edu_lpi_base, vectors,
+        if (vits_lpi_audit_owned_range(pci_edu_lpi_base, vectors,
+                                       vm->vmid, 8192) < 0 ||
+            vits_lpi_revoke_range_owned(pci_edu_lpi_base, vectors,
                                         vm->vmid) < 0) {
             WARN("PCI: edu reset aborted, vITS route ownership mismatch");
             return -1;

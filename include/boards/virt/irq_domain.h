@@ -22,6 +22,9 @@ int irq_domain_unregister(unsigned int pintid);
 int irq_domain_unregister_owned(unsigned int pintid, unsigned long vmid);
 int irq_domain_unregister_owned_range(unsigned int first_pintid,
                                       unsigned int count, unsigned long vmid);
+int irq_domain_audit_owned_range(unsigned int first_pintid,
+                                 unsigned int count, unsigned long vmid,
+                                 unsigned int first_vintid);
 int irq_domain_unregister_vm(unsigned long vmid);
 int irq_domain_update_vcpu_affinity(unsigned long vmid, int vcpu_id,
                                     int target_cpu);
