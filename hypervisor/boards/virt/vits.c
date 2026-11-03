@@ -430,14 +430,17 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
 
     if (cache_idx >= 0) {
         if (!hi_word) {
-            /* 低 32 位：缓存（per-VM 缓存，避免多 VM 串扰） */
             vits->write_lo_cache[cache_idx] = val32;
+            vits->write_lo_valid[cache_idx] = 1;
             return;
         }
-        /* 高 32 位：合并低 32 位 + 高 32 位，构造完整 64 位值 */
-        uint64_t full_val =
-            ((uint64_t)val32 << 32) | vits->write_lo_cache[cache_idx];
-        val = full_val;
+        if (!vits->write_lo_valid[cache_idx]) {
+            WARN("vITS: reject high-word write without low word (offset=0x%x)",
+                 offset);
+            return;
+        }
+        val = ((uint64_t)val32 << 32) | vits->write_lo_cache[cache_idx];
+        vits->write_lo_valid[cache_idx] = 0;
     }
 
     switch (reg_off) {
