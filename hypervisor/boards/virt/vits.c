@@ -115,6 +115,21 @@ void vits_init_vm(struct vits_state *vits, struct task_struct *vm)
 
 /* ---------- 工具函数：读 Guest 命令队列 ---------- */
 
+static void vits_invalidate_cmd_range(void *start, size_t len)
+{
+    uint64_t ctr;
+    asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uint64_t line_size = 4UL << ((ctr >> 16) & 0xf);
+    uintptr_t p = (uintptr_t)start & ~(line_size - 1);
+    uintptr_t end = (uintptr_t)start + len;
+
+    while (p < end) {
+        asm volatile("dc ivac, %0" :: "r"(p) : "memory");
+        p += line_size;
+    }
+    asm volatile("dsb sy" ::: "memory");
+}
+
 /*
  * 从 Guest 的命令队列（GPA）中读取一条命令（32 字节 = 4 x u64）。
  * 返回 0 成功，-1 失败（页未映射等）。
@@ -141,6 +156,9 @@ static int vits_read_cmd(struct vits_state *vits, uint64_t offset,
         WARN("vITS: cmdq GPA 0x%lx not mapped", (unsigned long)gpa);
         return -1;
     }
+
+    /* Invalidate stale command data before reading Guest-owned queue memory. */
+    vits_invalidate_cmd_range((void *)(uintptr_t)cmdq_pa, VITS_CMD_SIZE);
 
     /* 读 4 个 u64（小端，直接内存拷贝） */
     uint64_t *p = (uint64_t *)(uintptr_t)cmdq_pa;
