@@ -1973,7 +1973,7 @@ int pci_edu_vm_reset(struct task_struct *vm)
                                  pci_edu_lpi_base, vectors) < 0)
             return -1;
         for (unsigned int i = 0; i < vectors; i++)
-            vits_lpi_revoke(pci_edu_lpi_base + i);
+            vits_lpi_revoke_owned(pci_edu_lpi_base + i, 1);
     }
     pci_edu_lpi_base = 0;
     pci_edu_msi_enabled = 0;
@@ -2005,7 +2005,7 @@ int pci_edu_function_reset(struct task_struct *vm)
             return -1;
         }
         for (unsigned int i = 0; i < vectors; i++)
-            vits_lpi_revoke(pci_edu_lpi_base + i);
+            vits_lpi_revoke_owned(pci_edu_lpi_base + i, vm->vmid);
     }
     if (edu_flr_supported && edu_pcie_cap_off) {
         uint32_t devctl = pci_config_read(edu_bus, edu_dev, edu_func,

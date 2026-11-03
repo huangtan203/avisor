@@ -117,6 +117,24 @@ int irq_domain_unregister(unsigned int pintid)
     return ret;
 }
 
+int irq_domain_unregister_owned(unsigned int pintid, unsigned long vmid)
+{
+    unsigned long flags = domain_lock();
+    int ret = -1;
+
+    for (int i = 0; i < IRQ_DOMAIN_MAX_ROUTES; i++) {
+        if (routes[i].enabled && routes[i].pintid == pintid &&
+            routes[i].owner == IRQ_DOMAIN_OWNER_VM &&
+            routes[i].vmid == vmid) {
+            routes[i].enabled = 0;
+            ret = 0;
+            break;
+        }
+    }
+    domain_unlock(flags);
+    return ret;
+}
+
 int irq_domain_unregister_vm(unsigned long vmid)
 {
     unsigned long flags = domain_lock();
@@ -191,7 +209,9 @@ int irq_domain_selftest(void)
         irq_domain_update_vcpu_affinity(1, 1, 1) != 0 ||
         irq_domain_lookup(16383, &route) < 0 || route.target_cpu != 1)
         ret = -1;
-    if (irq_domain_unregister(16383) < 0 ||
+    if (irq_domain_unregister_owned(16383, 2) != -1 ||
+        irq_domain_lookup(16383, &route) < 0 || route.vmid != 1 ||
+        irq_domain_unregister_owned(16383, 1) < 0 ||
         irq_domain_lookup(16383, &route) != -1)
         ret = -1;
     return ret;

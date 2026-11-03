@@ -607,13 +607,24 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
 
 /* ---------- 中断注入查表 ---------- */
 
+int vits_lpi_revoke_owned(unsigned int plpi, unsigned long vmid)
+{
+    if (plpi < LPI_MAP_BASE || plpi >= LPI_MAP_BASE + LPI_MAP_MAX ||
+        irq_domain_unregister_owned(plpi, vmid) < 0)
+        return -1;
+    lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
+    lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
+    return 0;
+}
+
 int vits_lpi_revoke(unsigned int plpi)
 {
-    if (plpi >= LPI_MAP_BASE && plpi < LPI_MAP_BASE + LPI_MAP_MAX) {
-        lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
-        lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
-    }
-    return irq_domain_unregister(plpi);
+    struct irq_route route;
+
+    if (irq_domain_lookup(plpi, &route) < 0 ||
+        route.owner != IRQ_DOMAIN_OWNER_VM)
+        return -1;
+    return vits_lpi_revoke_owned(plpi, route.vmid);
 }
 
 int vits_lpi_to_virq(unsigned int plpi, unsigned int *out_vmid,

@@ -114,5 +114,6 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val);
  * 输出 vmid 和 vINTID。
  */
 int vits_lpi_revoke(unsigned int plpi);
+int vits_lpi_revoke_owned(unsigned int plpi, unsigned long vmid);
 int vits_lpi_to_virq(unsigned int plpi, unsigned int *out_vmid,
                      unsigned int *out_vintid);
