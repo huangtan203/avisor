@@ -447,10 +447,21 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
         break;
 
     case VITS_CBASER: {
-        vits->cbaser = val;
-        /* 计算命令队列大小：SIZE[7:0] = 页数 - 1 */
+        if (vits->ctlr & 0x1) {
+            WARN("vITS: reject CBASER write while enabled");
+            break;
+        }
+
         uint32_t size = (uint32_t)(val & 0xFF);
-        vits->cmdq_bytes = (size + 1) * PAGE_SIZE;
+        uint32_t cmdq_bytes = (size + 1) * PAGE_SIZE;
+        if (!(val & (1ULL << 63)) ||
+            cmdq_bytes < VITS_CMD_SIZE || cmdq_bytes % VITS_CMD_SIZE) {
+            WARN("vITS: reject invalid CBASER=0x%lx", (unsigned long)val);
+            break;
+        }
+
+        vits->cbaser = val;
+        vits->cmdq_bytes = cmdq_bytes;
         vits->cwriter = 0;
         vits->creadr = 0;
         INFO("vITS: CBASER = 0x%lx (cmdq %u bytes)",
