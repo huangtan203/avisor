@@ -3959,6 +3959,14 @@ static void vits_test(void)
         return;
     }
 
+    /* 非 32 字节对齐的 CWRITER 必须被拒绝，且不得推进 CREADR。 */
+    mmio_write32(VITS_BASE + VITS_CWRITER, 1);
+    if (mmio_read32(VITS_BASE + VITS_CREADR) != 0) {
+        guest_puts("vITS: FAILED (invalid CWRITER advanced CREADR)\n");
+        return;
+    }
+    mmio_write32(VITS_BASE + VITS_CWRITER, 0);
+
     /* 2. MAPC: collection 0 -> procnum 0 */
     vits_mapc(0, 0);
 

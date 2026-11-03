@@ -125,8 +125,10 @@ static int vits_read_cmd(struct vits_state *vits, uint64_t offset,
     paddr_t cmdq_pa;
     paddr_t gpa;
 
-    if (!vits->cbaser || !(vits->cbaser & (1ULL << 63))) {
-        WARN("vITS: command queue not configured");
+    if (!vits->cbaser || !(vits->cbaser & (1ULL << 63)) ||
+        offset >= vits->cmdq_bytes || offset % VITS_CMD_SIZE) {
+        WARN("vITS: invalid command queue entry offset=0x%lx size=%u",
+             (unsigned long)offset, vits->cmdq_bytes);
         return -1;
     }
 
@@ -368,6 +370,14 @@ static void vits_process_cmdq(struct vits_state *vits)
     uint64_t cw = vits->cwriter;
     uint64_t cr = vits->creadr;
 
+    if (!vits->cmdq_bytes || vits->cmdq_bytes % VITS_CMD_SIZE ||
+        cw >= vits->cmdq_bytes || cw % VITS_CMD_SIZE ||
+        cr >= vits->cmdq_bytes || cr % VITS_CMD_SIZE) {
+        WARN("vITS: reject invalid command queue pointers CR=0x%lx CW=0x%lx size=%u",
+             (unsigned long)cr, (unsigned long)cw, vits->cmdq_bytes);
+        return;
+    }
+
     while (cr != cw) {
         if (vits_process_one(vits, cr) < 0)
             WARN("vITS: command at 0x%lx failed; advancing CREADR",
@@ -441,6 +451,8 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
         /* 计算命令队列大小：SIZE[7:0] = 页数 - 1 */
         uint32_t size = (uint32_t)(val & 0xFF);
         vits->cmdq_bytes = (size + 1) * PAGE_SIZE;
+        vits->cwriter = 0;
+        vits->creadr = 0;
         INFO("vITS: CBASER = 0x%lx (cmdq %u bytes)",
              (unsigned long)val, vits->cmdq_bytes);
         break;
