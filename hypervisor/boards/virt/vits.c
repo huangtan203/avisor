@@ -445,6 +445,8 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
 
     switch (reg_off) {
     case VITS_CTLR:
+        for (unsigned int i = 0; i < ARRAY_SIZE(vits->write_lo_valid); i++)
+            vits->write_lo_valid[i] = 0;
         vits->ctlr = val32 & 0x1;  /* 只保留 Enabled 位 */
         INFO("vITS: CTLR = %u", vits->ctlr);
         break;
