@@ -617,6 +617,20 @@ int vits_lpi_revoke_owned(unsigned int plpi, unsigned long vmid)
     return 0;
 }
 
+int vits_lpi_revoke_range_owned(unsigned int first_plpi,
+                                unsigned int count, unsigned long vmid)
+{
+    if (!count || first_plpi < LPI_MAP_BASE ||
+        count > LPI_MAP_BASE + LPI_MAP_MAX - first_plpi ||
+        irq_domain_unregister_owned_range(first_plpi, count, vmid) < 0)
+        return -1;
+    for (unsigned int i = 0; i < count; i++) {
+        lpi_map[first_plpi + i - LPI_MAP_BASE].vmid = 0;
+        lpi_map[first_plpi + i - LPI_MAP_BASE].vintid = 0;
+    }
+    return 0;
+}
+
 int vits_lpi_revoke(unsigned int plpi)
 {
     struct irq_route route;

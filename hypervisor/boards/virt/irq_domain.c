@@ -135,6 +135,49 @@ int irq_domain_unregister_owned(unsigned int pintid, unsigned long vmid)
     return ret;
 }
 
+int irq_domain_unregister_owned_range(unsigned int first_pintid,
+                                      unsigned int count, unsigned long vmid)
+{
+    unsigned long flags = domain_lock();
+    unsigned int matched = 0;
+
+    for (unsigned int n = 0; n < count; n++) {
+        unsigned int pintid = first_pintid + n;
+        int found = 0;
+
+        for (int i = 0; i < IRQ_DOMAIN_MAX_ROUTES; i++) {
+            if (!routes[i].enabled || routes[i].pintid != pintid)
+                continue;
+            if (routes[i].owner != IRQ_DOMAIN_OWNER_VM ||
+                routes[i].vmid != vmid) {
+                domain_unlock(flags);
+                return -1;
+            }
+            found = 1;
+            break;
+        }
+        if (!found) {
+            domain_unlock(flags);
+            return -1;
+        }
+        matched++;
+    }
+
+    for (unsigned int n = 0; n < matched; n++) {
+        unsigned int pintid = first_pintid + n;
+        for (int i = 0; i < IRQ_DOMAIN_MAX_ROUTES; i++) {
+            if (routes[i].enabled && routes[i].pintid == pintid &&
+                routes[i].owner == IRQ_DOMAIN_OWNER_VM &&
+                routes[i].vmid == vmid) {
+                routes[i].enabled = 0;
+                break;
+            }
+        }
+    }
+    domain_unlock(flags);
+    return 0;
+}
+
 int irq_domain_unregister_vm(unsigned long vmid)
 {
     unsigned long flags = domain_lock();

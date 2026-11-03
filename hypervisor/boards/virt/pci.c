@@ -1948,8 +1948,8 @@ rollback:
     if (its_teardown_pci_msi(pci_edu_requester_id(), lpi_base,
                              vectors) < 0)
         WARN("PCI: failed to release rolled-back ITS MSI resources");
-    while (registered_vectors)
-        vits_lpi_revoke(lpi_base + --registered_vectors);
+    if (vits_lpi_revoke_range_owned(lpi_base, registered_vectors, 1) < 0)
+        WARN("PCI: failed to revoke rolled-back vITS routes");
     pci_edu_lpi_base = 0;
     pci_edu_msi_enabled = 0;
     WARN("PCI: edu MSI reinitialization transaction rolled back");
@@ -1972,8 +1972,8 @@ int pci_edu_vm_reset(struct task_struct *vm)
         if (its_teardown_pci_msi(pci_edu_requester_id(),
                                  pci_edu_lpi_base, vectors) < 0)
             return -1;
-        for (unsigned int i = 0; i < vectors; i++)
-            vits_lpi_revoke_owned(pci_edu_lpi_base + i, 1);
+        if (vits_lpi_revoke_range_owned(pci_edu_lpi_base, vectors, 1) < 0)
+            return -1;
     }
     pci_edu_lpi_base = 0;
     pci_edu_msi_enabled = 0;
@@ -2004,8 +2004,11 @@ int pci_edu_function_reset(struct task_struct *vm)
             WARN("PCI: edu reset aborted, ITS resources remain mapped");
             return -1;
         }
-        for (unsigned int i = 0; i < vectors; i++)
-            vits_lpi_revoke_owned(pci_edu_lpi_base + i, vm->vmid);
+        if (vits_lpi_revoke_range_owned(pci_edu_lpi_base, vectors,
+                                        vm->vmid) < 0) {
+            WARN("PCI: edu reset aborted, vITS route ownership mismatch");
+            return -1;
+        }
     }
     if (edu_flr_supported && edu_pcie_cap_off) {
         uint32_t devctl = pci_config_read(edu_bus, edu_dev, edu_func,
