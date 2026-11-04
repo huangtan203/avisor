@@ -4089,6 +4089,21 @@ static void vits_test(void)
         }
         guest_puts("vITS: unknown opcode halted queue, CREADR retained\n");
 
+        /* 停止后追加的合法 SYNC 不得被执行：CREADR 必须仍停在未知槽位 unk_slot。 */
+        u64 *after = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
+        after[0] = ITS_CMD_SYNC;
+        after[1] = 0;
+        after[2] = 0;
+        after[3] = 0;
+        asm volatile("dsb sy" ::: "memory");
+        vits_cwriter += 32;
+        mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != unk_slot) {
+            guest_puts("vITS: FAILED (valid command executed after halt)\n");
+            return;
+        }
+        guest_puts("vITS: valid command after halt not executed\n");
+
         mmio_write32(VITS_BASE + VITS_CTLR, 0);
         mmio_write32(VITS_BASE + VITS_CBASER, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) & 0xFFFFFFFFULL));
         mmio_write32(VITS_BASE + VITS_CBASER + 4, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) >> 32));
