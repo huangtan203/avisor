@@ -448,8 +448,13 @@ static int vits_process_one(struct vits_state *vits, uint64_t offset)
             return -1;
         break;
     default:
-        WARN("vITS: unknown command opcode 0x%02x", opcode);
-        break;
+        /*
+         * 未知 opcode 视为命令失败：不猜测其语义，也不消费该槽位。
+         * 与其它失败路径一致，由 vits_process_cmdq() 停止队列并保留 CREADR。
+         */
+        WARN("vITS: unknown command opcode 0x%02x at offset 0x%lx",
+             opcode, (unsigned long)offset);
+        return -1;
     }
 
     return 0;
