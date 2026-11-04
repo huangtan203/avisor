@@ -4044,6 +4044,15 @@ static void vits_test(void)
         }
         guest_puts("vITS: unowned MAPTI halted queue, CREADR retained\n");
 
+        /* 重放：重写相同 CWRITER 会从 CREADR 再次处理失败的 MAPTI，
+         * 去重后不得再次告警，CREADR 仍停在 halt_slot。 */
+        mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != halt_slot) {
+            guest_puts("vITS: FAILED (replay moved CREADR past halt)\n");
+            return;
+        }
+        guest_puts("vITS: MAPTI replay kept halt point\n");
+
         mmio_write32(VITS_BASE + VITS_CTLR, 0);
         mmio_write32(VITS_BASE + VITS_CBASER, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) & 0xFFFFFFFFULL));
         mmio_write32(VITS_BASE + VITS_CBASER + 4, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) >> 32));
