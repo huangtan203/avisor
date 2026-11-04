@@ -68,6 +68,13 @@ struct vits_state {
     uint64_t cbaser;        /* GITS_CBASER（Guest GPA） */
     uint64_t cwriter;       /* GITS_CWRITER（字节偏移） */
     uint64_t creadr;        /* GITS_CREADR（字节偏移） */
+    /*
+     * fail-stop 停止点。halted 为 1 时表示队列已因 halted_at 偏移的命令失败而停止；
+     * 同一偏移被重复访问（Guest 再次推进 CWRITER）时不再重复告警。
+     * CBASER 重写（队列复位）时清除。
+     */
+    uint64_t halted_at;
+    uint8_t halted;
     uint64_t baser[8];      /* GITS_BASERn（Guest GPA） */
 
     /*

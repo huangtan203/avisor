@@ -451,9 +451,11 @@ static int vits_process_one(struct vits_state *vits, uint64_t offset)
         /*
          * 未知 opcode 视为命令失败：不猜测其语义，也不消费该槽位。
          * 与其它失败路径一致，由 vits_process_cmdq() 停止队列并保留 CREADR。
+         * 同一停止点被重复访问时不再重复告警。
          */
-        WARN("vITS: unknown command opcode 0x%02x at offset 0x%lx",
-             opcode, (unsigned long)offset);
+        if (!vits->halted || vits->halted_at != offset)
+            WARN("vITS: unknown command opcode 0x%02x at offset 0x%lx",
+                 opcode, (unsigned long)offset);
         return -1;
     }
 
@@ -480,8 +482,13 @@ static void vits_process_cmdq(struct vits_state *vits)
 
     while (cr != cw) {
         if (vits_process_one(vits, cr) < 0) {
-            WARN("vITS: command at 0x%lx failed; halting, CREADR retained",
-                 (unsigned long)cr);
+            /* 同一停止点被 Guest 重复推进 CWRITER 时不重复告警。 */
+            if (!vits->halted || vits->halted_at != cr) {
+                WARN("vITS: command at 0x%lx failed; halting, CREADR retained",
+                     (unsigned long)cr);
+                vits->halted = 1;
+                vits->halted_at = cr;
+            }
             vits->creadr = cr;
             return;
         }
@@ -491,6 +498,7 @@ static void vits_process_cmdq(struct vits_state *vits)
             cr = 0;
     }
 
+    vits->halted = 0;
     vits->creadr = cw;
 }
 
@@ -582,6 +590,8 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
         vits->cmdq_bytes = cmdq_bytes;
         vits->cwriter = 0;
         vits->creadr = 0;
+        vits->halted = 0;
+        vits->halted_at = 0;
         INFO("vITS: CBASER = 0x%lx (cmdq %u bytes)",
              (unsigned long)val, vits->cmdq_bytes);
         break;
