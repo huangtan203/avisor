@@ -324,7 +324,8 @@ static void vits_cmd_mapd(struct vits_state *vits, uint64_t cmd[4])
  *   4. 配置 LPI 属性表并等待物理 ITS MAPTI 完成
  *   5. 物理完成后提交 vITS shadow mapping
  */
-static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
+static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
+                          uint64_t cmd_offset)
 {
     uint32_t vdevid = (uint32_t)(cmd[0] >> 32);
     uint32_t veventid = (uint32_t)(cmd[1] & 0xFFFFFFFFULL);
@@ -336,7 +337,8 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4])
 
     if (!vits->vm || vits->vm->vmid != 1 ||
         !pci_edu_owns_requester(vdevid)) {
-        WARN("vITS: MAPTI rejected for unowned requester %u", vdevid);
+        if (!vits->halted || vits->halted_at != cmd_offset)
+            WARN("vITS: MAPTI rejected for unowned requester %u", vdevid);
         return -1;
     }
     if (veventid == 0) {
@@ -444,7 +446,7 @@ static int vits_process_one(struct vits_state *vits, uint64_t offset)
         vits_cmd_mapd(vits, cmd);
         break;
     case VITS_CMD_MAPTI:
-        if (vits_cmd_mapti(vits, cmd) < 0)
+        if (vits_cmd_mapti(vits, cmd, offset) < 0)
             return -1;
         break;
     default:
