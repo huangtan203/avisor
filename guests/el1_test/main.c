@@ -3959,13 +3959,62 @@ static void vits_test(void)
         return;
     }
 
-    /* 非 32 字节对齐的 CWRITER 必须被拒绝，且不得推进 CREADR。 */
-    mmio_write32(VITS_BASE + VITS_CWRITER, 1);
-    if (mmio_read32(VITS_BASE + VITS_CREADR) != 0) {
-        guest_puts("vITS: FAILED (invalid CWRITER advanced CREADR)\n");
+    /* 启用后 CBASER 不可改写，且不能清零已运行的队列指针。 */
+    mmio_write32(VITS_BASE + VITS_CBASER, 0);
+    mmio_write32(VITS_BASE + VITS_CBASER + 4, 0);
+    if (mmio_read32(VITS_BASE + VITS_CBASER + 4) != 0x80000000U) {
+        guest_puts("vITS: FAILED (enabled CBASER write accepted)\n");
         return;
     }
-    mmio_write32(VITS_BASE + VITS_CWRITER, 0);
+    guest_puts("vITS: enabled CBASER write rejected\n");
+
+    /* 低字缓存不能跨越 CTLR disable/enable 状态转换。 */
+    mmio_write32(VITS_BASE + VITS_BASER(0), 0x12345000U);
+    mmio_write32(VITS_BASE + VITS_CTLR, 0);
+    mmio_write32(VITS_BASE + VITS_CTLR, 1);
+    mmio_write32(VITS_BASE + VITS_BASER(0) + 4, 0);
+    if (mmio_read32(VITS_BASE + VITS_BASER(0)) != 0x40014000U ||
+        mmio_read32(VITS_BASE + VITS_BASER(0) + 4) != 0x80000000U) {
+        guest_puts("vITS: FAILED (BASER cache survived CTLR transition)\n");
+        return;
+    }
+    guest_puts("vITS: CTLR transition cleared pending register write\n");
+
+    /* 在 disabled 状态提交 CWRITER，再 enable 时应自动消费队列。 */
+    mmio_write32(VITS_BASE + VITS_CTLR, 0);
+    ((u64 *)vits_cmdq_buf)[0] = ITS_CMD_SYNC;
+    ((u64 *)vits_cmdq_buf)[1] = 0;
+    ((u64 *)vits_cmdq_buf)[2] = 0;
+    ((u64 *)vits_cmdq_buf)[3] = 0;
+    asm volatile("dsb sy" ::: "memory");
+    mmio_write32(VITS_BASE + VITS_CWRITER, 0x20);
+    if (mmio_read32(VITS_BASE + VITS_CREADR) != 0) {
+        guest_puts("vITS: FAILED (disabled queue processed early)\n");
+        return;
+    }
+    mmio_write32(VITS_BASE + VITS_CTLR, 1);
+    if (mmio_read32(VITS_BASE + VITS_CREADR) != 0x20) {
+        guest_puts("vITS: FAILED (enable did not drain pending queue)\n");
+        return;
+    }
+    guest_puts("vITS: pending queue consumed on CTLR enable\n");
+    /* 直接写入 CWRITER 后同步软件写指针，保证后续命令槽位与硬件一致。 */
+    vits_cwriter = 0x20;
+
+    /* 单独写 BASER0 高 word 不应改写已配置的基址。 */
+    mmio_write32(VITS_BASE + VITS_BASER(0) + 4, 0);
+    if (mmio_read32(VITS_BASE + VITS_BASER(0) + 4) != 0x80000000U) {
+        guest_puts("vITS: FAILED (orphan high word changed BASER)\n");
+        return;
+    }
+
+    /* 非 32 字节对齐的 CWRITER 必须被拒绝，且不得推进 CREADR。 */
+    mmio_write32(VITS_BASE + VITS_CWRITER, 1);
+    if (mmio_read32(VITS_BASE + VITS_CREADR) != 0x20 ||
+        mmio_read32(VITS_BASE + VITS_CWRITER) != 0x20) {
+        guest_puts("vITS: FAILED (invalid CWRITER changed queue state)\n");
+        return;
+    }
 
     /* 2. MAPC: collection 0 -> procnum 0 */
     vits_mapc(0, 0);
@@ -3973,9 +4022,40 @@ static void vits_test(void)
     /* 3. MAPD: requester ID 由 hypervisor ownership 查询返回。 */
     vits_mapd((u32)edu_requester_id, (u64)vits_itt_buf, 3);
 
-    /* 未拥有的 requester 不得创建设备到 LPI 映射。 */
+    /* 未拥有的 requester 不得创建设备到 LPI 映射。
+     * MAPTI 被拒绝后按 fail-stop 语义停止队列：CREADR 停在该命令槽位，
+     * 之后的命令不被执行。随后通过 CTLR 失能 + 重写 CBASER 复位队列。 */
     vits_mapd((u32)edu_requester_id + 1, (u64)vits_itt_buf, 3);
-    vits_mapti((u32)edu_requester_id + 1, 1, VITS_TEST_VLPI + 1, 0);
+    {
+        u64 *slot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
+        slot[0] = ITS_CMD_MAPTI | ((u64)((u32)edu_requester_id + 1) << 32);
+        slot[1] = 1 | ((u64)(VITS_TEST_VLPI + 1) << 32);
+        slot[2] = 0;
+        slot[3] = 0;
+        asm volatile("dsb sy" ::: "memory");
+        u32 halt_slot = vits_cwriter;
+        vits_cwriter += 32;
+        if (vits_cwriter >= VITS_CMDQ_SIZE)
+            vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != halt_slot) {
+            guest_puts("vITS: FAILED (fail-stop did not retain CREADR)\n");
+            return;
+        }
+        guest_puts("vITS: unowned MAPTI halted queue, CREADR retained\n");
+
+        mmio_write32(VITS_BASE + VITS_CTLR, 0);
+        mmio_write32(VITS_BASE + VITS_CBASER, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) & 0xFFFFFFFFULL));
+        mmio_write32(VITS_BASE + VITS_CBASER + 4, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) >> 32));
+        vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CTLR, 1);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != 0 ||
+            mmio_read32(VITS_BASE + VITS_CWRITER) != 0) {
+            guest_puts("vITS: FAILED (queue reset after halt)\n");
+            return;
+        }
+        guest_puts("vITS: queue reset after halt\n");
+    }
 
     /* 物理 MAPTI 完成前不得发布软件 route/shadow mapping。 */
     vits_mapti((u32)edu_requester_id, 2, VITS_TEST_VLPI + 1, 0);
@@ -3987,7 +4067,7 @@ static void vits_test(void)
     vits_sync();
 
     /* 5. 修改 edu 的 MSI data 为 1（EventID = 1）
-         * 通过 PCI ECAM trap-and-emulate 写配置空间。
+     * 通过 PCI ECAM trap-and-emulate 写配置空间。
      * edu 在 bus 0, dev 2, func 0。
      * MSI Capability 在 pci_init 里探测过，偏移由 QEMU 决定。
      * 简化：从 Cap Pointer 开始遍历，找到 MSI Capability。
