@@ -4055,6 +4055,35 @@ static void vits_test(void)
             return;
         }
         guest_puts("vITS: queue reset after halt\n");
+
+        /* 未知 opcode 同样触发 fail-stop，且不得被静默消费。 */
+        u64 *uslot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
+        uslot[0] = 0x7FULL;
+        uslot[1] = 0;
+        uslot[2] = 0;
+        uslot[3] = 0;
+        asm volatile("dsb sy" ::: "memory");
+        u32 unk_slot = vits_cwriter;
+        vits_cwriter += 32;
+        if (vits_cwriter >= VITS_CMDQ_SIZE)
+            vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != unk_slot) {
+            guest_puts("vITS: FAILED (unknown opcode consumed silently)\n");
+            return;
+        }
+        guest_puts("vITS: unknown opcode halted queue, CREADR retained\n");
+
+        mmio_write32(VITS_BASE + VITS_CTLR, 0);
+        mmio_write32(VITS_BASE + VITS_CBASER, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) & 0xFFFFFFFFULL));
+        mmio_write32(VITS_BASE + VITS_CBASER + 4, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) >> 32));
+        vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CTLR, 1);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != 0 ||
+            mmio_read32(VITS_BASE + VITS_CWRITER) != 0) {
+            guest_puts("vITS: FAILED (queue reset after unknown opcode)\n");
+            return;
+        }
     }
 
     /* 物理 MAPTI 完成前不得发布软件 route/shadow mapping。 */
