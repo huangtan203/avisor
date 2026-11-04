@@ -456,7 +456,9 @@ static int vits_process_one(struct vits_state *vits, uint64_t offset)
 }
 
 /*
- * 处理命令队列：从 CREADR 到 CWRITER 之间的所有命令
+ * 处理命令队列：从 CREADR 到 CWRITER 之间的命令。
+ * 遇到第一条失败命令即停止，CREADR 保持在该命令偏移，
+ * 后续命令不再执行，直到 Guest 修复状态并重新推进 CWRITER。
  */
 static void vits_process_cmdq(struct vits_state *vits)
 {
@@ -472,9 +474,12 @@ static void vits_process_cmdq(struct vits_state *vits)
     }
 
     while (cr != cw) {
-        if (vits_process_one(vits, cr) < 0)
-            WARN("vITS: command at 0x%lx failed; advancing CREADR",
+        if (vits_process_one(vits, cr) < 0) {
+            WARN("vITS: command at 0x%lx failed; halting, CREADR retained",
                  (unsigned long)cr);
+            vits->creadr = cr;
+            return;
+        }
 
         cr += VITS_CMD_SIZE;
         if (cr >= vits->cmdq_bytes)
