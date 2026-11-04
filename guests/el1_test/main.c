@@ -4056,6 +4056,21 @@ static void vits_test(void)
         }
         guest_puts("vITS: queue reset after halt\n");
 
+        /* 先消费一条合法 SYNC 把队列推进到非零偏移 0x20，
+         * 再在 0x20 处放置未知 opcode，覆盖非零偏移的 fail-stop。 */
+        u64 *sync_slot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
+        sync_slot[0] = ITS_CMD_SYNC;
+        sync_slot[1] = 0;
+        sync_slot[2] = 0;
+        sync_slot[3] = 0;
+        asm volatile("dsb sy" ::: "memory");
+        vits_cwriter += 32;
+        mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != vits_cwriter) {
+            guest_puts("vITS: FAILED (SYNC before unknown opcode not consumed)\n");
+            return;
+        }
+
         /* 未知 opcode 同样触发 fail-stop，且不得被静默消费。 */
         u64 *uslot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
         uslot[0] = 0x7FULL;
@@ -4068,7 +4083,7 @@ static void vits_test(void)
         if (vits_cwriter >= VITS_CMDQ_SIZE)
             vits_cwriter = 0;
         mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
-        if (mmio_read32(VITS_BASE + VITS_CREADR) != unk_slot) {
+        if (unk_slot == 0 || mmio_read32(VITS_BASE + VITS_CREADR) != unk_slot) {
             guest_puts("vITS: FAILED (unknown opcode consumed silently)\n");
             return;
         }
