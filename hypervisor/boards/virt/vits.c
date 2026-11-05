@@ -400,6 +400,14 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
         }
     }
 
+    /*
+     * 替换路径先记下旧路由：本次 MAPTI 失败时要用旧 vINTID 恢复，
+     * 而不是删除路由——反查表仍指向该 pLPI，删除会让映射静默失效。
+     */
+    struct irq_route prev_route;
+    int have_prev = (evt_idx >= 0) &&
+                    irq_domain_lookup(plpi, &prev_route) == 0;
+
     /* 记录映射 */
     if (irq_domain_register(plpi, vits->vm->vmid, 0, vintid) < 0) {
         WARN("vITS: LPI ownership registration failed for %u", plpi);
@@ -417,8 +425,20 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
     asm volatile("dsb sy" ::: "memory");
 
     if (its_send_mapti(vdevid, plpi, veventid, vicid) < 0) {
-        irq_domain_unregister_owned(plpi, vits->vm->vmid);
-        WARN("vITS: physical MAPTI failed, software route rolled back");
+        if (have_prev) {
+            /* 替换失败：把路由与 shadow 恢复成替换前的 vINTID。 */
+            irq_domain_register(plpi, vits->vm->vmid, 0,
+                                prev_route.vintid);
+            lpi_map_acquire();
+            lpi_map[plpi - LPI_MAP_BASE].vmid = (uint16_t)vits->vm->vmid;
+            lpi_map[plpi - LPI_MAP_BASE].vintid = prev_route.vintid;
+            lpi_map_release();
+            WARN("vITS: physical MAPTI failed, replacement rolled back to vINTID=%u",
+                 prev_route.vintid);
+        } else {
+            irq_domain_unregister_owned(plpi, vits->vm->vmid);
+            WARN("vITS: physical MAPTI failed, software route rolled back");
+        }
         return -1;
     }
     lpi_map_acquire();
