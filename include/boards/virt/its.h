@@ -55,6 +55,12 @@ int its_teardown_pci_msi(unsigned int devid, unsigned int lpi_base,
 int its_send_mapti(unsigned int devid, unsigned int lpi,
                    unsigned int eventid, unsigned int collection);
 
+/*
+ * 清除物理 ITS 中 (DeviceID, EventID) 的映射。
+ * DISCARD 命令：dw0[7:0]=0x0F，dw0[63:32]=DeviceID，dw1[31:0]=EventID。
+ */
+int its_send_discard(unsigned int devid, unsigned int eventid);
+
 /* MSI 消息地址：GITS_TRANSLATER 的物理地址（写入 PCI MSI Capability） */
 uint64_t its_get_msi_address(void);
 

@@ -42,6 +42,7 @@
 #define ITS_CMD_MAPD   0x08
 #define ITS_CMD_MAPC   0x09
 #define ITS_CMD_MAPTI  0x0A
+#define ITS_CMD_DISCARD 0x0F
 
 /* GICv3 LPI INTID 起始（QEMU 强制 pINTID >= 8192 才接受 MAPTI） */
 #define LPI_INTID_BASE   8192
@@ -171,6 +172,12 @@ int its_send_mapti(unsigned int devid, unsigned int lpi,
     return its_send_cmd(ITS_CMD_MAPTI | ((uint64_t)devid << 32),
                         ((uint64_t)lpi << 32) | eventid,
                         collection, 0);
+}
+
+int its_send_discard(unsigned int devid, unsigned int eventid)
+{
+    return its_send_cmd(ITS_CMD_DISCARD | ((uint64_t)devid << 32),
+                        eventid, 0, 0);
 }
 
 /* ---------- 对外接口 ---------- */

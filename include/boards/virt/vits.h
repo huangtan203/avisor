@@ -67,6 +67,7 @@
 #define VITS_CMD_MAPD    0x08
 #define VITS_CMD_MAPC    0x09
 #define VITS_CMD_MAPTI   0x0A
+#define VITS_CMD_DISCARD 0x0F
 
 /* 命令大小：32 字节 */
 #define VITS_CMD_SIZE    32

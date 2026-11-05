@@ -1268,6 +1268,7 @@ static u64 edu_bar0_base;
 #define ITS_CMD_MAPD       0x08
 #define ITS_CMD_MAPC       0x09
 #define ITS_CMD_MAPTI      0x0A
+#define ITS_CMD_DISCARD    0x0F
 
 /* 命令队列大小（1 页 = 128 条命令） */
 #define VITS_CMDQ_SIZE     4096
@@ -1420,6 +1421,17 @@ static void vits_mapti(u32 devid, u32 eventid, u32 vintid, u16 icid)
     puts_dec(vintid);
     guest_puts(" icid=");
     puts_dec(icid);
+    guest_puts("\n");
+}
+
+static void vits_discard(u32 devid, u32 eventid)
+{
+    u64 dw0 = ITS_CMD_DISCARD | ((u64)devid << 32);
+    vits_send_cmd(dw0, eventid, 0, 0);
+    guest_puts("vITS: DISCARD devid=");
+    puts_dec(devid);
+    guest_puts(" eventid=");
+    puts_dec(eventid);
     guest_puts("\n");
 }
 
@@ -4267,6 +4279,25 @@ static void vits_test(void)
         /* 7. 恢复 MSI data = 0（保持 Phase 8 兼容） */
         mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF, msi_data);
         guest_puts("vITS: MSI data restored\n");
+
+        /* DISCARD 后同一 (devid, eventid) 不得再送达中断。 */
+        vits_discard((u32)edu_requester_id, 1);
+        vits_sync();
+        vits_irq_received = 0;
+        vits_irq_intid = 0;
+        mmio_write32(edu_bar0_base + EDU_IRQ_ACK, 0xffffffff);
+        mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF,
+                     (msi_data & 0xFFFF0000) | 1);
+        mmio_write32(edu_bar0_base + EDU_IRQ_RAISE, 0x13572468);
+        timeout = 2000000;
+        while (!vits_irq_received && timeout-- > 0)
+            asm volatile("nop");
+        if (vits_irq_received) {
+            guest_puts("vITS: FAILED (interrupt delivered after DISCARD)\n");
+            return;
+        }
+        guest_puts("vITS: DISCARD suppressed interrupt delivery\n");
+        mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF, msi_data);
 
         if (hvc_call(HVC_PCI_RESET, 0) == 0) {
             u32 pci_id = mmio_read32(ecam_addr);
