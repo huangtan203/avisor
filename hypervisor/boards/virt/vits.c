@@ -282,7 +282,8 @@ static void vits_cmd_mapc(struct vits_state *vits, uint64_t cmd[4])
  *   - 物理 ITS 已经在 its_setup_pci_msi 里为该设备建了 ITT
  *   - 这里只做有效性检查，不重复下发命令
  */
-static void vits_cmd_mapd(struct vits_state *vits, uint64_t cmd[4])
+static int vits_cmd_mapd(struct vits_state *vits, uint64_t cmd[4],
+                         uint64_t cmd_offset)
 {
     uint32_t vdevid = (uint32_t)(cmd[0] >> 32);
     uint8_t itt_size = (uint8_t)(cmd[1] & 0x1F);
@@ -294,13 +295,15 @@ static void vits_cmd_mapd(struct vits_state *vits, uint64_t cmd[4])
 
     if (!vits->vm || vits->vm->vmid != 1 ||
         !pci_edu_owns_requester(vdevid)) {
-        WARN("vITS: MAPD rejected for unowned requester %u", vdevid);
-        return;
+        if (!vits->halted || vits->halted_at != cmd_offset)
+            WARN("vITS: MAPD rejected for unowned requester %u", vdevid);
+        vits->halt_reason = VITS_ERR_UNOWNED_DEVICE;
+        return -1;
     }
 
     if (!valid) {
         WARN("vITS: MAPD invalid not supported");
-        return;
+        return 0;
     }
 
     /*
@@ -309,6 +312,7 @@ static void vits_cmd_mapd(struct vits_state *vits, uint64_t cmd[4])
      *
      * 扩展点：未来多设备时，在这里调用 its_setup_pci_msi() 分配。
      */
+    return 0;
 }
 
 /*
@@ -573,7 +577,8 @@ static int vits_process_one(struct vits_state *vits, uint64_t offset)
         vits_cmd_mapc(vits, cmd);
         break;
     case VITS_CMD_MAPD:
-        vits_cmd_mapd(vits, cmd);
+        if (vits_cmd_mapd(vits, cmd, offset) < 0)
+            return -1;
         break;
     case VITS_CMD_MAPTI:
         if (vits_cmd_mapti(vits, cmd, offset) < 0)

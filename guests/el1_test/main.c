@@ -4039,10 +4039,47 @@ static void vits_test(void)
     /* 3. MAPD: requester ID 由 hypervisor ownership 查询返回。 */
     vits_mapd((u32)edu_requester_id, (u64)vits_itt_buf, 3);
 
-    /* 未拥有的 requester 不得创建设备到 LPI 映射。
-     * MAPTI 被拒绝后按 fail-stop 语义停止队列：CREADR 停在该命令槽位，
-     * 之后的命令不被执行。随后通过 CTLR 失能 + 重写 CBASER 复位队列。 */
-    vits_mapd((u32)edu_requester_id + 1, (u64)vits_itt_buf, 3);
+    /* 未拥有的 requester 不得创建设备表项。MAPD 与 MAPTI 一样按 fail-stop
+     * 语义停止队列：CREADR 停在该命令槽位，后续命令不执行。
+     * 手工写槽位而非调用 vits_mapd()，避免其 CREADR 轮询在 halt 下耗尽。 */
+    {
+        u64 *dslot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
+        dslot[0] = ITS_CMD_MAPD | ((u64)((u32)edu_requester_id + 1) << 32);
+        dslot[1] = 3;
+        dslot[2] = (1ULL << 63) | ((u64)vits_itt_buf & ~0xFFULL);
+        dslot[3] = 0;
+        asm volatile("dsb sy" ::: "memory");
+        u32 mapd_halt_slot = vits_cwriter;
+        vits_cwriter += 32;
+        if (vits_cwriter >= VITS_CMDQ_SIZE)
+            vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != mapd_halt_slot) {
+            guest_puts("vITS: FAILED (unowned MAPD did not halt)\n");
+            return;
+        }
+        u32 err = mmio_read32(VITS_BASE + VITS_ERR_STATUS);
+        if ((err & 1) == 0 ||
+            ((err >> 8) & 0xFF) != VITS_ERR_UNOWNED_DEVICE ||
+            (err >> 16) != (mapd_halt_slot / 32)) {
+            guest_puts("vITS: FAILED (unowned MAPD reason not reported)\n");
+            return;
+        }
+        guest_puts("vITS: unowned MAPD halted with UNOWNED_DEVICE\n");
+
+        mmio_write32(VITS_BASE + VITS_CTLR, 0);
+        mmio_write32(VITS_BASE + VITS_CBASER, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) & 0xFFFFFFFFULL));
+        mmio_write32(VITS_BASE + VITS_CBASER + 4, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) >> 32));
+        vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CTLR, 1);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != 0 ||
+            mmio_read32(VITS_BASE + VITS_CWRITER) != 0) {
+            guest_puts("vITS: FAILED (queue reset after MAPD halt)\n");
+            return;
+        }
+    }
+
+    /* 未拥有的 requester 不得创建设备到 LPI 映射。 */
     {
         u64 *slot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
         slot[0] = ITS_CMD_MAPTI | ((u64)((u32)edu_requester_id + 1) << 32);
