@@ -4299,6 +4299,34 @@ static void vits_test(void)
         guest_puts("vITS: DISCARD suppressed interrupt delivery\n");
         mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF, msi_data);
 
+        /* DISCARD 不存在的映射必须幂等成功，且不阻塞队列。 */
+        vits_discard((u32)edu_requester_id, 1);
+        vits_sync();
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != vits_cwriter) {
+            guest_puts("vITS: FAILED (redundant DISCARD did not drain)\n");
+            return;
+        }
+        guest_puts("vITS: redundant DISCARD drained cleanly\n");
+
+        /* DISCARD 后重新 MAPTI 同一事件：映射恢复，中断再次送达。 */
+        vits_mapti((u32)edu_requester_id, 1, VITS_TEST_VLPI, 0);
+        vits_sync();
+        vits_irq_received = 0;
+        vits_irq_intid = 0;
+        mmio_write32(edu_bar0_base + EDU_IRQ_ACK, 0xffffffff);
+        mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF,
+                     (msi_data & 0xFFFF0000) | 1);
+        mmio_write32(edu_bar0_base + EDU_IRQ_RAISE, 0x24681357);
+        timeout = 10000000;
+        while (!vits_irq_received && timeout-- > 0)
+            asm volatile("nop");
+        if (!vits_irq_received || vits_irq_intid != VITS_TEST_VSPI) {
+            guest_puts("vITS: FAILED (remap after DISCARD not delivered)\n");
+            return;
+        }
+        guest_puts("vITS: remap after DISCARD delivered again\n");
+        mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF, msi_data);
+
         if (hvc_call(HVC_PCI_RESET, 0) == 0) {
             u32 pci_id = mmio_read32(ecam_addr);
             u32 bar0 = mmio_read32(ecam_addr + 0x10);
