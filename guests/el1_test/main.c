@@ -1259,6 +1259,7 @@ static u64 edu_bar0_base;
 #define VITS_CREADR        0x0090
 #define VITS_BASER(n)      (0x0100 + (n) * 8)
 #define VITS_TRANSLATER    0x10040
+#define VITS_ERR_STATUS    0x0200      /* 软件定义：bit0=halted, [31:8]=失败槽位 */
 
 /* ITS 命令码 */
 #define ITS_CMD_SYNC       0x05
@@ -4097,6 +4098,16 @@ static void vits_test(void)
             return;
         }
         guest_puts("vITS: unknown opcode halted queue, CREADR retained\n");
+
+        /* 软件错误寄存器必须报告 halted 与失败槽位号。 */
+        {
+            u32 err = mmio_read32(VITS_BASE + VITS_ERR_STATUS);
+            if ((err & 1) == 0 || (err >> 8) != (unk_slot / 32)) {
+                guest_puts("vITS: FAILED (error status does not report halt)\n");
+                return;
+            }
+        }
+        guest_puts("vITS: error status reports halt slot\n");
 
         /* 停止后追加的合法 SYNC 不得被执行：CREADR 必须仍停在未知槽位 unk_slot。 */
         u64 *after = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
