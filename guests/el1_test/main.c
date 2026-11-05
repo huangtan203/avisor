@@ -4402,6 +4402,33 @@ static void vits_test(void)
             return;
         }
         guest_puts("vITS: remap after DISCARD delivered again\n");
+
+        /* MAPD V=0 解除设备映射：撤销该设备全部事件映射，中断被抑制。 */
+        {
+            u64 dw0 = ITS_CMD_MAPD | ((u64)edu_requester_id << 32);
+            u64 dw1 = 3;
+            u64 dw2 = 0;    /* V=0：解除映射 */
+            vits_send_cmd(dw0, dw1, dw2, 0);
+        }
+        vits_sync();
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != vits_cwriter) {
+            guest_puts("vITS: FAILED (MAPD V=0 did not drain)\n");
+            return;
+        }
+        vits_irq_received = 0;
+        vits_irq_intid = 0;
+        mmio_write32(edu_bar0_base + EDU_IRQ_ACK, 0xffffffff);
+        mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF,
+                     (msi_data & 0xFFFF0000) | 1);
+        mmio_write32(edu_bar0_base + EDU_IRQ_RAISE, 0x11223344);
+        timeout = 2000000;
+        while (!vits_irq_received && timeout-- > 0)
+            asm volatile("nop");
+        if (vits_irq_received) {
+            guest_puts("vITS: FAILED (interrupt delivered after MAPD V=0)\n");
+            return;
+        }
+        guest_puts("vITS: MAPD V=0 unmapped device, interrupt suppressed\n");
         mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF, msi_data);
 
         if (hvc_call(HVC_PCI_RESET, 0) == 0) {

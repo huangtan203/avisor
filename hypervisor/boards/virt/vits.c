@@ -240,6 +240,9 @@ static int vits_read_cmd(struct vits_state *vits, uint64_t offset,
 
 /* ---------- 命令处理 ---------- */
 
+/* 撤销单个 (devid, eventid) 映射，DISCARD 与 MAPD V=0 共用。 */
+static int vits_unmap_evt(struct vits_state *vits, int evt_idx);
+
 static void vits_cmd_sync(struct vits_state *vits)
 {
     /* SYNC 空操作（所有命令同步处理） */
@@ -302,7 +305,24 @@ static int vits_cmd_mapd(struct vits_state *vits, uint64_t cmd[4],
     }
 
     if (!valid) {
-        WARN("vITS: MAPD invalid not supported");
+        /*
+         * V=0 表示解除设备映射：撤销该设备已建立的全部事件映射。
+         * 逐项下发物理 DISCARD 并清理路由与反查表；单项失败按 fail-stop
+         * 停止，避免留下部分映射却报告成功。
+         */
+        int unmapped = 0;
+        for (unsigned int i = 0; i < VITS_EVT_MAP_MAX; i++) {
+            if (!vits->evt_map[i].plpi ||
+                vits->evt_map[i].devid != vdevid)
+                continue;
+            if (vits_unmap_evt(vits, (int)i) < 0) {
+                WARN("vITS: MAPD V=0 unmap failed for devid=%u", vdevid);
+                return -1;
+            }
+            unmapped++;
+        }
+        INFO("vITS: MAPD V=0 unmapped %d event(s) for devid=%u",
+             unmapped, vdevid);
         return 0;
     }
 
@@ -496,15 +516,42 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
 }
 
 /*
+ * 撤销单个 (devid, eventid) 映射：下发物理 DISCARD，撤销路由与 shadow，
+ * 清空反查表项。pLPI 保留不复用（避免复用后收到过期中断）。
+ */
+static int vits_unmap_evt(struct vits_state *vits, int evt_idx)
+{
+    uint32_t devid = vits->evt_map[evt_idx].devid;
+    uint32_t eventid = vits->evt_map[evt_idx].eventid;
+    unsigned int plpi = vits->evt_map[evt_idx].plpi;
+
+    if (its_send_discard(devid, eventid) < 0) {
+        WARN("vITS: physical DISCARD failed for devid=%u eventid=%u",
+             devid, eventid);
+        return -1;
+    }
+    if (vits_lpi_revoke_owned(plpi, vits->vm->vmid) < 0) {
+        WARN("vITS: DISCARD route revoke failed for pLPI=%u", plpi);
+        return -1;
+    }
+
+    vits->evt_map[evt_idx].plpi = 0;
+    vits->evt_map[evt_idx].devid = 0;
+    vits->evt_map[evt_idx].eventid = 0;
+
+    INFO("vITS: unmapped devid=%u eventid=%u pLPI=%u (pLPI retained)",
+         devid, eventid, plpi);
+    return 0;
+}
+
+/*
  * DISCARD: 清除 (DeviceID, EventID) 的映射
  *   dw0[63:32] = DeviceID
  *   dw1[31:0]  = EventID
  *
  * 处理：
  *   1. 查反查表定位 pLPI；未映射视为成功（规范允许 DISCARD 不存在的映射）
- *   2. 下发物理 DISCARD
- *   3. 撤销 irq_domain 路由与 lpi_map shadow
- *   4. 清空反查表项；pLPI 保留不复用（避免复用后收到过期中断）
+ *   2. 撤销单项映射（物理 DISCARD、路由与 shadow、反查表）
  */
 static int vits_cmd_discard(struct vits_state *vits, uint64_t cmd[4],
                             uint64_t cmd_offset)
@@ -536,25 +583,7 @@ static int vits_cmd_discard(struct vits_state *vits, uint64_t cmd[4],
         return 0;
     }
 
-    unsigned int plpi = vits->evt_map[evt_idx].plpi;
-
-    if (its_send_discard(vdevid, veventid) < 0) {
-        WARN("vITS: physical DISCARD failed for devid=%u eventid=%u",
-             vdevid, veventid);
-        return -1;
-    }
-    if (vits_lpi_revoke_owned(plpi, vits->vm->vmid) < 0) {
-        WARN("vITS: DISCARD route revoke failed for pLPI=%u", plpi);
-        return -1;
-    }
-
-    vits->evt_map[evt_idx].plpi = 0;
-    vits->evt_map[evt_idx].devid = 0;
-    vits->evt_map[evt_idx].eventid = 0;
-
-    INFO("vITS: DISCARD done: devid=%u eventid=%u pLPI=%u (pLPI retained)",
-         vdevid, veventid, plpi);
-    return 0;
+    return vits_unmap_evt(vits, evt_idx);
 }
 
 /*
