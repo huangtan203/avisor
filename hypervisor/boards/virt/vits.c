@@ -339,6 +339,7 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
         !pci_edu_owns_requester(vdevid)) {
         if (!vits->halted || vits->halted_at != cmd_offset)
             WARN("vITS: MAPTI rejected for unowned requester %u", vdevid);
+        vits->halt_reason = VITS_ERR_UNOWNED_DEVICE;
         return -1;
     }
     if (veventid == 0) {
@@ -458,6 +459,7 @@ static int vits_process_one(struct vits_state *vits, uint64_t offset)
         if (!vits->halted || vits->halted_at != offset)
             WARN("vITS: unknown command opcode 0x%02x at offset 0x%lx",
                  opcode, (unsigned long)offset);
+        vits->halt_reason = VITS_ERR_UNKNOWN_OPCODE;
         return -1;
     }
 
@@ -501,6 +503,7 @@ static void vits_process_cmdq(struct vits_state *vits)
     }
 
     vits->halted = 0;
+    vits->halt_reason = VITS_ERR_OTHER;
     vits->creadr = cw;
 }
 
@@ -594,6 +597,7 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
         vits->creadr = 0;
         vits->halted = 0;
         vits->halted_at = 0;
+        vits->halt_reason = VITS_ERR_OTHER;
         INFO("vITS: CBASER = 0x%lx (cmdq %u bytes)",
              (unsigned long)val, vits->cmdq_bytes);
         break;
@@ -775,9 +779,10 @@ uint64_t vits_mmio_read(struct vits_state *vits, uint32_t offset)
         val = 0;
         break;
     case VITS_ERR_STATUS:
-        /* bit0 = halted，[31:8] = 失败命令槽位号 */
+        /* bit0 = halted，[15:8] = 原因码，[31:16] = 失败命令槽位号 */
         val = (uint64_t)(vits->halted ? 1 : 0) |
-              ((vits->halted_at / VITS_CMD_SIZE) << 8);
+              ((uint64_t)vits->halt_reason << 8) |
+              ((vits->halted_at / VITS_CMD_SIZE) << 16);
         break;
     default:
         WARN("vITS: unknown read offset 0x%x", offset);

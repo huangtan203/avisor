@@ -49,10 +49,18 @@
 
 /*
  * 软件定义的错误状态寄存器（只读，非 GICv3 规范寄存器）。
- * 反映最近一次 fail-stop：bit0 = halted，[31:8] = 失败命令的槽位号。
+ * 反映最近一次 fail-stop：
+ *   bit0     = halted
+ *   [15:8]   = 失败原因码（VITS_ERR_*）
+ *   [31:16]  = 失败命令的槽位号
  * 写入忽略。
  */
 #define VITS_ERR_STATUS   0x0200
+
+/* VITS_ERR_STATUS[15:8] 的失败原因码 */
+#define VITS_ERR_OTHER            0   /* 其它失败（读取失败、分配失败等） */
+#define VITS_ERR_UNKNOWN_OPCODE   1   /* 未知命令 opcode */
+#define VITS_ERR_UNOWNED_DEVICE   2   /* MAPTI 的 requester 不属于本 VM */
 
 /* ITS 命令操作码（与物理 ITS 一致） */
 #define VITS_CMD_SYNC    0x05
@@ -82,6 +90,7 @@ struct vits_state {
      */
     uint64_t halted_at;
     uint8_t halted;
+    uint8_t halt_reason;    /* VITS_ERR_*，仅 halted 为 1 时有效 */
     uint64_t baser[8];      /* GITS_BASERn（Guest GPA） */
 
     /*
