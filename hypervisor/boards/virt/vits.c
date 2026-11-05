@@ -312,6 +312,34 @@ static void vits_cmd_mapd(struct vits_state *vits, uint64_t cmd[4])
 }
 
 /*
+ * MAPTI 失败回滚：
+ *   替换路径（have_prev）恢复替换前的 vINTID，保留反查表仍指向的映射；
+ *   新分配路径删除路由并清空 shadow。
+ */
+static void vits_mapti_rollback(struct vits_state *vits, unsigned int plpi,
+                                int have_prev,
+                                const struct irq_route *prev_route)
+{
+    if (have_prev) {
+        irq_domain_register(plpi, vits->vm->vmid, 0, prev_route->vintid);
+        lpi_map_acquire();
+        lpi_map[plpi - LPI_MAP_BASE].vmid = (uint16_t)vits->vm->vmid;
+        lpi_map[plpi - LPI_MAP_BASE].vintid = prev_route->vintid;
+        lpi_map_release();
+        WARN("vITS: MAPTI rolled back replacement to vINTID=%u",
+             prev_route->vintid);
+        return;
+    }
+
+    irq_domain_unregister_owned(plpi, vits->vm->vmid);
+    lpi_map_acquire();
+    lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
+    lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
+    lpi_map_release();
+    WARN("vITS: MAPTI rolled back new mapping for pLPI %u", plpi);
+}
+
+/*
  * MAPTI: 映射事件到 LPI（EventID → (pINTID, ICID)）
  *   dw0[63:32] = DeviceID
  *   dw1[63:32] = pINTID（Guest 指定的 vINTID/LPI 号）
@@ -425,20 +453,7 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
     asm volatile("dsb sy" ::: "memory");
 
     if (its_send_mapti(vdevid, plpi, veventid, vicid) < 0) {
-        if (have_prev) {
-            /* 替换失败：把路由与 shadow 恢复成替换前的 vINTID。 */
-            irq_domain_register(plpi, vits->vm->vmid, 0,
-                                prev_route.vintid);
-            lpi_map_acquire();
-            lpi_map[plpi - LPI_MAP_BASE].vmid = (uint16_t)vits->vm->vmid;
-            lpi_map[plpi - LPI_MAP_BASE].vintid = prev_route.vintid;
-            lpi_map_release();
-            WARN("vITS: physical MAPTI failed, replacement rolled back to vINTID=%u",
-                 prev_route.vintid);
-        } else {
-            irq_domain_unregister_owned(plpi, vits->vm->vmid);
-            WARN("vITS: physical MAPTI failed, software route rolled back");
-        }
+        vits_mapti_rollback(vits, plpi, have_prev, &prev_route);
         return -1;
     }
     lpi_map_acquire();
@@ -447,12 +462,7 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
     lpi_map_release();
     if (vits_lpi_audit_owned_range(plpi, 1, vits->vm->vmid,
                                    vintid) < 0) {
-        irq_domain_unregister_owned(plpi, vits->vm->vmid);
-        lpi_map_acquire();
-        lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
-        lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
-        lpi_map_release();
-        WARN("vITS: MAPTI mapping audit failed; route rolled back");
+        vits_mapti_rollback(vits, plpi, have_prev, &prev_route);
         return -1;
     }
 
