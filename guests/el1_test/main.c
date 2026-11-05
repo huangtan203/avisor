@@ -4166,6 +4166,46 @@ static void vits_test(void)
         }
     }
 
+    /* 未拥有 requester 的 DISCARD 必须被拒绝并以 UNOWNED_DEVICE 报告。
+     * 手工构造槽位：vits_discard() 会轮询 CREADR 追平，在 fail-stop
+     * 下必然超时并打印误导性的 timeout 日志。 */
+    {
+        u64 *dslot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
+        dslot[0] = ITS_CMD_DISCARD | ((u64)((u32)edu_requester_id + 1) << 32);
+        dslot[1] = 1;
+        dslot[2] = 0;
+        dslot[3] = 0;
+        asm volatile("dsb sy" ::: "memory");
+        u32 dslot_off = vits_cwriter;
+        vits_cwriter += 32;
+        if (vits_cwriter >= VITS_CMDQ_SIZE)
+            vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != dslot_off) {
+            guest_puts("vITS: FAILED (unowned DISCARD was not rejected)\n");
+            return;
+        }
+        u32 err = mmio_read32(VITS_BASE + VITS_ERR_STATUS);
+        if ((err & 1) == 0 ||
+            ((err >> 8) & 0xFF) != VITS_ERR_UNOWNED_DEVICE ||
+            (err >> 16) != (dslot_off / 32)) {
+            guest_puts("vITS: FAILED (unowned DISCARD reason not reported)\n");
+            return;
+        }
+    }
+    guest_puts("vITS: unowned DISCARD rejected with UNOWNED_DEVICE\n");
+
+    mmio_write32(VITS_BASE + VITS_CTLR, 0);
+    mmio_write32(VITS_BASE + VITS_CBASER, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) & 0xFFFFFFFFULL));
+    mmio_write32(VITS_BASE + VITS_CBASER + 4, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) >> 32));
+    vits_cwriter = 0;
+    mmio_write32(VITS_BASE + VITS_CTLR, 1);
+    if (mmio_read32(VITS_BASE + VITS_CREADR) != 0 ||
+        mmio_read32(VITS_BASE + VITS_CWRITER) != 0) {
+        guest_puts("vITS: FAILED (queue reset after unowned DISCARD)\n");
+        return;
+    }
+
     /* 物理 MAPTI 完成前不得发布软件 route/shadow mapping。 */
     vits_mapti((u32)edu_requester_id, 2, VITS_TEST_VLPI + 1, 0);
 
