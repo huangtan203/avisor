@@ -71,6 +71,9 @@
 /* 命令大小：32 字节 */
 #define VITS_CMD_SIZE    32
 
+/* MAPTI (devid, eventid) 反查表容量 */
+#define VITS_EVT_MAP_MAX 64
+
 /*
  * per-VM vITS 状态
  *
@@ -92,6 +95,17 @@ struct vits_state {
     uint8_t halted;
     uint8_t halt_reason;    /* VITS_ERR_*，仅 halted 为 1 时有效 */
     uint64_t baser[8];      /* GITS_BASERn（Guest GPA） */
+
+    /*
+     * MAPTI 替换语义的反查表：(vdevid, veventid) -> pLPI。
+     * 同一 (vdevid, veventid) 再次 MAPTI 时复用已分配的 pLPI，不消耗新 pLPI。
+     * plpi 为 0 表示该槽位空闲。
+     */
+    struct vits_evt_map {
+        uint32_t plpi;
+        uint32_t devid;
+        uint32_t eventid;
+    } evt_map[VITS_EVT_MAP_MAX];
 
     /*
      * 命令队列大小（字节）。

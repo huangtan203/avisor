@@ -376,11 +376,28 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
      * 这里不做范围限制，Guest 传什么存什么。
      */
 
-    /* 原子保留一个唯一的物理 LPI；失败后不回退全局 cursor。 */
+    /*
+     * 替换语义：同一 (vdevid, veventid) 已有映射时复用其 pLPI，
+     * 不消耗新 pLPI；irq_domain 与 shadow 以新 vINTID 原位覆盖。
+     */
+    int evt_idx = -1;
+    for (unsigned int i = 0; i < VITS_EVT_MAP_MAX; i++) {
+        if (vits->evt_map[i].plpi && vits->evt_map[i].devid == vdevid &&
+            vits->evt_map[i].eventid == veventid) {
+            evt_idx = (int)i;
+            break;
+        }
+    }
+
     unsigned int plpi;
-    if (vits_reserve_plpi(&plpi) < 0) {
-        WARN("vITS: no free physical LPI");
-        return -1;
+    if (evt_idx >= 0) {
+        plpi = vits->evt_map[evt_idx].plpi;
+    } else {
+        /* 原子保留一个唯一的物理 LPI；失败后不回退全局 cursor。 */
+        if (vits_reserve_plpi(&plpi) < 0) {
+            WARN("vITS: no free physical LPI");
+            return -1;
+        }
     }
 
     /* 记录映射 */
@@ -417,6 +434,29 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
         lpi_map_release();
         WARN("vITS: MAPTI mapping audit failed; route rolled back");
         return -1;
+    }
+
+    /* 记录 (vdevid, veventid) -> pLPI，供后续替换复用。 */
+    if (evt_idx < 0) {
+        for (unsigned int i = 0; i < VITS_EVT_MAP_MAX; i++) {
+            if (!vits->evt_map[i].plpi) {
+                vits->evt_map[i].plpi = plpi;
+                vits->evt_map[i].devid = vdevid;
+                vits->evt_map[i].eventid = veventid;
+                evt_idx = (int)i;
+                break;
+            }
+        }
+        if (evt_idx < 0) {
+            irq_domain_unregister_owned(plpi, vits->vm->vmid);
+            lpi_map_acquire();
+            lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
+            lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
+            lpi_map_release();
+            WARN("vITS: MAPTI reverse map full for devid=%u eventid=%u",
+                 vdevid, veventid);
+            return -1;
+        }
     }
 
     INFO("vITS: MAPTI done: vINTID=%u -> pLPI=%u (vmid=%u)",

@@ -4158,7 +4158,10 @@ static void vits_test(void)
     vits_mapti((u32)edu_requester_id, 2, VITS_TEST_VLPI + 1, 0);
 
     /* 4. MAPTI: eventid=1 -> vLPI=VITS_TEST_VLPI, icid=0
-     * 用 eventid=1 避免和 Phase 8 已配置的 eventid=0 冲突 */
+     * 用 eventid=1 避免和 Phase 8 已配置的 eventid=0 冲突。
+     * 先以 VITS_TEST_VLPI+2 建立映射，再以 VITS_TEST_VLPI 替换：
+     * 后者必须复用同一 pLPI，且中断按替换后的 vINTID 注入。 */
+    vits_mapti((u32)edu_requester_id, 1, VITS_TEST_VLPI + 2, 0);
     vits_mapti((u32)edu_requester_id, 1, VITS_TEST_VLPI, 0);
 
     vits_sync();
