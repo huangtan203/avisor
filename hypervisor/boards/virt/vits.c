@@ -478,11 +478,8 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
             }
         }
         if (evt_idx < 0) {
-            irq_domain_unregister_owned(plpi, vits->vm->vmid);
-            lpi_map_acquire();
-            lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
-            lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
-            lpi_map_release();
+            /* 新分配路径：无旧路由可恢复，prev_route 不被访问。 */
+            vits_mapti_rollback(vits, plpi, 0, NULL);
             WARN("vITS: MAPTI reverse map full for devid=%u eventid=%u",
                  vdevid, veventid);
             return -1;
