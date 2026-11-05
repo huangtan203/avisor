@@ -47,6 +47,13 @@
 #define VITS_BASER(n)     (0x0100 + (n) * 8)  /* 表基址 n=0..7 */
 #define VITS_TRANSLATER   0x10040  /* MSI doorbell（WO） */
 
+/*
+ * 软件定义的错误状态寄存器（只读，非 GICv3 规范寄存器）。
+ * 反映最近一次 fail-stop：bit0 = halted，[31:8] = 失败命令的槽位号。
+ * 写入忽略。
+ */
+#define VITS_ERR_STATUS   0x0200
+
 /* ITS 命令操作码（与物理 ITS 一致） */
 #define VITS_CMD_SYNC    0x05
 #define VITS_CMD_MAPD    0x08

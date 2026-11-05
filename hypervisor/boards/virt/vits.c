@@ -640,6 +640,10 @@ void vits_mmio_write(struct vits_state *vits, uint32_t offset, uint64_t val)
         /* Guest software doorbell writes are ignored for passthrough devices. */
         break;
 
+    case VITS_ERR_STATUS:
+        /* 软件定义的只读状态寄存器，写忽略。 */
+        break;
+
     default:
         WARN("vITS: unknown write offset 0x%x val=0x%lx",
              offset, (unsigned long)val);
@@ -769,6 +773,11 @@ uint64_t vits_mmio_read(struct vits_state *vits, uint32_t offset)
         break;
     case VITS_TRANSLATER:
         val = 0;
+        break;
+    case VITS_ERR_STATUS:
+        /* bit0 = halted，[31:8] = 失败命令槽位号 */
+        val = (uint64_t)(vits->halted ? 1 : 0) |
+              ((vits->halted_at / VITS_CMD_SIZE) << 8);
         break;
     default:
         WARN("vITS: unknown read offset 0x%x", offset);
