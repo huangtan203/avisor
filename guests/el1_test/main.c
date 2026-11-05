@@ -1261,6 +1261,7 @@ static u64 edu_bar0_base;
 #define VITS_TRANSLATER    0x10040
 #define VITS_ERR_STATUS    0x0200      /* 软件定义：bit0=halted, [15:8]=原因, [31:16]=槽位 */
 #define VITS_ERR_UNKNOWN_OPCODE 1
+#define VITS_ERR_UNOWNED_DEVICE 2
 
 /* ITS 命令码 */
 #define ITS_CMD_SYNC       0x05
@@ -3971,12 +3972,14 @@ static void vits_test(void)
     guest_puts("vITS: enabled CBASER write rejected\n");
 
     /* 低字缓存不能跨越 CTLR disable/enable 状态转换。 */
+    u32 baser0_lo_before = mmio_read32(VITS_BASE + VITS_BASER(0));
+    u32 baser0_hi_before = mmio_read32(VITS_BASE + VITS_BASER(0) + 4);
     mmio_write32(VITS_BASE + VITS_BASER(0), 0x12345000U);
     mmio_write32(VITS_BASE + VITS_CTLR, 0);
     mmio_write32(VITS_BASE + VITS_CTLR, 1);
     mmio_write32(VITS_BASE + VITS_BASER(0) + 4, 0);
-    if (mmio_read32(VITS_BASE + VITS_BASER(0)) != 0x40014000U ||
-        mmio_read32(VITS_BASE + VITS_BASER(0) + 4) != 0x80000000U) {
+    if (mmio_read32(VITS_BASE + VITS_BASER(0)) != baser0_lo_before ||
+        mmio_read32(VITS_BASE + VITS_BASER(0) + 4) != baser0_hi_before) {
         guest_puts("vITS: FAILED (BASER cache survived CTLR transition)\n");
         return;
     }
@@ -4045,6 +4048,18 @@ static void vits_test(void)
             return;
         }
         guest_puts("vITS: unowned MAPTI halted queue, CREADR retained\n");
+
+        /* 未拥有 requester 的拒绝必须以 UNOWNED_DEVICE 原因码报告。 */
+        {
+            u32 err = mmio_read32(VITS_BASE + VITS_ERR_STATUS);
+            if ((err & 1) == 0 ||
+                ((err >> 8) & 0xFF) != VITS_ERR_UNOWNED_DEVICE ||
+                (err >> 16) != (halt_slot / 32)) {
+                guest_puts("vITS: FAILED (unowned MAPTI reason not reported)\n");
+                return;
+            }
+        }
+        guest_puts("vITS: unowned MAPTI reason reported\n");
 
         /* 重放：重写相同 CWRITER 会从 CREADR 再次处理失败的 MAPTI，
          * 去重后不得再次告警，CREADR 仍停在 halt_slot。 */
