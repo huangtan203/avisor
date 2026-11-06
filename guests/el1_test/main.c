@@ -1746,7 +1746,18 @@ static void test_shared_memory(void)
     volatile char *shm_ptr = (volatile char *)shm_ipa;
 
     if (vmid == 1) {
-        /* VM1: 主动方 — 写 "PING" 然后忙等 "PONG" */
+        /* VM1: 主动方 — 等 VM2 置 READY 后写 "PING"，再忙等 "PONG" */
+        /* 等 VM2 attach 并置 READY（偏移 8），再写 PING，避免 PING 早于对端就绪 */
+        int ready_wait = 1000000;
+        while (shm_ptr[8] != 'R' && --ready_wait > 0)
+            hvc_call(HVC_SCHED_YIELD, 0);
+        if (shm_ptr[8] != 'R') {
+            guest_puts("shm: FAILED (VM1 timeout waiting for VM2 READY)\n");
+            hvc_call(HVC_SHM_DETACH, (u64)shmid);
+            guest_puts("shm: detached\n");
+            return;
+        }
+
         shm_ptr[0] = 'P';
         shm_ptr[1] = 'I';
         shm_ptr[2] = 'N';
@@ -1772,8 +1783,10 @@ static void test_shared_memory(void)
             guest_puts("shm: FAILED (VM1 timeout waiting for PONG)\n");
         }
     } else {
-        /* VM2: 被动方 — 忙等 "PING"，然后回复 "PONG" */
-        guest_puts("shm: VM2 waiting for 'PING'...\n");
+        /* VM2: 被动方 — 置 READY，忙等 "PING"，然后回复 "PONG" */
+        shm_ptr[8] = 'R';
+        asm volatile("dsb sy" ::: "memory");
+        guest_puts("shm: VM2 ready, waiting for 'PING'...\n");
 
         /* 忙等 PING，循环中 yield 让出 CPU */
         int timeout = 50000;  /* yield 次数 */
