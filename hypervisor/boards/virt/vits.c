@@ -636,8 +636,14 @@ static int vits_process_one(struct vits_state *vits, uint64_t offset)
 {
     uint64_t cmd[4];
 
-    if (vits_read_cmd(vits, offset, cmd) < 0)
+    if (vits_read_cmd(vits, offset, cmd) < 0) {
+        /*
+         * 读取失败（页未映射、CBASER 非法等）：必须显式覆盖原因码，
+         * 否则会残留上一条失败命令的原因，ERR_STATUS 上报错误原因。
+         */
+        vits->halt_reason = VITS_ERR_OTHER;
         return -1;
+    }
 
     uint8_t opcode = (uint8_t)(cmd[0] & 0xFF);
 
