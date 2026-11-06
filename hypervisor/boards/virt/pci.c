@@ -1786,6 +1786,22 @@ void pci_init(void)
         edu_resource->msi_ctrl = (edu_resource->msi_ctrl &
                                   ~PCI_MSI_CTRL_EN) | PCI_MSI_CTRL_EN;
         unsigned int owned_vectors = max_vectors > 16 ? 16 : max_vectors;
+        /*
+         * 运行时校验：edu MSI 的 vSPI 由 vINTID 经共享换算函数得出，
+         * 必须落在合法的 SPI 区间且不与已有虚拟中断冲突。
+         * 该前提此前只靠常量取值保证，任一端改动都会静默破坏。
+         */
+        for (unsigned int i = 0; i < owned_vectors; i++) {
+            uint32_t vintid = EDU_MSI_VINTID_BASE + i;
+            uint32_t vspi = vintid_to_vspi(vintid);
+            if (vspi < 32 || vspi >= 1020 ||
+                vspi == VIRQ_VIRTIO_NET || vspi == VIRQ_IVSHMEM ||
+                vspi == VIRQ_PCI_EDU) {
+                WARN("PCI: edu MSI vINTID %u maps to invalid vSPI %u",
+                     vintid, vspi);
+                return;
+            }
+        }
         for (unsigned int i = 0; i < owned_vectors; i++) {
             if (irq_domain_register(lpi_base + i, 1, 0,
                                     EDU_MSI_VINTID_BASE + i) < 0) {

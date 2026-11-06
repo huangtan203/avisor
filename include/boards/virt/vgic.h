@@ -23,6 +23,19 @@ struct vm_virt_state;
 #define VIRQ_PCI_EDU    50  /* PCI 直通 edu INTx 转发的虚拟 SPI */
 
 /*
+ * LPI vINTID 到注入 vSPI 的换算（注入路径与运行时校验共用）。
+ * vINTID >= 8192 时映射到 64 起的 vSPI 区间，否则原样保留。
+ */
+#define VITS_LPI_VINTID_BASE  8192
+#define VITS_LPI_VSPI_BASE    64
+static inline uint32_t vintid_to_vspi(uint32_t vintid)
+{
+    return (vintid >= VITS_LPI_VINTID_BASE)
+               ? (VITS_LPI_VSPI_BASE + (vintid - VITS_LPI_VINTID_BASE))
+               : vintid;
+}
+
+/*
  * Phase 15: 虚拟 GIC Distributor (GICD) 状态
  *
  * GICv3 的 CPU 接口 (ICC_*_EL1) 由硬件自动虚拟化（直通），但

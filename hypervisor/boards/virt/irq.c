@@ -156,9 +156,7 @@ void handle_irq(void)
             }
 
             if (target_vm) {
-                uint32_t vspi = (tgt_vintid >= 8192)
-                                    ? (64 + (tgt_vintid - 8192))
-                                    : tgt_vintid;
+                uint32_t vspi = vintid_to_vspi(tgt_vintid);
                 vgic_inject_virq_to_vm(target_vm, vspi);
             }
 

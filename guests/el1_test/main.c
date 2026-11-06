@@ -1464,6 +1464,13 @@ static volatile u32 vits_irq_intid = 0;
 /* 转换为虚拟 SPI 号（与 irq.c 公式一致：vSPI = 64 + (vLPI - 8192)） */
 #define VITS_TEST_VSPI        (64 + (VITS_TEST_VLPI - 8192))
 
+/*
+ * 编译期一致性：edu MSI 的 vSPI 与 vITS 测试的 vSPI 必须相同。
+ * hypervisor 侧 EDU_MSI_VINTID_BASE 与此处 VITS_TEST_VLPI 同为 8200，
+ * 任一端改动会使负数组长度触发编译错误。
+ */
+typedef char pci_edu_vspi_matches_vits[(PCI_EDU_IRQ == VITS_TEST_VSPI) ? 1 : -1];
+
 static u64 edu_ecam_base;
 static u64 edu_requester_id;
 
