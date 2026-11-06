@@ -4470,6 +4470,39 @@ static void vits_test(void)
         guest_puts("vITS: MAPD V=0 unmapped device, interrupt suppressed\n");
         mmio_write32(ecam_addr + msi_cap_off + PCI_MSI_DATA_OFF, msi_data);
 
+        /*
+         * 共享 vSPI 72 回归：edu 原生 MSI（EventID 0）不经 vITS 映射，
+         * MAPD V=0 只撤销 evt_map 中的事件，不得破坏它。edu 与 vITS
+         * 虽然注入同一个 vSPI，但各自的中断通路必须仍然独立有效。
+         */
+        edu_irq_received = 0;
+        edu_irq_status_val = 0;
+        vits_irq_received = 0;
+        vits_irq_intid = 0;
+        mmio_write32(edu_bar0_base + EDU_IRQ_ACK, 0xffffffff);
+        mmio_write32(edu_bar0_base + EDU_IRQ_RAISE, 0x5a5a5a5a);
+        timeout = 10000000;
+        while (!edu_irq_received && timeout-- > 0)
+            asm volatile("nop");
+        if (!edu_irq_received ||
+            edu_irq_status_val != 0x5a5a5a5a) {
+            guest_puts("vITS: FAILED (edu MSI lost after MAPD V=0, status=0x");
+            puts_hex(edu_irq_status_val, 8);
+            guest_puts(")\n");
+            return;
+        }
+        if (vits_irq_intid != PCI_EDU_IRQ) {
+            guest_puts("vITS: FAILED (shared vSPI not ");
+            puts_dec(PCI_EDU_IRQ);
+            guest_puts(", got ");
+            puts_dec(vits_irq_intid);
+            guest_puts(")\n");
+            return;
+        }
+        guest_puts("vITS: edu MSI and vITS share vSPI ");
+        puts_dec(PCI_EDU_IRQ);
+        guest_puts(", both paths still deliver\n");
+
         if (hvc_call(HVC_PCI_RESET, 0) == 0) {
             u32 pci_id = mmio_read32(ecam_addr);
             u32 bar0 = mmio_read32(ecam_addr + 0x10);
