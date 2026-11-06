@@ -416,6 +416,18 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
         vits->halt_reason = VITS_ERR_OTHER;
         return -1;
     }
+    /*
+     * EventID 运行时校验：必须落在物理 ITT 容量内。越界 EventID 不会在
+     * vITS 层被拒绝，而会令物理命令队列挂死并影响所有 VM，因此在任何
+     * 副作用之前拒绝。
+     */
+    if (veventid >= ITS_ITT_MAX_EVENTS) {
+        if (!vits->halted || vits->halted_at != cmd_offset)
+            WARN("vITS: MAPTI eventid %u exceeds ITT capacity %u",
+                 veventid, ITS_ITT_MAX_EVENTS);
+        vits->halt_reason = VITS_ERR_OTHER;
+        return -1;
+    }
 
     if (veventid == 0) {
         unsigned int plpi = pci_edu_lpi_base;

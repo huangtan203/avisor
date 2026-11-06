@@ -53,9 +53,8 @@
  * 否则无法抢占 EL1 guest 上下文（RPR 卡在 0x80） */
 #define LPI_PROP_PRIO     0x60
 
-/* ITT 表大小字段（MAPD dw1[4:0]）：表项数 = 2^(size+1) = 16 */
-#define ITS_ITT_SIZE_SHIFT  3
-#define ITS_ITT_MAX_EVENTS  (1 << (ITS_ITT_SIZE_SHIFT + 1))
+/* ITT 表大小字段（MAPD dw1[4:0]）：表项数 = 2^(size+1) = 16。
+ * ITS_ITT_SIZE_SHIFT / ITS_ITT_MAX_EVENTS 定义在 its.h，供 vITS 共用。 */
 
 /* 命令队列容量：1 页 = 4096 / 32 = 128 条命令 */
 #define ITS_CMDQ_BYTES  PAGE_SIZE
@@ -132,6 +131,36 @@ static void its_free_lpi_range(unsigned int lpi_base,
  * CWRITER.Offset 字段位于 [19:5]（命令 32 字节对齐），
  * 直接写 32 对齐的字节偏移即可正确编码。
  */
+/*
+ * 物理 ITS 命令队列挂死后的恢复。
+ *
+ * 触发场景：Guest 下发的 MAPTI 使用超出 ITT 容量的 EventID 时，
+ * QEMU 的 ITS 会停在处理该命令的过程中不再推进 CREADR，队列永久挂死。
+ * 若不恢复，之后所有物理 ITS 命令（包括其它 VM 的）都会被拒绝，
+ * 影响面远超单个 Guest。
+ *
+ * 恢复依据：ITS 使能时 CBASER 只读，必须先清 CTLR.Enabled；
+ * 队列内容无需清零——写 CBASER 会把 CWRITER/CREADR 一并复位。
+ * 恢复后清除 cq_stalled，允许后续命令继续下发。
+ */
+static void its_reset_cmdq(void)
+{
+    put32(GITS_CTLR, 0);
+    put64(GITS_CBASER, (1ULL << 63) | (uint64_t)cmdq_pa);
+    put64(GITS_CWRITER, 0);
+    put32(GITS_CTLR, 0x1);
+
+    cq_byte_off = 0;
+    cq_stalled = 0;
+
+    if (!(get32(GITS_CTLR) & 0x1)) {
+        cq_stalled = 1;
+        WARN("ITS: command queue reset failed (CTLR=0x%x)", get32(GITS_CTLR));
+        return;
+    }
+    INFO("ITS: command queue reset complete; resuming");
+}
+
 static int its_send_cmd(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3)
 {
     if (cq_stalled) {
@@ -158,9 +187,9 @@ static int its_send_cmd(uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3)
     while (get64(GITS_CREADR) != cq_byte_off && --timeout > 0)
         ;
     if (timeout == 0) {
-        cq_stalled = 1;
-        WARN("ITS: command queue stalled (CWR=%u CRR=%lu); future commands rejected",
+        WARN("ITS: command queue stalled (CWR=%u CRR=%lu); resetting queue",
              cq_byte_off, (unsigned long)get64(GITS_CREADR));
+        its_reset_cmdq();
         return -1;
     }
     return 0;

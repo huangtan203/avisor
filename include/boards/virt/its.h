@@ -32,6 +32,14 @@
 #include "common/types.h"
 
 /*
+ * 单个设备 ITT 支持的 EventID 数量（2^(size+1)，size=3）。
+ * vITS 的 MAPTI 必须据此拒绝越界 EventID：超出范围的事件在物理 ITS
+ * 上会令命令队列永久挂死，影响所有 VM。
+ */
+#define ITS_ITT_SIZE_SHIFT  3
+#define ITS_ITT_MAX_EVENTS  (1 << (ITS_ITT_SIZE_SHIFT + 1))
+
+/*
  * ITS 初始化（在 gic_init 之后、pci_init 之前调用）：
  *   - 分配并安装 CPU0 的 LPI 配置表/挂起表
  *   - 分配命令队列 + 设备表 + 集合表并编程 BASER/CBASER

@@ -4190,6 +4190,46 @@ static void vits_test(void)
         }
     }
 
+    /*
+     * 越界 EventID（>= ITT 容量 16）的 MAPTI 必须被 vITS 拒绝，
+     * 且不得让物理 ITS 命令队列挂死——修复前它会让所有 VM 的
+     * 物理 ITS 命令永久失败。
+     */
+    {
+        u64 *eslot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
+        eslot[0] = ITS_CMD_MAPTI | ((u64)((u32)edu_requester_id) << 32);
+        eslot[1] = ((u64)(VITS_TEST_VLPI + 3) << 32) | 20;
+        eslot[2] = 0;
+        eslot[3] = 0;
+        asm volatile("dsb sy" ::: "memory");
+        u32 evt_halt_slot = vits_cwriter;
+        vits_cwriter += 32;
+        if (vits_cwriter >= VITS_CMDQ_SIZE)
+            vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != evt_halt_slot) {
+            guest_puts("vITS: FAILED (overflow eventid MAPTI was accepted)\n");
+            return;
+        }
+        u32 evt_err = mmio_read32(VITS_BASE + VITS_ERR_STATUS);
+        if ((evt_err & 1) == 0 || (evt_err >> 16) != (evt_halt_slot / 32)) {
+            guest_puts("vITS: FAILED (overflow eventid reason not reported)\n");
+            return;
+        }
+        guest_puts("vITS: overflow eventid MAPTI rejected without ITS stall\n");
+
+        mmio_write32(VITS_BASE + VITS_CTLR, 0);
+        mmio_write32(VITS_BASE + VITS_CBASER, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) & 0xFFFFFFFFULL));
+        mmio_write32(VITS_BASE + VITS_CBASER + 4, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) >> 32));
+        vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CTLR, 1);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != 0 ||
+            mmio_read32(VITS_BASE + VITS_CWRITER) != 0) {
+            guest_puts("vITS: FAILED (queue reset after overflow eventid)\n");
+            return;
+        }
+    }
+
     /* 未拥有的 requester 不得创建设备到 LPI 映射。 */
     {
         u64 *slot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
