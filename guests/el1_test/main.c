@@ -4171,6 +4171,25 @@ static void vits_test(void)
         }
     }
 
+    /* 合法上界 vINTID=9147（vSPI 1019）必须被接受，不得 halt。 */
+    {
+        vits_mapti((u32)edu_requester_id, 3, 9147, 0);
+        vits_sync();
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != vits_cwriter ||
+            (mmio_read32(VITS_BASE + VITS_ERR_STATUS) & 1)) {
+            guest_puts("vITS: FAILED (legal max vINTID 9147 rejected)\n");
+            return;
+        }
+        guest_puts("vITS: legal max vINTID 9147 accepted\n");
+        /* 撤销该映射，避免残留影响后续用例的反查表占用。 */
+        vits_discard((u32)edu_requester_id, 3);
+        vits_sync();
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != vits_cwriter) {
+            guest_puts("vITS: FAILED (discard of max vINTID did not drain)\n");
+            return;
+        }
+    }
+
     /* 未拥有的 requester 不得创建设备到 LPI 映射。 */
     {
         u64 *slot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
