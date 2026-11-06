@@ -4125,11 +4125,17 @@ static void vits_test(void)
         }
     }
 
-    /* 非法 vINTID（小于 LPI 基址）的 MAPTI 必须 fail-stop，不得分配 pLPI。 */
+    /*
+     * 非法 vINTID 的 MAPTI 必须 fail-stop，不得分配 pLPI。
+     * 下界：5 < 8192；上界：9148 换算得 vSPI 1020，超出 SPI 上限。
+     * 9147 换算得 1019，是合法的最大值，不在负面用例中。
+     */
     {
+        static const u32 bad_vintid[2] = { 5, 9148 };
+        for (unsigned int bi = 0; bi < 2; bi++) {
         u64 *islot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
         islot[0] = ITS_CMD_MAPTI | ((u64)((u32)edu_requester_id) << 32);
-        islot[1] = ((u64)5 << 32) | 1;  /* vINTID=5（非 LPI） */
+        islot[1] = ((u64)bad_vintid[bi] << 32) | 1;
         islot[2] = 0;
         islot[3] = 0;
         asm volatile("dsb sy" ::: "memory");
@@ -4148,7 +4154,9 @@ static void vits_test(void)
             guest_puts("vITS: FAILED (invalid vINTID reason not reported)\n");
             return;
         }
-        guest_puts("vITS: invalid vINTID MAPTI halted\n");
+        guest_puts("vITS: invalid vINTID ");
+        puts_dec(bad_vintid[bi]);
+        guest_puts(" MAPTI halted\n");
 
         mmio_write32(VITS_BASE + VITS_CTLR, 0);
         mmio_write32(VITS_BASE + VITS_CBASER, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) & 0xFFFFFFFFULL));
@@ -4159,6 +4167,7 @@ static void vits_test(void)
             mmio_read32(VITS_BASE + VITS_CWRITER) != 0) {
             guest_puts("vITS: FAILED (queue reset after invalid vINTID)\n");
             return;
+        }
         }
     }
 
