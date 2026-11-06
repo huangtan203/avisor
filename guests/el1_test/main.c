@@ -4125,6 +4125,43 @@ static void vits_test(void)
         }
     }
 
+    /* 非法 vINTID（小于 LPI 基址）的 MAPTI 必须 fail-stop，不得分配 pLPI。 */
+    {
+        u64 *islot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
+        islot[0] = ITS_CMD_MAPTI | ((u64)((u32)edu_requester_id) << 32);
+        islot[1] = ((u64)5 << 32) | 1;  /* vINTID=5（非 LPI） */
+        islot[2] = 0;
+        islot[3] = 0;
+        asm volatile("dsb sy" ::: "memory");
+        u32 ivint_halt_slot = vits_cwriter;
+        vits_cwriter += 32;
+        if (vits_cwriter >= VITS_CMDQ_SIZE)
+            vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != ivint_halt_slot) {
+            guest_puts("vITS: FAILED (invalid vINTID MAPTI did not halt)\n");
+            return;
+        }
+        u32 err = mmio_read32(VITS_BASE + VITS_ERR_STATUS);
+        if ((err & 1) == 0 ||
+            (err >> 16) != (ivint_halt_slot / 32)) {
+            guest_puts("vITS: FAILED (invalid vINTID reason not reported)\n");
+            return;
+        }
+        guest_puts("vITS: invalid vINTID MAPTI halted\n");
+
+        mmio_write32(VITS_BASE + VITS_CTLR, 0);
+        mmio_write32(VITS_BASE + VITS_CBASER, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) & 0xFFFFFFFFULL));
+        mmio_write32(VITS_BASE + VITS_CBASER + 4, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) >> 32));
+        vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CTLR, 1);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != 0 ||
+            mmio_read32(VITS_BASE + VITS_CWRITER) != 0) {
+            guest_puts("vITS: FAILED (queue reset after invalid vINTID)\n");
+            return;
+        }
+    }
+
     /* 未拥有的 requester 不得创建设备到 LPI 映射。 */
     {
         u64 *slot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);

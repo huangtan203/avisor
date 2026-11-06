@@ -403,6 +403,20 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
         vits->halt_reason = VITS_ERR_UNOWNED_DEVICE;
         return -1;
     }
+    /*
+     * vINTID 运行时校验：ITS 映射的虚拟中断必须是 LPI（>= 8192）。
+     * 小于该值的号（SGI/PPI/SPI）会被 irq.c 原样当作 SPI 注入，与已有
+     * 设备或 vtimer 冲突；超出 SPI 上限的换算结果同样非法。
+     * 校验在任何副作用之前执行，失败时不分配 pLPI、不下发物理命令。
+     */
+    if (vintid < VITS_LPI_VINTID_BASE ||
+        vintid_to_vspi(vintid) >= 1020) {
+        if (!vits->halted || vits->halted_at != cmd_offset)
+            WARN("vITS: MAPTI invalid vINTID %u", vintid);
+        vits->halt_reason = VITS_ERR_OTHER;
+        return -1;
+    }
+
     if (veventid == 0) {
         unsigned int plpi = pci_edu_lpi_base;
         if (!plpi || irq_domain_register(plpi, vits->vm->vmid, 0,
