@@ -454,6 +454,23 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
     if (evt_idx >= 0) {
         plpi = vits->evt_map[evt_idx].plpi;
     } else {
+        /*
+         * 先确认反查表有空位，再分配 pLPI 与下发物理 MAPTI：
+         * 表满若在物理 MAPTI 之后才发现，已生效的物理映射无法经 DISCARD
+         * 释放（反查表中无记录），pLPI 会永久泄漏。
+         */
+        int free_slot = -1;
+        for (unsigned int i = 0; i < VITS_EVT_MAP_MAX; i++) {
+            if (!vits->evt_map[i].plpi) {
+                free_slot = (int)i;
+                break;
+            }
+        }
+        if (free_slot < 0) {
+            WARN("vITS: MAPTI reverse map full for devid=%u eventid=%u",
+                 vdevid, veventid);
+            return -1;
+        }
         /* 原子保留一个唯一的物理 LPI；失败后不回退全局 cursor。 */
         if (vits_reserve_plpi(&plpi) < 0) {
             WARN("vITS: no free physical LPI");
@@ -511,9 +528,12 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
             }
         }
         if (evt_idx < 0) {
-            /* 新分配路径：无旧路由可恢复，prev_route 不被访问。 */
+            /*
+             * 前置检查已确认存在空位，且命令队列为单线程处理，此处不可能
+             * 失败。若发生，说明反查表被并发修改，必须回滚已生效的物理映射。
+             */
             vits_mapti_rollback(vits, plpi, 0, NULL);
-            WARN("vITS: MAPTI reverse map full for devid=%u eventid=%u",
+            WARN("vITS: MAPTI reverse map slot vanished for devid=%u eventid=%u",
                  vdevid, veventid);
             return -1;
         }
