@@ -256,7 +256,8 @@ static void vits_cmd_sync(struct vits_state *vits)
  * 简化：只支持 collection 0 → CPU0。
  * 物理 ITS 已经在 its_setup_pci_msi 里配置过 collection 0。
  */
-static void vits_cmd_mapc(struct vits_state *vits, uint64_t cmd[4])
+static int vits_cmd_mapc(struct vits_state *vits, uint64_t cmd[4],
+                         uint64_t cmd_offset)
 {
     uint16_t icid = (uint16_t)(cmd[2] & 0xFFFF);
     uint64_t rdbase = (cmd[2] >> 16) & 0xFFFFFFFFULL;
@@ -265,13 +266,21 @@ static void vits_cmd_mapc(struct vits_state *vits, uint64_t cmd[4])
     INFO("vITS: MAPC icid=%u rdbase=0x%lx valid=%d",
          icid, (unsigned long)rdbase, valid);
 
-    if (icid != 0) {
-        WARN("vITS: MAPC only supports ICID 0 (got %u)", icid);
-        return;
+    /*
+     * 本实现只支持 collection 0 → CPU0，且该 collection 由 pci_init 阶段
+     * 固化，VM1 全部 LPI 依赖它。因此不支持的 ICID 与解绑（V=0）都不能
+     * 静默成功：拒绝并 fail-stop，上报 VITS_ERR_UNSUPPORTED。
+     */
+    if (icid != 0 || !valid) {
+        if (!vits->halted || vits->halted_at != cmd_offset)
+            WARN("vITS: MAPC unsupported icid=%u valid=%d", icid, valid);
+        vits->halt_reason = VITS_ERR_UNSUPPORTED;
+        return -1;
     }
 
     /* 物理 ITS 的 collection 0 已经在 pci_init 阶段配置好了（到 CPU0），
      * 这里不需要重复配置。 */
+    return 0;
 }
 
 /*
@@ -603,7 +612,8 @@ static int vits_process_one(struct vits_state *vits, uint64_t offset)
         vits_cmd_sync(vits);
         break;
     case VITS_CMD_MAPC:
-        vits_cmd_mapc(vits, cmd);
+        if (vits_cmd_mapc(vits, cmd, offset) < 0)
+            return -1;
         break;
     case VITS_CMD_MAPD:
         if (vits_cmd_mapd(vits, cmd, offset) < 0)

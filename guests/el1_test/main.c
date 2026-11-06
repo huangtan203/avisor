@@ -1262,6 +1262,7 @@ static u64 edu_bar0_base;
 #define VITS_ERR_STATUS    0x0200      /* 软件定义：bit0=halted, [15:8]=原因, [31:16]=槽位 */
 #define VITS_ERR_UNKNOWN_OPCODE 1
 #define VITS_ERR_UNOWNED_DEVICE 2
+#define VITS_ERR_UNSUPPORTED    3
 
 /* ITS 命令码 */
 #define ITS_CMD_SYNC       0x05
@@ -4075,6 +4076,44 @@ static void vits_test(void)
         if (mmio_read32(VITS_BASE + VITS_CREADR) != 0 ||
             mmio_read32(VITS_BASE + VITS_CWRITER) != 0) {
             guest_puts("vITS: FAILED (queue reset after MAPD halt)\n");
+            return;
+        }
+    }
+
+    /* 不支持的 MAPC（ICID=1）必须 fail-stop 并上报 UNSUPPORTED。 */
+    {
+        u64 *cslot = (u64 *)((u8 *)vits_cmdq_buf + vits_cwriter);
+        cslot[0] = ITS_CMD_MAPC;
+        cslot[1] = 0;
+        cslot[2] = (1ULL << 63) | 1;    /* V=1，ICID=1 */
+        cslot[3] = 0;
+        asm volatile("dsb sy" ::: "memory");
+        u32 mapc_halt_slot = vits_cwriter;
+        vits_cwriter += 32;
+        if (vits_cwriter >= VITS_CMDQ_SIZE)
+            vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CWRITER, vits_cwriter);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != mapc_halt_slot) {
+            guest_puts("vITS: FAILED (unsupported MAPC did not halt)\n");
+            return;
+        }
+        u32 err = mmio_read32(VITS_BASE + VITS_ERR_STATUS);
+        if ((err & 1) == 0 ||
+            ((err >> 8) & 0xFF) != VITS_ERR_UNSUPPORTED ||
+            (err >> 16) != (mapc_halt_slot / 32)) {
+            guest_puts("vITS: FAILED (unsupported MAPC reason not reported)\n");
+            return;
+        }
+        guest_puts("vITS: unsupported MAPC halted with UNSUPPORTED\n");
+
+        mmio_write32(VITS_BASE + VITS_CTLR, 0);
+        mmio_write32(VITS_BASE + VITS_CBASER, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) & 0xFFFFFFFFULL));
+        mmio_write32(VITS_BASE + VITS_CBASER + 4, (u32)(((1ULL << 63) | (u64)vits_cmdq_buf) >> 32));
+        vits_cwriter = 0;
+        mmio_write32(VITS_BASE + VITS_CTLR, 1);
+        if (mmio_read32(VITS_BASE + VITS_CREADR) != 0 ||
+            mmio_read32(VITS_BASE + VITS_CWRITER) != 0) {
+            guest_puts("vITS: FAILED (queue reset after MAPC halt)\n");
             return;
         }
     }

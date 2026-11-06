@@ -61,6 +61,7 @@
 #define VITS_ERR_OTHER            0   /* 其它失败（读取失败、分配失败等） */
 #define VITS_ERR_UNKNOWN_OPCODE   1   /* 未知命令 opcode */
 #define VITS_ERR_UNOWNED_DEVICE   2   /* MAPTI 的 requester 不属于本 VM */
+#define VITS_ERR_UNSUPPORTED      3   /* 命令合法但本实现不支持（如 MAPC 解绑） */
 
 /* ITS 命令操作码（与物理 ITS 一致） */
 #define VITS_CMD_SYNC    0x05
