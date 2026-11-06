@@ -88,6 +88,12 @@
 #define PCI_MSIX_PBA             0x08
 
 #define PCI_MAX_BUSES 16
+/*
+ * edu MSI 的 vINTID 基址：vector i 登记为 EDU_MSI_VINTID_BASE + i。
+ * 取值 >= 8192，注入时按 vSPI = 64 + (vINTID - 8192) 映射，
+ * 与 guest 期望的 VITS_TEST_VSPI（72）保持一致。
+ */
+#define EDU_MSI_VINTID_BASE 8200
 #define PCI_MAX_DEVICES 128
 #define PCI_MAX_BARS 6
 #define PCI_HEADER_TYPE 0x0e
@@ -1782,10 +1788,16 @@ void pci_init(void)
         unsigned int owned_vectors = max_vectors > 16 ? 16 : max_vectors;
         for (unsigned int i = 0; i < owned_vectors; i++) {
             if (irq_domain_register(lpi_base + i, 1, 0,
-                                    VIRQ_PCI_EDU) < 0) {
+                                    EDU_MSI_VINTID_BASE + i) < 0) {
                 WARN("PCI: edu MSI LPI ownership registration failed");
                 return;
             }
+        }
+        /* edu 的 MSI 不经过 vITS MAPTI，需补齐 shadow 以保持与路由一致。 */
+        if (vits_lpi_publish_range_owned(lpi_base, owned_vectors, 1,
+                                         EDU_MSI_VINTID_BASE) < 0) {
+            WARN("PCI: edu MSI LPI shadow publish failed");
+            return;
         }
         uint32_t dma_generation =
             pci_dma_get_generation(edu_resource);
@@ -1879,10 +1891,13 @@ static int pci_edu_reinit_msi(uint32_t expected_generation)
         return -1;
     for (unsigned int i = 0; i < vectors; i++) {
         if (irq_domain_register(lpi_base + i, 1, 0,
-                                VIRQ_PCI_EDU) < 0)
+                                EDU_MSI_VINTID_BASE + i) < 0)
             goto rollback;
         registered_vectors++;
     }
+    if (vits_lpi_publish_range_owned(lpi_base, vectors, 1,
+                                     EDU_MSI_VINTID_BASE) < 0)
+        goto rollback;
     if (pci_edu_intx_irq >= 32 && pci_edu_intx_irq < 1020) {
         if (irq_domain_register(pci_edu_intx_irq, 1, 0,
                                 VIRQ_PCI_EDU) < 0)
@@ -1912,7 +1927,8 @@ static int pci_edu_reinit_msi(uint32_t expected_generation)
                      edu_msi_cap_off + data_off,
                      its_get_msi_data(0) & 0xffff);
 
-    if (vits_lpi_audit_owned_range(lpi_base, vectors, 1, 8192) < 0 ||
+    if (vits_lpi_audit_owned_range(lpi_base, vectors, 1,
+                                   EDU_MSI_VINTID_BASE) < 0 ||
         pci_dma_set_authorized(edu_resource, 1, 1,
                                expected_generation) < 0)
         goto rollback;
@@ -1974,7 +1990,7 @@ int pci_edu_vm_reset(struct task_struct *vm)
                                  pci_edu_lpi_base, vectors) < 0)
             return -1;
         if (vits_lpi_audit_owned_range(pci_edu_lpi_base, vectors, 1,
-                                       8192) < 0 ||
+                                       EDU_MSI_VINTID_BASE) < 0 ||
             vits_lpi_revoke_range_owned(pci_edu_lpi_base, vectors, 1) < 0)
             return -1;
     }
@@ -2008,7 +2024,7 @@ int pci_edu_function_reset(struct task_struct *vm)
             return -1;
         }
         if (vits_lpi_audit_owned_range(pci_edu_lpi_base, vectors,
-                                       vm->vmid, 8192) < 0 ||
+                                       vm->vmid, EDU_MSI_VINTID_BASE) < 0 ||
             vits_lpi_revoke_range_owned(pci_edu_lpi_base, vectors,
                                         vm->vmid) < 0) {
             WARN("PCI: edu reset aborted, vITS route ownership mismatch");

@@ -864,6 +864,30 @@ int vits_lpi_revoke_range_owned(unsigned int first_plpi,
     return 0;
 }
 
+/*
+ * 发布一段由 VM 拥有的 pLPI -> vINTID 映射到 shadow。
+ *
+ * 用于不经过 vITS MAPTI 的映射路径（如 PCI 直通设备的 MSI LPI）：
+ * 路由已在 irq_domain 登记，这里同步 shadow，使两者保持一致，
+ * 后续 vits_lpi_audit_owned_range() 可以完整校验。
+ * vINTID 按 first_vintid + i 递增。
+ */
+int vits_lpi_publish_range_owned(unsigned int first_plpi,
+                                 unsigned int count, unsigned long vmid,
+                                 unsigned int first_vintid)
+{
+    if (!count || first_plpi < LPI_MAP_BASE ||
+        count > LPI_MAP_BASE + LPI_MAP_MAX - first_plpi)
+        return -1;
+    lpi_map_acquire();
+    for (unsigned int i = 0; i < count; i++) {
+        lpi_map[first_plpi + i - LPI_MAP_BASE].vmid = (uint16_t)vmid;
+        lpi_map[first_plpi + i - LPI_MAP_BASE].vintid = first_vintid + i;
+    }
+    lpi_map_release();
+    return 0;
+}
+
 int vits_lpi_audit_owned_range(unsigned int first_plpi,
                                 unsigned int count, unsigned long vmid,
                                 unsigned int first_vintid)

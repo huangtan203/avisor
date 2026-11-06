@@ -1245,7 +1245,7 @@ static u64 edu_bar0_base;
 #define EDU_IRQ_RAISE      0x60
 #define EDU_IRQ_ACK        0x64
 
-#define PCI_EDU_IRQ        50              /* 虚拟 SPI（hypervisor 转发） */
+#define PCI_EDU_IRQ        72              /* edu MSI 注入的虚拟 SPI（vINTID 8200） */
 
 /* ---------- Phase 9: vITS 虚拟 ITS 驱动 ---------- */
 
@@ -4540,18 +4540,13 @@ void guest_irq_handler(void)
     } else if (intid == IVSHMEM_IRQ) {
         ivshmem_irq_handler();
     } else if (intid == PCI_EDU_IRQ) {
-        /* 清设备侧 irq_status（MSI 模式下设备看到状态归零即安静，
-         * 之后走末尾统一虚拟 EOI 结束软件注入的虚拟中断） */
+        /* vSPI 72：edu MSI（vINTID 8200）同时也是 vITS 测试的映射中断，
+         * 两组测试共用该号，因此两组标志都需要置位。 */
         edu_irq_status_val = mmio_read32(edu_bar0_base + EDU_IRQ_STATUS);
         mmio_write32(edu_bar0_base + EDU_IRQ_ACK, edu_irq_status_val);
         edu_irq_received = 1;
-    } else if (intid == VITS_TEST_VSPI) {
-        /* vITS 映射的 MSI 中断（Phase 9 测试） */
         vits_irq_intid = intid;
         vits_irq_received = 1;
-        /* 清设备侧 IRQ status */
-        mmio_write32(edu_bar0_base + EDU_IRQ_ACK,
-                     mmio_read32(edu_bar0_base + EDU_IRQ_STATUS));
     } else if (intid == SHM_NOTIFY_VIRQ) {
         /* 共享内存通知中断（Phase 10） */
         shm_notify_received = 1;
