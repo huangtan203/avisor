@@ -163,16 +163,8 @@ void handle_hvc64(unsigned long hvc_nr)
 			break;
 		}
 		regs->regs[0] = pci_edu_function_reset(current);
-		if (regs->regs[0] == 0) {
-			struct irq_route route;
-			if (!pci_edu_lpi_base ||
-			    !pci_edu_msi_enabled ||
-			    irq_domain_lookup(pci_edu_intx_irq, &route) < 0 ||
-			    route.owner != IRQ_DOMAIN_OWNER_VM || route.vmid != 1 ||
-			    irq_domain_lookup(pci_edu_lpi_base, &route) < 0 ||
-			    route.owner != IRQ_DOMAIN_OWNER_VM || route.vmid != 1)
-				regs->regs[0] = -1;
-		}
+		if (regs->regs[0] == 0 && pci_edu_reset_verify() < 0)
+			regs->regs[0] = -1;
 		break;
 
 	/* Phase 10: 调度器 hypercall */

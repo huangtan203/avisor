@@ -63,12 +63,13 @@ void task_stack_check(struct task_struct *tsk)
 	if (!tsk || tsk->pid == 0)
 		return;
 
-	if (!task_stack_guard_valid(tsk))
-		PANIC("EL2 task stack overflow: vmid=%lu vcpu=%d pid=%ld",
-		      tsk->vmid, tsk->vcpu_id, tsk->pid);
-
 	asm volatile("mov %0, sp" : "=r"(sp));
 	guard_end = task_stack_guard_end(tsk);
+
+	if (!task_stack_guard_valid(tsk))
+		PANIC("EL2 task stack overflow: vmid=%lu vcpu=%d pid=%ld sp=0x%lx guard_end=0x%lx",
+		      tsk->vmid, tsk->vcpu_id, tsk->pid, sp, guard_end);
+
 	if (tsk == current) {
 		if (sp <= guard_end || sp - guard_end < TASK_STACK_MIN_FREE)
 			PANIC("EL2 task stack exhausted: vmid=%lu vcpu=%d free=%lu",
@@ -97,6 +98,30 @@ int task_stack_guard_valid(struct task_struct *tsk)
 		if (guard[i] != TASK_STACK_CANARY)
 			return 0;
 	return 1;
+}
+
+/*
+ * task_struct 与它的 EL2 栈在同一块连续内存里：结构体在低地址端，
+ * 栈从 tsk + THREAD_SIZE 向下增长，task_pt_regs() 因此要求两者连续
+ * 且整体覆盖 THREAD_SIZE 字节。
+ *
+ * THREAD_SIZE 为 8KB，必须一次分配连续 2 页——两次 allocate_page()
+ * 不保证相邻，不能拼成一块栈。
+ */
+#define TASK_STRUCT_PAGES  (THREAD_SIZE / PAGE_SIZE)
+
+static struct task_struct *allocate_task_struct(void)
+{
+	paddr_t pa = allocate_block_pages(TASK_STRUCT_PAGES);
+
+	if (!pa)
+		return 0;
+	return (struct task_struct *)TO_VADDR(pa);
+}
+
+static void deallocate_task_struct(struct task_struct *tsk)
+{
+	free_block_pages(TO_PADDR(tsk), TASK_STRUCT_PAGES);
 }
 
 struct pt_regs *task_pt_regs(struct task_struct *tsk)
@@ -175,13 +200,13 @@ static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
 	if (cpu < 0 || cpu >= MAX_CPUS)
 		return -1;
 
-	p = (struct task_struct *)allocate_page();
+	p = allocate_task_struct();
 	if (!p)
 		return -1;
 
 	p->freeze_context = (struct freeze_context *)allocate_page();
 	if (!p->freeze_context) {
-		deallocate_page(p);
+		deallocate_task_struct(p);
 		return -1;
 	}
 	p->console.in_fifo = NULL;
@@ -189,7 +214,7 @@ static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
 	init_task_console(p);
 	if (!p->console.in_fifo || !p->console.out_fifo) {
 		destroy_task_aux(p);
-		deallocate_page(p);
+		deallocate_task_struct(p);
 		return -1;
 	}
 
@@ -235,7 +260,7 @@ static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
 	pid = sched_enqueue_task(cpu, p);
 	if (pid < 0) {
 		destroy_task_aux(p);
-		deallocate_page(p);
+		deallocate_task_struct(p);
 		return -1;
 	}
 	if (cpu_state[cpu].task[pid] == p && pid < cpu_state[cpu].nr_tasks - 1)
@@ -244,7 +269,7 @@ static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
 	if (vm_attach_vcpu(p, vmid, vcpu_id) < 0) {
 		sched_dequeue_task(p);
 		destroy_task_aux(p);
-		deallocate_page(p);
+		deallocate_task_struct(p);
 		return -1;
 	}
 
@@ -303,7 +328,7 @@ static int remove_task_slot(struct task_struct *tsk)
 #endif
 	vm_detach_vcpu(tsk);
 	destroy_task_aux(tsk);
-	deallocate_page(tsk);
+	deallocate_task_struct(tsk);
 	task_reaped_count[cpu]++;
 	return 1;
 }

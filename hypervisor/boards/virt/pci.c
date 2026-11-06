@@ -2098,6 +2098,28 @@ int pci_edu_function_reset(struct task_struct *vm)
     return 0;
 }
 
+/*
+ * reset 之后确认 edu 的 INTx 与 MSI 路由仍归属 VM1。
+ *
+ * 从 handle_hvc64() 的内联代码抽出：irq_route 局部变量若留在
+ * handle_hvc64 的帧里，会与其它分支的栈槽累加，把 EL2 任务栈
+ * 推过 guard 区。
+ */
+int pci_edu_reset_verify(void)
+{
+    struct irq_route route;
+
+    if (!pci_edu_lpi_base || !pci_edu_msi_enabled)
+        return -1;
+    if (irq_domain_lookup(pci_edu_intx_irq, &route) < 0 ||
+        route.owner != IRQ_DOMAIN_OWNER_VM || route.vmid != 1)
+        return -1;
+    if (irq_domain_lookup(pci_edu_lpi_base, &route) < 0 ||
+        route.owner != IRQ_DOMAIN_OWNER_VM || route.vmid != 1)
+        return -1;
+    return 0;
+}
+
 static int pci_resource_owner(struct pci_device_resource *resource,
                               unsigned int bus, unsigned int dev,
                               unsigned int func)

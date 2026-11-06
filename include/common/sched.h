@@ -13,7 +13,7 @@
 
 #ifndef __ASSEMBLER__
 #include "arch/aarch64/sysregs.h"
-#define THREAD_SIZE 4096
+#define THREAD_SIZE 8192
 #define TASK_STACK_GUARD_SIZE 64
 #define TASK_STACK_MIN_RESERVE 2048
 #define TASK_STACK_MIN_FREE 256

@@ -39,6 +39,8 @@ int pci_get_owned_config(struct task_struct *vm, unsigned int selector,
                          uint64_t *bar0_size, unsigned int *requester_id);
 int pci_edu_vm_reset(struct task_struct *vm);
 int pci_edu_function_reset(struct task_struct *vm);
+/* reset 后校验 edu 的 INTx/MSI 路由仍归属 VM1；0 通过，-1 失败 */
+int pci_edu_reset_verify(void);
 
 /* 把 edu 的 ECAM + BAR0 映射进指定 VM 的 Stage 2（MMIO 直通） */
 int pci_passthrough_map(struct task_struct *vm);
