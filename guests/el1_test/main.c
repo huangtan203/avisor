@@ -2305,7 +2305,7 @@ static void phase185_igrpen1_roundtrip_test(void)
  */
 static void phase186_bpr1_roundtrip_test(void)
 {
-    const u32 probe = 3;   /* BinaryPoint 取值，位于 bits[2:0] */
+    const u32 probe = 7;   /* BinaryPoint 取值，位于 bits[2:0]；7 为最大值且与复位值 0 不同 */
 
     guest_puts("\nPhase 186: ICC_BPR1_EL1 virtualization round-trip\n");
 
@@ -2322,7 +2322,7 @@ static void phase186_bpr1_roundtrip_test(void)
     u64 after_switch = 0;
     asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(after_switch));
 
-    guest_puts("  BPR1 after write=3 -> ");
+    guest_puts("  BPR1 after write=7 -> ");
     puts_dec(after_write & 0x7);
     guest_puts(", after switch -> ");
     puts_dec(after_switch & 0x7);
