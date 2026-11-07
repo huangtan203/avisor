@@ -529,6 +529,7 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
     asm volatile("dsb sy" ::: "memory");
 
     if (its_send_mapti(vdevid, plpi, veventid, vicid) < 0) {
+        vits->halt_reason = VITS_ERR_OTHER;
         vits_mapti_rollback(vits, plpi, have_prev, &prev_route);
         return -1;
     }
