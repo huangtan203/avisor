@@ -2257,10 +2257,15 @@ restore:
  */
 static void phase185_igrpen1_roundtrip_test(void)
 {
+    /*
+     * 两个 VM 必须写入不同的值，否则无法区分"自己的值"与"对方泄漏进来的值"。
+     * EnableGrp1 只有 1 位，只能取 0/1：VM1 写 0，VM2 写 1。
+     */
+    const u32 probe = (guest_vmid() == 1) ? 0 : 1;
+
     guest_puts("\nPhase 185: ICC_IGRPEN1_EL1 virtualization round-trip\n");
 
-    /* 关闭 Group 1 使能 */
-    icc_igrpen1_write(0);
+    icc_igrpen1_write(probe);
     u32 after_write = 0;
     asm volatile("mrs %0, S3_0_C12_C12_7" : "=r"(after_write));
 
@@ -2273,16 +2278,18 @@ static void phase185_igrpen1_roundtrip_test(void)
     u32 after_switch = 0;
     asm volatile("mrs %0, S3_0_C12_C12_7" : "=r"(after_switch));
 
-    guest_puts("  IGRPEN1 after write=0 = ");
+    guest_puts("  IGRPEN1 write=");
+    puts_dec(probe);
+    guest_puts(" -> ");
     puts_dec(after_write & 1);
-    guest_puts(", after switch = ");
+    guest_puts(", after switch -> ");
     puts_dec(after_switch & 1);
     guest_puts(" ... ");
 
-    if ((after_write & 1) != 0) {
-        guest_puts("FAILED (write of 0 not reflected)\n");
-    } else if ((after_switch & 1) != 0) {
-        guest_puts("FAILED (enable bit did not stay 0 across switch)\n");
+    if ((after_write & 1) != probe) {
+        guest_puts("FAILED (write not reflected)\n");
+    } else if ((after_switch & 1) != probe) {
+        guest_puts("FAILED (value changed across switch: own/other VM leak)\n");
     } else {
         guest_puts("PASSED\n");
     }
@@ -2305,7 +2312,13 @@ static void phase185_igrpen1_roundtrip_test(void)
  */
 static void phase186_bpr1_roundtrip_test(void)
 {
-    const u32 probe = 7;   /* BinaryPoint 取值，位于 bits[2:0]；7 为最大值且与复位值 0 不同 */
+    /*
+     * 两个 VM 写入互不相同、且都偏离初值 0 的探测值，这样既能检出
+     * "丢失到初值"，也能检出"读到对方 VM 泄漏进来的值"。
+     * BinaryPoint 可取的值为 0..7，BPR1 非安全副本最小值为 BPR0+1，
+     * 这里选 5/6，避开最小值边界。
+     */
+    const u32 probe = (guest_vmid() == 1) ? 5 : 6;
 
     guest_puts("\nPhase 186: ICC_BPR1_EL1 virtualization round-trip\n");
 
@@ -2322,7 +2335,9 @@ static void phase186_bpr1_roundtrip_test(void)
     u64 after_switch = 0;
     asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(after_switch));
 
-    guest_puts("  BPR1 after write=7 -> ");
+    guest_puts("  BPR1 write=");
+    puts_dec(probe);
+    guest_puts(" -> ");
     puts_dec(after_write & 0x7);
     guest_puts(", after switch -> ");
     puts_dec(after_switch & 0x7);
@@ -2331,7 +2346,7 @@ static void phase186_bpr1_roundtrip_test(void)
     if ((after_write & 0x7) != probe) {
         guest_puts("FAILED (write not reflected)\n");
     } else if ((after_switch & 0x7) != probe) {
-        guest_puts("FAILED (lost across switch)\n");
+        guest_puts("FAILED (value changed across switch: own/other VM leak)\n");
     } else {
         guest_puts("PASSED\n");
     }
