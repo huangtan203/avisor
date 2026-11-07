@@ -2291,6 +2291,52 @@ static void phase185_igrpen1_roundtrip_test(void)
     icc_igrpen1_write(1);
 }
 
+/* ---------- Phase 186: ICC_BPR1_EL1 虚拟化往返 ---------- */
+
+/*
+ * Phase 186 测试：guest 读写 ICC_BPR1_EL1（S3_0_C12_C12_3）是否落到 VBPR1。
+ *
+ * HCR_EL2.IMO=1 时，EL1 的 ICC_BPR1_EL1 访问映射到 ICV_BPR1_EL1，
+ * 更新 ICH_VMCR_EL2.VBPR1（bits[20:18]）。BinaryPoint 字段为 bits[2:0]。
+ *
+ * 注意：BPR1 有最小值约束（非安全 ICC_BPR1 的最小值为 ICC_BPR0 + 1），
+ * 写入过小的值会被钳位。因此写入 BinaryPoint=3，它不应被钳位到更小值
+ * 之外；若硬件钳位，读回值会不同，用例据实报告而不是忽略。
+ */
+static void phase186_bpr1_roundtrip_test(void)
+{
+    const u32 probe = 3;   /* BinaryPoint 取值，位于 bits[2:0] */
+
+    guest_puts("\nPhase 186: ICC_BPR1_EL1 virtualization round-trip\n");
+
+    asm volatile("msr S3_0_C12_C12_3, %0" :: "r"((u64)probe));
+    asm volatile("isb" ::: "memory");
+    u64 after_write = 0;
+    asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(after_write));
+
+    for (int i = 0; i < 8; i++) {
+        hvc_call(HVC_SCHED_YIELD, 0);
+        asm volatile("dmb ish" ::: "memory");
+    }
+
+    u64 after_switch = 0;
+    asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(after_switch));
+
+    guest_puts("  BPR1 after write=3 -> ");
+    puts_dec(after_write & 0x7);
+    guest_puts(", after switch -> ");
+    puts_dec(after_switch & 0x7);
+    guest_puts(" ... ");
+
+    if ((after_write & 0x7) != probe) {
+        guest_puts("FAILED (write not reflected)\n");
+    } else if ((after_switch & 0x7) != probe) {
+        guest_puts("FAILED (lost across switch)\n");
+    } else {
+        guest_puts("PASSED\n");
+    }
+}
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -5044,6 +5090,9 @@ void guest_main(void)
 
     /* 测试 11c: Phase 185 ICC_IGRPEN1_EL1 虚拟化往返（主核单线程） */
     phase185_igrpen1_roundtrip_test();
+
+    /* 测试 11d: Phase 186 ICC_BPR1_EL1 虚拟化往返（主核单线程） */
+    phase186_bpr1_roundtrip_test();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
