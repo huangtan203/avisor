@@ -614,14 +614,16 @@ void handle_trap_system(unsigned long esr)
 			goto sys_fin;
 		}
 		/*
-		 * Phase 180: ICH_HCR_EL2.TC=1 同时使 ICC_PMR_EL1 写陷入 EL2。
-		 * 把写入值映射到当前 vCPU 保存的 ICH_VMCR.VPMR（bits[31:24]），
-		 * 世界切换时由 vgic_restore_state() 写回硬件。
+		 * Phase 180/183: ICH_HCR_EL2.TC=1 同时使 ICC_PMR_EL1 写陷入 EL2。
+		 * 必须同时更新硬件 ICH_VMCR_EL2 与保存副本 current->virt.gic_vmcr：
+		 * trap 不经过 leaving_vm，若只改副本，下一次世界切换会用硬件旧值
+		 * 覆盖副本，导致 guest 的 PMR 写入丢失。
 		 */
 		if (op0 == 3 && op1 == 0 && crn == 4 && crm == 6 && op2 == 0) {
-			unsigned long vmcr = current->virt.gic_vmcr;
+			unsigned long vmcr = READ_SYSREG64(ICH_VMCR_EL2);
 			vmcr &= ~(0xFFUL << ICH_VMCR_VPMR_SHIFT);
 			vmcr |= (regs->regs[rt] & 0xFFUL) << ICH_VMCR_VPMR_SHIFT;
+			WRITE_SYSREG64(vmcr, ICH_VMCR_EL2);
 			current->virt.gic_vmcr = vmcr;
 			goto sys_fin;
 		}
@@ -631,9 +633,9 @@ void handle_trap_system(unsigned long esr)
 	} else if ((op0 & 2) && dir == 1) {
 		DEFINE_SYSREG_MRS(actlr_el1, 0, 1, 0, 1);
 #ifdef PLATFORM_VIRT
-		/* Phase 180: 读 ICC_PMR_EL1 返回当前 vCPU 的 VPMR，见写分支注释。 */
+		/* Phase 180/183: 读 ICC_PMR_EL1 返回硬件 VPMR，见写分支注释。 */
 		if (op0 == 3 && op1 == 0 && crn == 4 && crm == 6 && op2 == 0) {
-			regs->regs[rt] = (current->virt.gic_vmcr >> ICH_VMCR_VPMR_SHIFT) & 0xFFUL;
+			regs->regs[rt] = (READ_SYSREG64(ICH_VMCR_EL2) >> ICH_VMCR_VPMR_SHIFT) & 0xFFUL;
 			goto sys_fin;
 		}
 #endif
