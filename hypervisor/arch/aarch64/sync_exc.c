@@ -613,11 +613,30 @@ void handle_trap_system(unsigned long esr)
 			handle_vgic_sgi1r(regs->regs[rt]);
 			goto sys_fin;
 		}
+		/*
+		 * Phase 180: ICH_HCR_EL2.TC=1 同时使 ICC_PMR_EL1 写陷入 EL2。
+		 * 把写入值映射到当前 vCPU 保存的 ICH_VMCR.VPMR（bits[31:24]），
+		 * 世界切换时由 vgic_restore_state() 写回硬件。
+		 */
+		if (op0 == 3 && op1 == 0 && crn == 4 && crm == 6 && op2 == 0) {
+			unsigned long vmcr = current->virt.gic_vmcr;
+			vmcr &= ~(0xFFUL << ICH_VMCR_VPMR_SHIFT);
+			vmcr |= (regs->regs[rt] & 0xFFUL) << ICH_VMCR_VPMR_SHIFT;
+			current->virt.gic_vmcr = vmcr;
+			goto sys_fin;
+		}
 #endif
 		DEFINE_SYSREG_MSR(actlr_el1, 0, 1, 0, 1);
 		DEFINE_SYSREG_MSR(csselr_el1, 1, 0, 0, 0);
 	} else if ((op0 & 2) && dir == 1) {
 		DEFINE_SYSREG_MRS(actlr_el1, 0, 1, 0, 1);
+#ifdef PLATFORM_VIRT
+		/* Phase 180: 读 ICC_PMR_EL1 返回当前 vCPU 的 VPMR，见写分支注释。 */
+		if (op0 == 3 && op1 == 0 && crn == 4 && crm == 6 && op2 == 0) {
+			regs->regs[rt] = (current->virt.gic_vmcr >> ICH_VMCR_VPMR_SHIFT) & 0xFFUL;
+			goto sys_fin;
+		}
+#endif
 		/*
 		 * MPIDR_EL1 (S3_0_C0_C0_5)：虚拟 SMP 的 vCPU 身份。
 		 *
