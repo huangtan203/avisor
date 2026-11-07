@@ -659,7 +659,8 @@ void handle_trap_system(unsigned long esr)
 		DEFINE_SYSREG_MRS(revidr_el1, 0, 0, 0, 6);
 	}
 
-	WARN("system register access is not handled.");
+	WARN("system register access is not handled: op0=%u op1=%u crn=%u crm=%u op2=%u dir=%u rt=%u",
+	     op0, op1, crn, crm, op2, dir, rt);
 sys_fin:
 	increment_current_pc(4);
 	return;
