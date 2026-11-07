@@ -2241,6 +2241,56 @@ restore:
     icc_pmr_write(0xFF);
 }
 
+/* ---------- Phase 185: ICC_IGRPEN1_EL1 虚拟化往返 ---------- */
+
+/*
+ * Phase 185 测试：guest 读写 ICC_IGRPEN1_EL1 是否落到 VENG1。
+ *
+ * HCR_EL2.IMO=1 时，EL1 的 ICC_IGRPEN1_EL1 访问由硬件映射到虚拟接口的
+ * ICV_IGRPEN1_EL1，其后端是 ICH_VMCR_EL2.VENG1。按 Arm 架构，该寄存器
+ * 不受 ICH_HCR_EL2.TC 捕获（TC 只覆盖 PMR/SGI 等），因此不应出现
+ * "system register access is not handled"。
+ *
+ * 本用例做纯寄存器往返检查，不构造中断投递：
+ *   写 0 -> 读回应为 0 -> 让出切换 -> 读应仍为 0 -> 恢复 1。
+ * 只由主核执行，不依赖次核。
+ */
+static void phase185_igrpen1_roundtrip_test(void)
+{
+    guest_puts("\nPhase 185: ICC_IGRPEN1_EL1 virtualization round-trip\n");
+
+    /* 关闭 Group 1 使能 */
+    icc_igrpen1_write(0);
+    u32 after_write = 0;
+    asm volatile("mrs %0, S3_0_C12_C12_7" : "=r"(after_write));
+
+    /* 让出 CPU 多次，迫使 VM 切换（VENG1 随 ICH_VMCR 保存/恢复） */
+    for (int i = 0; i < 8; i++) {
+        hvc_call(HVC_SCHED_YIELD, 0);
+        asm volatile("dmb ish" ::: "memory");
+    }
+
+    u32 after_switch = 0;
+    asm volatile("mrs %0, S3_0_C12_C12_7" : "=r"(after_switch));
+
+    guest_puts("  IGRPEN1 after write=0 = ");
+    puts_dec(after_write & 1);
+    guest_puts(", after switch = ");
+    puts_dec(after_switch & 1);
+    guest_puts(" ... ");
+
+    if ((after_write & 1) != 0) {
+        guest_puts("FAILED (write of 0 not reflected)\n");
+    } else if ((after_switch & 1) != 0) {
+        guest_puts("FAILED (enable bit did not stay 0 across switch)\n");
+    } else {
+        guest_puts("PASSED\n");
+    }
+
+    /* 恢复 Group 1 使能，避免后续测试收不到中断 */
+    icc_igrpen1_write(1);
+}
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -4991,6 +5041,9 @@ void guest_main(void)
 
     /* 测试 11b: Phase 183 ICC_PMR_EL1 跨切换持久性（主核单线程） */
     phase183_pmr_persist_test();
+
+    /* 测试 11c: Phase 185 ICC_IGRPEN1_EL1 虚拟化往返（主核单线程） */
+    phase185_igrpen1_roundtrip_test();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
