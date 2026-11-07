@@ -2191,6 +2191,56 @@ static void phase17_vsgi_trap_test(void)
     }
 }
 
+/* ---------- Phase 183: ICC_PMR_EL1 跨切换持久性 ---------- */
+
+/*
+ * Phase 183 测试：guest 写 ICC_PMR_EL1 后，经任务切换再读回是否保持。
+ *
+ * 背景：PMR 写由 ICH_HCR_EL2.TC 陷入 EL2 模拟。若 hypervisor 只更新
+ * 保存副本而不写硬件 ICH_VMCR_EL2，leaving_vm 会用硬件旧值覆盖副本，
+ * 写入在第一次切换后即丢失。本用例通过主动让出 CPU 迫使切换发生，
+ * 再读回比对，能在运行时暴露该缺陷。
+ *
+ * 只由主核在单次调用内完成，不依赖次核。
+ */
+static void phase183_pmr_persist_test(void)
+{
+    const u32 probe = 0xA0;   /* 与初始化值 0xFF/0xF8 均不同 */
+
+    guest_puts("\nPhase 183: ICC_PMR_EL1 persistence across world switch\n");
+
+    icc_pmr_write(probe);
+    u32 after_write = ICC_PMR_EL1_VAL;
+
+    /* 让出 CPU 多次，迫使调度器切换 VM（触发 leaving/entering_vm） */
+    for (int i = 0; i < 8; i++) {
+        hvc_call(HVC_SCHED_YIELD, 0);
+        asm volatile("dmb ish" ::: "memory");
+    }
+
+    u32 after_yield = ICC_PMR_EL1_VAL;
+
+    guest_puts("  PMR after write = 0x");
+    puts_hex(after_write & 0xFF, 2);
+    guest_puts(", after switch = 0x");
+    puts_hex(after_yield & 0xFF, 2);
+    guest_puts(" ... ");
+
+    if ((after_write & 0xFF) != probe) {
+        guest_puts("FAILED (write not applied)\n");
+        goto restore;
+    }
+    if ((after_yield & 0xFF) != probe) {
+        guest_puts("FAILED (lost across switch)\n");
+        goto restore;
+    }
+    guest_puts("PASSED\n");
+
+restore:
+    /* 恢复放行全部优先级，避免影响后续测试 */
+    icc_pmr_write(0xFF);
+}
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -4938,6 +4988,9 @@ void guest_main(void)
 
     /* 测试 11: Phase 18 优先级与 pending 完整建模（主核单线程） */
     phase18_priority_pending_test();
+
+    /* 测试 11b: Phase 183 ICC_PMR_EL1 跨切换持久性（主核单线程） */
+    phase183_pmr_persist_test();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
