@@ -2322,6 +2322,7 @@ static void phase186_bpr1_roundtrip_test(void)
 
     guest_puts("\nPhase 186: ICC_BPR1_EL1 virtualization round-trip\n");
 
+    u64 cpu_before = hvc_call(HVC_SCHED_GET_CPU, 0);
     asm volatile("msr S3_0_C12_C12_3, %0" :: "r"((u64)probe));
     asm volatile("isb" ::: "memory");
     u64 after_write = 0;
@@ -2334,6 +2335,7 @@ static void phase186_bpr1_roundtrip_test(void)
 
     u64 after_switch = 0;
     asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(after_switch));
+    u64 cpu_after = hvc_call(HVC_SCHED_GET_CPU, 0);
 
     guest_puts("  BPR1 write=");
     puts_dec(probe);
@@ -2341,7 +2343,11 @@ static void phase186_bpr1_roundtrip_test(void)
     puts_dec(after_write & 0x7);
     guest_puts(", after switch -> ");
     puts_dec(after_switch & 0x7);
-    guest_puts(" ... ");
+    guest_puts(" [pcpu ");
+    puts_dec(cpu_before);
+    guest_puts("->");
+    puts_dec(cpu_after);
+    guest_puts("] ... ");
 
     if ((after_write & 0x7) != probe) {
         guest_puts("FAILED (write not reflected)\n");
