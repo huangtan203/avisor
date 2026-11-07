@@ -592,10 +592,12 @@ static int vits_unmap_evt(struct vits_state *vits, int evt_idx)
     if (its_send_discard(devid, eventid) < 0) {
         WARN("vITS: physical DISCARD failed for devid=%u eventid=%u",
              devid, eventid);
+        vits->halt_reason = VITS_ERR_OTHER;
         return -1;
     }
     if (vits_lpi_revoke_owned(plpi, vits->vm->vmid) < 0) {
         WARN("vITS: DISCARD route revoke failed for pLPI=%u", plpi);
+        vits->halt_reason = VITS_ERR_OTHER;
         return -1;
     }
 
