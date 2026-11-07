@@ -432,8 +432,10 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
     if (veventid == 0) {
         unsigned int plpi = pci_edu_lpi_base;
         if (!plpi || irq_domain_register(plpi, vits->vm->vmid, 0,
-                                         vintid) < 0)
+                                         vintid) < 0) {
+            vits->halt_reason = VITS_ERR_OTHER;
             return -1;
+        }
         lpi_map_acquire();
         lpi_map[plpi - LPI_MAP_BASE].vmid = (uint16_t)vits->vm->vmid;
         lpi_map[plpi - LPI_MAP_BASE].vintid = vintid;
@@ -445,6 +447,7 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
             lpi_map[plpi - LPI_MAP_BASE].vmid = 0;
             lpi_map[plpi - LPI_MAP_BASE].vintid = 0;
             lpi_map_release();
+            vits->halt_reason = VITS_ERR_OTHER;
             return -1;
         }
         INFO("vITS: MAPTI uses PCI MSI LPI %u for event 0", plpi);
@@ -495,11 +498,13 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
         if (free_slot < 0) {
             WARN("vITS: MAPTI reverse map full for devid=%u eventid=%u",
                  vdevid, veventid);
+            vits->halt_reason = VITS_ERR_OTHER;
             return -1;
         }
         /* 原子保留一个唯一的物理 LPI；失败后不回退全局 cursor。 */
         if (vits_reserve_plpi(&plpi) < 0) {
             WARN("vITS: no free physical LPI");
+            vits->halt_reason = VITS_ERR_OTHER;
             return -1;
         }
     }
@@ -515,6 +520,7 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
     /* 记录映射 */
     if (irq_domain_register(plpi, vits->vm->vmid, 0, vintid) < 0) {
         WARN("vITS: LPI ownership registration failed for %u", plpi);
+        vits->halt_reason = VITS_ERR_OTHER;
         return -1;
     }
 
@@ -539,6 +545,7 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
     lpi_map_release();
     if (vits_lpi_audit_owned_range(plpi, 1, vits->vm->vmid,
                                    vintid) < 0) {
+        vits->halt_reason = VITS_ERR_OTHER;
         vits_mapti_rollback(vits, plpi, have_prev, &prev_route);
         return -1;
     }
@@ -562,6 +569,7 @@ static int vits_cmd_mapti(struct vits_state *vits, uint64_t cmd[4],
             vits_mapti_rollback(vits, plpi, 0, NULL);
             WARN("vITS: MAPTI reverse map slot vanished for devid=%u eventid=%u",
                  vdevid, veventid);
+            vits->halt_reason = VITS_ERR_OTHER;
             return -1;
         }
     }
