@@ -2307,55 +2307,64 @@ static void phase185_igrpen1_roundtrip_test(void)
  * 更新 ICH_VMCR_EL2.VBPR1（bits[20:18]）。BinaryPoint 字段为 bits[2:0]。
  *
  * 注意：BPR1 有最小值约束（非安全 ICC_BPR1 的最小值为 ICC_BPR0 + 1），
- * 写入过小的值会被钳位。因此写入 BinaryPoint=3，它不应被钳位到更小值
- * 之外；若硬件钳位，读回值会不同，用例据实报告而不是忽略。
+ * 写入过小的值会被钳位。实测 ICC_BPR0_EL1 = 2，因此有效范围为 3..7，
+ * 探测值只能取该范围内的值。
  */
 static void phase186_bpr1_roundtrip_test(void)
 {
     /*
      * 两个 VM 写入互不相同、且都偏离初值 0 的探测值，这样既能检出
      * "丢失到初值"，也能检出"读到对方 VM 泄漏进来的值"。
-     * BinaryPoint 可取的值为 0..7，BPR1 非安全副本最小值为 BPR0+1，
-     * 这里选 5/6，避开最小值边界。
+     *
+     * 单轮写入存在盲区：破坏 save/restore 后，同核上读回值等于最后一次
+     * 写入，因此"最后写入者"必然读回自己的值而 PASSED。改为多轮、每轮
+     * 换一个不同值，只要任一轮读回不符就判 FAILED —— 只要有一轮顺序发生
+     * 反转，两侧都能被检出。
+     *
+     * BPR1 非安全副本最小值为 BPR0+1，实测 BPR0=2，有效范围 3..7。
+     * VM1 取 {3,4}，VM2 取 {5,6}，全部在有效范围内且互不重叠。
      */
-    const u32 probe = (guest_vmid() == 1) ? 5 : 6;
+    const u32 base = (guest_vmid() == 1) ? 3 : 5;
+    const int rounds = 2;
 
     guest_puts("\nPhase 186: ICC_BPR1_EL1 virtualization round-trip\n");
 
-    u64 cpu_before = hvc_call(HVC_SCHED_GET_CPU, 0);
-    asm volatile("msr S3_0_C12_C12_3, %0" :: "r"((u64)probe));
-    asm volatile("isb" ::: "memory");
-    u64 after_write = 0;
-    asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(after_write));
+    int failed = 0;
+    for (int r = 0; r < rounds; r++) {
+        const u32 probe = base + (u32)r;
 
-    for (int i = 0; i < 8; i++) {
-        hvc_call(HVC_SCHED_YIELD, 0);
-        asm volatile("dmb ish" ::: "memory");
+        asm volatile("msr S3_0_C12_C12_3, %0" :: "r"((u64)probe));
+        asm volatile("isb" ::: "memory");
+
+        for (int i = 0; i < 8; i++) {
+            hvc_call(HVC_SCHED_YIELD, 0);
+            asm volatile("dmb ish" ::: "memory");
+        }
+
+        u64 got = 0;
+        asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(got));
+        u64 got2 = 0;
+        asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(got2));
+
+        guest_puts("  round ");
+        puts_dec((u64)r);
+        guest_puts(": write=");
+        puts_dec(probe);
+        guest_puts(" -> ");
+        puts_dec(got & 0x7);
+        guest_puts(", again -> ");
+        puts_dec(got2 & 0x7);
+
+        if ((got & 0x7) != probe || (got2 & 0x7) != probe) {
+            guest_puts(" ... FAILED (value changed across switch: own/other VM leak)\n");
+            failed = 1;
+        } else {
+            guest_puts(" ... ok\n");
+        }
     }
 
-    u64 after_switch = 0;
-    asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(after_switch));
-    u64 cpu_after = hvc_call(HVC_SCHED_GET_CPU, 0);
-
-    guest_puts("  BPR1 write=");
-    puts_dec(probe);
-    guest_puts(" -> ");
-    puts_dec(after_write & 0x7);
-    guest_puts(", after switch -> ");
-    puts_dec(after_switch & 0x7);
-    guest_puts(" [pcpu ");
-    puts_dec(cpu_before);
-    guest_puts("->");
-    puts_dec(cpu_after);
-    guest_puts("] ... ");
-
-    if ((after_write & 0x7) != probe) {
-        guest_puts("FAILED (write not reflected)\n");
-    } else if ((after_switch & 0x7) != probe) {
-        guest_puts("FAILED (value changed across switch: own/other VM leak)\n");
-    } else {
-        guest_puts("PASSED\n");
-    }
+    guest_puts("  BPR1 ");
+    guest_puts(failed ? "FAILED\n" : "PASSED\n");
 }
 
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
