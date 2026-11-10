@@ -637,6 +637,24 @@ void handle_trap_system(unsigned long esr)
 			current->virt.gic_vmcr = vmcr;
 			goto sys_fin;
 		}
+		/*
+		 * Phase 190：ICC_CTLR_EL1.CBPR（bit 0）虚拟化。
+		 * CBPR 置位时 BPR1 的读写语义改由 BPR0 派生，后端是
+		 * ICH_VMCR_EL2.VCBPR（bit 4）。与 PMR 一样必须同时更新硬件
+		 * 寄存器与保存副本，否则世界切换会用旧副本覆盖。
+		 *
+		 * 本实现只虚拟化 CBPR；CTLR 的其余位（EOImode、PRIbits 等）
+		 * 不在此处理，写入被忽略。
+		 */
+		if (op0 == 3 && op1 == 0 && crn == 12 && crm == 12 && op2 == 4) {
+			unsigned long vmcr = READ_SYSREG64(ICH_VMCR_EL2);
+			vmcr &= ~ICH_VMCR_VCBPR;
+			if (regs->regs[rt] & 1UL)
+				vmcr |= ICH_VMCR_VCBPR;
+			WRITE_SYSREG64(vmcr, ICH_VMCR_EL2);
+			current->virt.gic_vmcr = vmcr;
+			goto sys_fin;
+		}
 #endif
 		DEFINE_SYSREG_MSR(actlr_el1, 0, 1, 0, 1);
 		DEFINE_SYSREG_MSR(csselr_el1, 1, 0, 0, 0);
@@ -646,6 +664,11 @@ void handle_trap_system(unsigned long esr)
 		/* Phase 180/183: 读 ICC_PMR_EL1 返回硬件 VPMR，见写分支注释。 */
 		if (op0 == 3 && op1 == 0 && crn == 4 && crm == 6 && op2 == 0) {
 			regs->regs[rt] = (READ_SYSREG64(ICH_VMCR_EL2) >> ICH_VMCR_VPMR_SHIFT) & 0xFFUL;
+			goto sys_fin;
+		}
+		/* Phase 190: 读 ICC_CTLR_EL1 返回虚拟 CBPR，见写分支注释。 */
+		if (op0 == 3 && op1 == 0 && crn == 12 && crm == 12 && op2 == 4) {
+			regs->regs[rt] = (READ_SYSREG64(ICH_VMCR_EL2) & ICH_VMCR_VCBPR) ? 1 : 0;
 			goto sys_fin;
 		}
 #endif

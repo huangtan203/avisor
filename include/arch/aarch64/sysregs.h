@@ -126,6 +126,7 @@
 /* ICH_VMCR_EL2 位（Guest 视角 ICC_* 的后端，与 QEMU 编码一致） */
 #define ICH_VMCR_VENG1 (1UL << 1)  /* ICC_IGRPEN1_EL1.EnableGrp1 */
 #define ICH_VMCR_VPMR_SHIFT 24     /* ICC_PMR_EL1 在 bits[31:24] */
+#define ICH_VMCR_VCBPR (1UL << 4)  /* ICC_CTLR_EL1.CBPR 的虚拟后端（Phase 190） */
 
 /* ICH_LR<n>_EL2 位（与 QEMU/KVM 的编码一致） */
 /*

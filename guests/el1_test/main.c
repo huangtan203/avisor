@@ -2654,6 +2654,80 @@ static void phase189_bpr_clamp_stage_test(void)
     guest_puts("\n");
 }
 
+#define ICC_CBPR_BIT (1UL << 0)
+#define ICH_VMCR_VCBPR_BIT (1UL << 4)
+
+static u64 ctlr_read(void)
+{
+    u64 v = 0;
+    asm volatile("mrs %0, S3_0_C12_C12_4" : "=r"(v));
+    return v;
+}
+
+static void ctlr_write(u64 v)
+{
+    asm volatile("msr S3_0_C12_C12_4, %0" :: "r"(v));
+    asm volatile("isb" ::: "memory");
+}
+
+/*
+ * 190：CBPR 路径验证（仅 VM1 执行）。
+ *
+ * ICC_CTLR_EL1.CBPR=1 时，BPR1 读回应为 VBPR0+1 饱和到 7，写入被忽略。
+ * 每步由 EL2 读 VMCR 确认 VCBPR 是否随 CTLR.CBPR 同步。
+ * 结束恢复 CTLR、BPR0、BPR1。
+ */
+static void phase190_cbpr_test(void)
+{
+    if (guest_vmid() != 1)
+        return;
+    guest_puts("\nPhase 190: CBPR path (ICC_CTLR_EL1.CBPR)\n");
+
+    const u64 saved_ctlr = ctlr_read();
+    const u64 saved0 = bpr0_read();
+    const u64 saved1 = bpr1_read();
+
+    /* 基线：CBPR=0，BPR1 正常读写 */
+    ctlr_write(saved_ctlr & ~ICC_CBPR_BIT);
+    bpr1_write(6);
+    guest_puts("  base CBPR=0 BPR1 write=6 readback=");
+    puts_dec(bpr1_read());
+    guest_puts(" VMCR.VCBPR=");
+    puts_dec((vmcr_raw() & ICH_VMCR_VCBPR_BIT) ? 1 : 0);
+    guest_puts("\n");
+
+    /* CBPR=1 时：BPR1 读回为 VBPR0+1 饱和到 7；写入被忽略 */
+    ctlr_write(saved_ctlr | ICC_CBPR_BIT);
+    static const u64 bpr0_samples[] = {2, 4, 6};
+    for (int s = 0; s < 3; s++) {
+        bpr0_write(bpr0_samples[s]);
+        bpr1_write(1);
+        u64 back = bpr1_read();
+        u64 vmcr = vmcr_raw();
+        guest_puts("  CBPR=1 BPR0=");
+        puts_dec(bpr0_read());
+        guest_puts(" BPR1 write=1 readback=");
+        puts_dec(back);
+        guest_puts(" VMCR.VCBPR=");
+        puts_dec((vmcr & ICH_VMCR_VCBPR_BIT) ? 1 : 0);
+        guest_puts(" VMCR.VBPR1=");
+        puts_dec((vmcr >> 18) & 0x7);
+        guest_puts("\n");
+    }
+
+    /* 结束：恢复 CTLR、BPR0、BPR1 */
+    ctlr_write(saved_ctlr);
+    bpr0_write(saved0);
+    bpr1_write(saved1);
+    guest_puts("  restored CTLR=");
+    puts_hex(saved_ctlr, 4);
+    guest_puts(" BPR0=");
+    puts_dec(saved0);
+    guest_puts(" BPR1=");
+    puts_dec(saved1);
+    guest_puts("\n");
+}
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -5418,6 +5492,7 @@ void guest_main(void)
     phase187c_bpr1_floor_test();
     phase188_bpr0_physical_test();
     phase189_bpr_clamp_stage_test();
+    phase190_cbpr_test();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
