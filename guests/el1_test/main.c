@@ -2577,6 +2577,83 @@ static void phase188_bpr0_physical_test(void)
     guest_puts("\n");
 }
 
+/* 读取 EL2 侧 ICH_VMCR_EL2 原始值（复用 HVC 76 的 x2） */
+static u64 vmcr_raw(void)
+{
+    register u64 x0 __asm__("x0") = 0;
+    register u64 x1 __asm__("x1");
+    register u64 x2 __asm__("x2");
+    register u64 x3 __asm__("x3");
+    register u64 x8 __asm__("x8") = HVC_VGIC_BPR_PHYS;
+    asm volatile("hvc #0"
+                 : "+r"(x0), "=r"(x1), "=r"(x2), "=r"(x3)
+                 : "r"(x8)
+                 : "memory");
+    return x2;
+}
+
+/*
+ * 189：判定钳位发生在写入时还是读回时（仅 VM1 执行）。
+ *
+ * 方法：写入后不读回，立即由 EL2 读 ICH_VMCR_EL2 看其保存的字段值。
+ *   - VMCR 中已是钳位值 -> 钳位发生在写入虚拟接口时
+ *   - VMCR 中为原值     -> 钳位发生在 guest 读回时
+ * 每组先写不读回取 VMCR，再读回后再取一次 VMCR，确认读回不改变 VMCR。
+ */
+static void phase189_bpr_clamp_stage_test(void)
+{
+    if (guest_vmid() != 1)
+        return;
+    guest_puts("\nPhase 189: BPR clamp stage (write vs readback)\n");
+
+    const u64 saved0 = bpr0_read();
+    const u64 saved1 = bpr1_read();
+
+    static const u64 bpr0_samples[] = {0, 1, 2, 3};
+    for (int s = 0; s < 4; s++) {
+        u64 w = bpr0_samples[s];
+        bpr0_write(w);
+        u64 vmcr_before = vmcr_raw();
+        u64 back = bpr0_read();
+        u64 vmcr_after = vmcr_raw();
+        guest_puts("  BPR0 write=");
+        puts_dec(w);
+        guest_puts(" VMCR.VBPR0 before readback=");
+        puts_dec((vmcr_before >> 21) & 0x7);
+        guest_puts(" readback=");
+        puts_dec(back);
+        guest_puts(" VMCR.VBPR0 after=");
+        puts_dec((vmcr_after >> 21) & 0x7);
+        guest_puts("\n");
+    }
+
+    static const u64 bpr1_samples[] = {0, 1, 2, 3};
+    for (int s = 0; s < 4; s++) {
+        u64 w = bpr1_samples[s];
+        bpr1_write(w);
+        u64 vmcr_before = vmcr_raw();
+        u64 back = bpr1_read();
+        u64 vmcr_after = vmcr_raw();
+        guest_puts("  BPR1 write=");
+        puts_dec(w);
+        guest_puts(" VMCR.VBPR1 before readback=");
+        puts_dec((vmcr_before >> 18) & 0x7);
+        guest_puts(" readback=");
+        puts_dec(back);
+        guest_puts(" VMCR.VBPR1 after=");
+        puts_dec((vmcr_after >> 18) & 0x7);
+        guest_puts("\n");
+    }
+
+    bpr0_write(saved0);
+    bpr1_write(saved1);
+    guest_puts("  restored BPR0=");
+    puts_dec(saved0);
+    guest_puts(" BPR1=");
+    puts_dec(saved1);
+    guest_puts("\n");
+}
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -5340,6 +5417,7 @@ void guest_main(void)
     phase187b_bpr0_roundtrip_test();
     phase187c_bpr1_floor_test();
     phase188_bpr0_physical_test();
+    phase189_bpr_clamp_stage_test();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
