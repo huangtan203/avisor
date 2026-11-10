@@ -2715,6 +2715,25 @@ static void phase190_cbpr_test(void)
         guest_puts("\n");
     }
 
+    /*
+     * CBPR=1 时 BPR0 的下限：Phase 189 在 CBPR=0 下测得下限 2，
+     * 这里重复写 0..3 观察 VMCR.VBPR0，确认是否受 CBPR 影响。
+     */
+    static const u64 bpr0_floor[] = {0, 1, 2, 3};
+    for (int s = 0; s < 4; s++) {
+        bpr0_write(bpr0_floor[s]);
+        u64 vmcr = vmcr_raw();
+        guest_puts("  CBPR=1 BPR0 write=");
+        puts_dec(bpr0_floor[s]);
+        guest_puts(" VMCR.VBPR0=");
+        puts_dec((vmcr >> 21) & 0x7);
+        guest_puts(" readback=");
+        puts_dec(bpr0_read());
+        guest_puts(" BPR1 readback=");
+        puts_dec(bpr1_read());
+        guest_puts("\n");
+    }
+
     /* 结束：恢复 CTLR、BPR0、BPR1 */
     ctlr_write(saved_ctlr);
     bpr0_write(saved0);

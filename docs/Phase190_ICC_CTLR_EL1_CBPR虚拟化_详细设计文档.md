@@ -88,7 +88,7 @@ if (op0 == 3 && op1 == 0 && crn == 12 && crm == 12 && op2 == 4) {
 
 ## 4. 实测输出
 
-`/tmp/p190c.out`，VM1：
+`/tmp/p191.out`，VM1：
 
 ```
 [vm1] Phase 190: CBPR path (ICC_CTLR_EL1.CBPR)
@@ -96,10 +96,14 @@ if (op0 == 3 && op1 == 0 && crn == 12 && crm == 12 && op2 == 4) {
 [vm1]   CBPR=1 BPR0=2 BPR1 write=1 readback=3 VMCR.VCBPR=1 VMCR.VBPR1=6
 [vm1]   CBPR=1 BPR0=4 BPR1 write=1 readback=5 VMCR.VCBPR=1 VMCR.VBPR1=6
 [vm1]   CBPR=1 BPR0=6 BPR1 write=1 readback=7 VMCR.VCBPR=1 VMCR.VBPR1=6
+[vm1]   CBPR=1 BPR0 write=0 VMCR.VBPR0=2 readback=2 BPR1 readback=3
+[vm1]   CBPR=1 BPR0 write=1 VMCR.VBPR0=2 readback=2 BPR1 readback=3
+[vm1]   CBPR=1 BPR0 write=2 VMCR.VBPR0=2 readback=2 BPR1 readback=3
+[vm1]   CBPR=1 BPR0 write=3 VMCR.VBPR0=3 readback=3 BPR1 readback=4
 [vm1]   restored CTLR=0000 BPR0=2 BPR1=4
 ```
 
-回归：`PANIC=0 notHandled=0 FAILED=0 PASSED=77`，`QEMU_EXIT=124`。
+回归：`PANIC=0 notHandled=0 FAILED=0 PASSED=78`，`QEMU_EXIT=124`。
 
 ## 5. 结论
 
@@ -107,6 +111,7 @@ if (op0 == 3 && op1 == 0 && crn == 12 && crm == 12 && op2 == 4) {
 2. **CBPR=1 时 BPR1 读回为 `min(VBPR0 + 1, 7)`**：BPR0=2 → 3、BPR0=4 → 5、BPR0=6 → 7，包含饱和边界。
 3. **CBPR=1 时 BPR1 写入被忽略**：三次写 1 后 `VMCR.VBPR1` 始终等于基线的 6。
 4. **CBPR=0 时 BPR1 正常读写**：写 6 读回 6，与 Phase 187 一致。
+5. **CBPR=1 时 BPR0 下限仍为 2**：写 0/1/2 时 `VMCR.VBPR0` 均为 2，写 3 时为 3。与 CBPR=0 下 Phase 189 的结果一致，CBPR 不改变 BPR0 的钳位规则。
 
 第 2、3 条在架构语义（第 2 节）中已有预期，本阶段是首次在本平台实测确认。
 
@@ -117,7 +122,8 @@ Phase 189 测得的 BPR1 下限 3 是 CBPR=0 下的行为。CBPR=1 时 BPR1 不�
 ## 7. 未验证的部分
 
 - CTLR 其余位（EOImode bit 1、PRIbits bits[10:8]、SEIS bit 3、A3V/IDS 等）未虚拟化，guest 读恒为 0。若后续有 guest 依赖这些位，需要扩展本分支。
-- CBPR=1 时 BPR0 的下限是否仍为 2 未单独测（用例中 BPR0 只取 2/4/6）。按 Phase 189 的结论应不变，但本阶段未直接验证。
+- BPR0 下限仅在 CBPR=1 下测试，采样为写 0..3。未测 BPR0 写入 4 以上的下限行为（该区间由 BPR0 ≥ 2 的读回已间接覆盖）。
+- 本次串口日志中，VM2 的输出与 VM1 的 `restored CTLR=` 行交错，该行被打断。恢复值 `BPR0=2 BPR1=4` 仍可读出；交错是两个 vCPU 并发打印造成的，不影响测试结果。
 
 ## 8. 代码位置与复现
 
@@ -126,7 +132,7 @@ Phase 189 测得的 BPR1 下限 3 是 CBPR=0 下的行为。CBPR=1 时 BPR1 不�
 | `ICH_VMCR_VCBPR` 定义 | `include/arch/aarch64/sysregs.h` 第 129 行 |
 | 写路径 | `hypervisor/arch/aarch64/sync_exc.c` 第 640–658 行 |
 | 读路径 | `hypervisor/arch/aarch64/sync_exc.c` 第 669–672 行 |
-| guest 用例 | `guests/el1_test/main.c` 第 2657–2729 行 |
+| guest 用例 | `guests/el1_test/main.c` 第 2657–2748 行 |
 | 调用点 | `guests/el1_test/main.c` 第 5495 行，`测试 11e` 段内、`phase189` 之后 |
 
 复现：
