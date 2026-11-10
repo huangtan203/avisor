@@ -103,11 +103,16 @@ H4 的否定是本阶段的主要结论。Phase 186 基于 `BPR0=2` 推断"BPR1 
 
 ## 10. 实现与复现
 
-### 10.1 代码位置
+### 10.1 代码位置（钉版本）
 
-- 实现：`guests/el1_test/main.c`，段落 `Phase 187` 起，包含 `bpr0_read/bpr0_write/bpr1_read/bpr1_write` 与 `phase187a_bpr0_map_test`、`phase187b_bpr0_roundtrip_test`、`phase187c_bpr1_floor_test`。
-- 调用：主流程 `测试 11e`，位于 `phase186_bpr1_roundtrip_test()` 之后、`phase19_injection_unify_test()` 之前。
-- hypervisor 无改动，`hypervisor/` 下本阶段不产生 diff。
+- 实现提交：`608f769`（tag `v0.187.0-phase187-bpr0-design`）。复现时执行 `git checkout 608f769`。
+- 实现：`guests/el1_test/main.c` 第 2370–2539 行，段落标题 `Phase 187` 起，至 `Phase 18: 优先级与 pending 完整建模` 标题前。包含：
+  - 第 2372–2400 行：`bpr0_read`、`bpr0_write`、`bpr1_read`、`bpr1_write`
+  - 第 2402 行起：`phase187a_bpr0_map_test`
+  - 第 2432 行起：`phase187b_bpr0_roundtrip_test`
+  - 第 2491 行起：`phase187c_bpr1_floor_test`
+- 调用：主流程 `测试 11e`，位于 `phase186_bpr1_roundtrip_test()` 之后、`phase19_injection_unify_test()` 之前（`main.c` 第 5299–5301 行）。
+- hypervisor 无改动，本阶段不产生 `hypervisor/` 下的 diff。
 
 ### 10.2 复现步骤
 
