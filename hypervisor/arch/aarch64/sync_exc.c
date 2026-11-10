@@ -186,6 +186,16 @@ void handle_hvc64(unsigned long hvc_nr)
 	case HVC_SCHED_GET_CPU:
 		regs->regs[0] = smp_processor_id();
 		break;
+	/*
+	 * Phase 188：EL2 直接读物理 GIC CPU 接口寄存器，用于判定 BPR1 下限
+	 * 是否由物理 ICC_BPR0_EL1 决定（只读，不修改任何状态）。
+	 */
+	case HVC_VGIC_BPR_PHYS:
+		regs->regs[0] = READ_SYSREG64(S3_0_C12_C8_3);
+		regs->regs[1] = READ_SYSREG64(S3_0_C12_C12_3);
+		regs->regs[2] = READ_SYSREG64(ICH_VMCR_EL2);
+		regs->regs[3] = READ_SYSREG64(S3_0_C12_C12_7);
+		break;
 
 	/* Phase 10: 内存管理 hypercall */
 	case HVC_MEM_MAP: {

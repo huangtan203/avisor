@@ -54,6 +54,7 @@ typedef int bool;
 #define HVC_SCHED_SET_PRIO  12
 #define HVC_SCHED_MIGRATE_CPU 74
 #define HVC_SCHED_GET_CPU     75
+#define HVC_VGIC_BPR_PHYS     76  /* Phase 188：返回 x0=物理 BPR0 x1=物理 BPR1 x2=VMCR x3=物理 IGRPEN1 */
 #define HVC_MEM_MAP         20
 #define HVC_MEM_UNMAP       21
 #define HVC_MEM_STATS       22  /* 返回 x0=user_pages x1=kernel_pages */

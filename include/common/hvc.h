@@ -96,3 +96,7 @@
 #define HVC_TASK_SLOT_REUSE_TEST 73 /* Phase 44：执行一次 task 槽位复用自测 */
 #define HVC_SCHED_MIGRATE_CPU    74 /* Phase 101：x0=目标 pCPU，迁移当前 vCPU */
 #define HVC_SCHED_GET_CPU        75 /* Phase 101：返回当前 pCPU */
+
+/* Phase 188: BPR0 钳位来源实证（只读诊断） */
+#define HVC_VGIC_BPR_PHYS        76 /* 返回 x0=物理 ICC_BPR0_EL1 x1=物理 ICC_BPR1_EL1
+                                     * x2=ICH_VMCR_EL2 原始值 x3=物理 ICC_IGRPEN1_EL1 */

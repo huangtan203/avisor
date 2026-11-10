@@ -2537,6 +2537,46 @@ static void phase187c_bpr1_floor_test(void)
     guest_puts("\n");
 }
 
+/*
+ * 188：BPR0 钳位来源实证（仅 VM1 执行，只读诊断）。
+ * 读取 EL2 报告的物理 ICC_BPR0/BPR1/IGRPEN1 与 ICH_VMCR_EL2 原始值，
+ * 同时在 guest 侧读回 BPR0，用于判定 BPR1 下限是否由物理 BPR0 决定。
+ */
+static void phase188_bpr0_physical_test(void)
+{
+    if (guest_vmid() != 1)
+        return;
+    guest_puts("\nPhase 188: BPR0 clamp source probe\n");
+
+    u64 phys_bpr0 = 0, phys_bpr1 = 0, vmcr = 0, phys_grpen1 = 0;
+    register u64 x0 __asm__("x0") = 0;
+    register u64 x1 __asm__("x1");
+    register u64 x2 __asm__("x2");
+    register u64 x3 __asm__("x3");
+    register u64 x8 __asm__("x8") = HVC_VGIC_BPR_PHYS;
+    asm volatile("hvc #0"
+                 : "+r"(x0), "=r"(x1), "=r"(x2), "=r"(x3)
+                 : "r"(x8)
+                 : "memory");
+    phys_bpr0 = x0;
+    phys_bpr1 = x1;
+    vmcr = x2;
+    phys_grpen1 = x3;
+
+    guest_puts("  phys BPR0=");
+    puts_dec(phys_bpr0 & 0x7);
+    guest_puts(" phys BPR1=");
+    puts_dec(phys_bpr1 & 0x7);
+    guest_puts(" phys IGRPEN1=");
+    puts_dec(phys_grpen1 & 0x1);
+    guest_puts(" VMCR=");
+    puts_hex(vmcr, 16);
+    guest_puts("\n");
+    guest_puts("  guest BPR0 readback=");
+    puts_dec(bpr0_read());
+    guest_puts("\n");
+}
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -5299,6 +5339,7 @@ void guest_main(void)
     phase187a_bpr0_map_test();
     phase187b_bpr0_roundtrip_test();
     phase187c_bpr1_floor_test();
+    phase188_bpr0_physical_test();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
