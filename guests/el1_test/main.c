@@ -2367,6 +2367,176 @@ static void phase186_bpr1_roundtrip_test(void)
     guest_puts(failed ? "FAILED\n" : "PASSED\n");
 }
 
+/* ---------- Phase 187: ICC_BPR0_EL1 虚拟化往返与 BPR1 钳位关系 ---------- */
+
+static u64 bpr0_read(void)
+{
+    u64 v = 0;
+    asm volatile("mrs %0, S3_0_C12_C8_3" : "=r"(v));
+    return v & 0x7;
+}
+
+static void bpr0_write(u64 v)
+{
+    asm volatile("msr S3_0_C12_C8_3, %0" :: "r"(v & 0x7));
+    asm volatile("isb" ::: "memory");
+}
+
+static u64 bpr1_read(void)
+{
+    u64 v = 0;
+    asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(v));
+    return v & 0x7;
+}
+
+static void bpr1_write(u64 v)
+{
+    asm volatile("msr S3_0_C12_C12_3, %0" :: "r"(v & 0x7));
+    asm volatile("isb" ::: "memory");
+}
+
+/*
+ * 187a：BPR0 映射表（仅 VM1 执行）。
+ * 依次写 0..7，记录读回值。结束时恢复执行前的 BPR0。
+ */
+static void phase187a_bpr0_map_test(void)
+{
+    if (guest_vmid() != 1)
+        return;
+
+    guest_puts("\nPhase 187a: ICC_BPR0_EL1 readback map\n");
+
+    const u64 saved = bpr0_read();
+    for (u64 w = 0; w < 8; w++) {
+        bpr0_write(w);
+        u64 got = bpr0_read();
+        guest_puts("  BPR0 write=");
+        puts_dec(w);
+        guest_puts(" -> ");
+        puts_dec(got);
+        guest_puts("\n");
+    }
+
+    bpr0_write(saved);
+    guest_puts("  BPR0 restored=");
+    puts_dec(saved);
+    guest_puts("\n");
+}
+
+/*
+ * 187b：BPR0 跨切换往返（双 VM）。
+ * 探测值取 187a 映射表确定的 BPR0 有效读回范围 2..7：
+ * VM1 取 {2,3}，VM2 取 {4,5}，互不重叠。
+ * 每个用例结束时恢复执行前的 BPR0。
+ */
+static void phase187b_bpr0_roundtrip_test(void)
+{
+    const u64 base = (guest_vmid() == 1) ? 2 : 4;
+    const int rounds = 2;
+
+    guest_puts("\nPhase 187b: ICC_BPR0_EL1 virtualization round-trip\n");
+
+    const u64 saved = bpr0_read();
+    int failed = 0;
+
+    for (int r = 0; r < rounds; r++) {
+        const u64 probe = base + (u64)r;
+        bpr0_write(probe);
+
+        u64 pcpu_start = hvc_call(HVC_SCHED_GET_CPU, 0);
+
+        for (int i = 0; i < 8; i++) {
+            hvc_call(HVC_SCHED_YIELD, 0);
+            asm volatile("dmb ish" ::: "memory");
+        }
+
+        u64 got = bpr0_read();
+        u64 got2 = bpr0_read();
+        u64 pcpu_end = hvc_call(HVC_SCHED_GET_CPU, 0);
+
+        guest_puts("  round ");
+        puts_dec((u64)r);
+        guest_puts(": write=");
+        puts_dec(probe);
+        guest_puts(" -> ");
+        puts_dec(got);
+        guest_puts(", again -> ");
+        puts_dec(got2);
+        guest_puts(" [pcpu ");
+        puts_dec(pcpu_start);
+        guest_puts("->");
+        puts_dec(pcpu_end);
+        guest_puts("]");
+
+        if (got != probe || got2 != probe) {
+            guest_puts(" ... FAILED (value changed across switch)\n");
+            failed = 1;
+        } else {
+            guest_puts(" ... ok\n");
+        }
+    }
+
+    bpr0_write(saved);
+    guest_puts("  BPR0 ");
+    guest_puts(failed ? "FAILED\n" : "PASSED\n");
+}
+
+/*
+ * 187c：BPR0 对 BPR1 下限的影响（仅 VM1 执行）。
+ * 对 BPR0 取若干代表值，每个值下遍历 BPR1 = 0..7，打印完整读回表。
+ * 实测结果：BPR1 下限恒为 3，不随 BPR0 变化（假设 H4 被否定）。
+ * 每个样本结束前再读一次 BPR0，确认遍历未改写 BPR0。
+ * 结束时恢复执行前的 BPR0 与 BPR1。
+ */
+static void phase187c_bpr1_floor_test(void)
+{
+    if (guest_vmid() != 1)
+        return;
+
+    guest_puts("\nPhase 187c: BPR1 effective floor vs BPR0\n");
+
+    const u64 saved0 = bpr0_read();
+    const u64 saved1 = bpr1_read();
+
+    static const u64 bpr0_samples[] = {0, 2, 4};
+    for (int s = 0; s < 3; s++) {
+        bpr0_write(bpr0_samples[s]);
+        guest_puts("  BPR0 write=");
+        puts_dec(bpr0_samples[s]);
+        guest_puts(" readback=");
+        puts_dec(bpr0_read());
+        guest_puts("\n");
+
+        guest_puts("    BPR1 table:");
+        u64 floor = 8;
+        for (u64 w = 0; w < 8; w++) {
+            bpr1_write(w);
+            u64 got = bpr1_read();
+            guest_puts(" ");
+            puts_dec(w);
+            guest_puts("->");
+            puts_dec(got);
+            if (got == w && floor == 8)
+                floor = w;
+        }
+        guest_puts("\n");
+
+        guest_puts("    BPR0 after table=");
+        puts_dec(bpr0_read());
+        guest_puts(" floor=");
+        puts_dec(floor);
+        guest_puts("\n");
+    }
+
+    bpr0_write(saved0);
+    bpr1_write(saved1);
+    guest_puts("  restored BPR0=");
+    puts_dec(saved0);
+    guest_puts(" BPR1=");
+    puts_dec(saved1);
+    guest_puts("\n");
+}
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -5123,6 +5293,12 @@ void guest_main(void)
 
     /* 测试 11d: Phase 186 ICC_BPR1_EL1 虚拟化往返（主核单线程） */
     phase186_bpr1_roundtrip_test();
+
+    /* 测试 11e: Phase 187 ICC_BPR0_EL1 往返与 BPR1 钳位关系
+     * 三个用例各自恢复执行前的 BPR0，不影响后续用例前提。 */
+    phase187a_bpr0_map_test();
+    phase187b_bpr0_roundtrip_test();
+    phase187c_bpr1_floor_test();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();

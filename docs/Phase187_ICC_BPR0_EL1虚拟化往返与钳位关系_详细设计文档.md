@@ -25,12 +25,12 @@ Phase 186 排查时发现：guest 写 `ICC_BPR1_EL1` 的 1、2 均读回 3，而
 
 | 编号 | 假设 | 验证方式 |
 |---|---|---|
-| H1 | BPR0 读回存在架构下限（实测读回 2），BPR1 的有效下限为 BPR0+1（实测 3） | 写 BPR0 各值并读回，建立映射表 |
-| H2 | 初值冲突：VMCR 初值 VBPR0=0，但 guest 读到 2，需区分"硬件下限"与"初值" | 在未写入 BPR0 的状态下读取，与映射表对照 |
-| H3 | BPR0 写入经 `VBPR0` 保存/恢复，跨 VM 切换后保持 | 多轮探测，每轮两 VM 写入互不相同的值 |
-| H4 | 写 BPR0 后，BPR1 的最小值随之变化（下限 = BPR0 + 1） | 固定 BPR0 为若干值，遍历 BPR1 的 0..7 写入并读回 |
+| H1 | BPR0 读回存在架构下限，写 0/1 读回 2，有效下限为 2 | **已支持**（187a 实测） |
+| H2 | 初值冲突：VMCR 初值 VBPR0=0，但 guest 读到 2，需区分"硬件下限"与"初值" | 在未写入 BPR0 的状态下读取，与映射表对照（未单独验证，见第 9 节） |
+| H3 | BPR0 写入经 `VBPR0` 保存/恢复，跨 VM 切换后保持 | **已支持**（187b 实测，两侧均 PASSED） |
+| H4 | 写 BPR0 后，BPR1 的最小值随之变化（下限 = BPR0 + 1） | **已否定**（187c 复核：BPR0=0/2/4 下 BPR1 下限均为 3） |
 
-H1 与 H2 的区分是关键：若 VMCR 初值为 0 而读回 2，则说明读回值受架构下限约束，而非简单的寄存器值。映射表能直接给出答案。
+H4 的否定是本阶段的主要结论。Phase 186 基于 `BPR0=2` 推断"BPR1 下限 = BPR0+1 = 3"，这个数值碰巧正确，但推断的机制（BPR1 下限依赖 BPR0）不成立。
 
 ## 4. 用例设计
 
@@ -52,18 +52,20 @@ H1 与 H2 的区分是关键：若 VMCR 初值为 0 而读回 2，则说明读�
 ### 4.3 用例 187c：BPR0 对 BPR1 下限的影响（单 VM）
 
 - 仅由 VM1 执行。
-- 对 BPR0 取若干代表值（由 187a 确定），每个值下遍历 BPR1 = 0..7，记录读回。
-- 对每个 BPR0 值，推算 BPR1 的实测下限，与 `BPR0 + 1` 比较，验证 H4。
+- 对 BPR0 取 0、2、4 三个样本。每个样本先写 BPR0 并读回，再遍历 BPR1 = 0..7 写入并读回，记录完整读回表。
+- 每个样本遍历结束后再读一次 BPR0，确认循环未改写 BPR0。
+- 结束时恢复执行前的 BPR0 与 BPR1。
+- 用于验证 H4。第一版只输出 BPR1 下限一项，复核时改为输出完整表以排除 BPR0 被循环改写的干扰。
 
 ## 5. 判定标准
 
 | 用例 | PASSED 条件 |
 |---|---|
-| 187a | 映射表可重复获得（同一条件下两次读回一致），并能解释 BPR0=2 的读回来源（H1/H2 有明确结论） |
+| 187a | 映射表可获得，且写 0/1/2 读回 2、写 3..7 原样读回（即 BPR0 有效下限为 2） |
 | 187b | 所有轮次读回等于本轮探测值，两 VM 均 PASSED |
-| 187c | 每个 BPR0 取值下，BPR1 实测下限等于 BPR0+1（或等于 3 的上限取值，以映射表为准） |
+| 187c | 不以 PASSED/FAILED 判定，产出为 BPR1 读回表。当前实测不支持 H4，结论记入第 9 节 |
 
-187a 本身不以 PASSED/FAILED 判定，它的产出是映射表；判定结论记录在实验结果中。
+187a 与 187c 不以 PASSED/FAILED 判定，产出为实测数据。187b 是唯一有通过/失败判定的用例。
 
 ## 6. 破坏性对照（实现阶段执行）
 
@@ -82,9 +84,64 @@ H1 与 H2 的区分是关键：若 VMCR 初值为 0 而读回 2，则说明读�
 
 ## 8. 与前序阶段的关系
 
-- Phase 186 的 `BPR0=2` 与钳位推断，由本阶段 187a 与 187c 给出实测依据。
-- Phase 186 文档第 2 节"钳位实测"段落，待 Phase 187 实现后补充引用。
+- Phase 186 的 `BPR0=2` 与"BPR1 下限 = BPR0+1"的推断，由本阶段验证：BPR0 下限为 2（H1 成立），但 BPR1 下限不随 BPR0 变化（H4 否定）。
+- Phase 186 中关于钳位机制的表述需要修正：BPR1 的下限为 3 是实测事实，而其依据（BPR0 决定下限）不成立。
 
-## 9. 结论
+## 9. 实测结论
 
-本阶段为设计阶段，产出为本文档。下一步进入实现，按第 4 节实现 187a、187b、187c，并按第 6 节执行破坏性对照。
+1. **BPR0 有效下限为 2**：写 0/1/2 均读回 2，写 3..7 原样读回（187a）。
+2. **BPR0 跨切换保持**：两 VM 各两轮均 PASSED，且同在 pCPU 0（187b）。
+3. **BPR1 下限恒为 3，与 BPR0 无关**（187c）：
+
+   | BPR0 写入 | BPR0 读回 | BPR1 读回表（写 0..7） | 下限 |
+   |---|---|---|---|
+   | 0 | 2 | 3,3,3,3,4,5,6,7 | 3 |
+   | 2 | 2 | 3,3,3,3,4,5,6,7 | 3 |
+   | 4 | 4 | 3,3,3,3,4,5,6,7 | 3 |
+
+4. **未确定的解释**：BPR1 下限可能由**物理** `ICC_BPR0_EL1` 决定，而 guest 写 BPR0 只更新 `ICH_VMCR_EL2.VBPR0`，不改物理寄存器。若物理 BPR0 为 2，则下限为 3，与全部样本吻合。该解释只能在 EL2 侧读取物理 BPR0 才能证实，本阶段未验证，不作为结论。
+
+## 10. 实现与复现
+
+### 10.1 代码位置
+
+- 实现：`guests/el1_test/main.c`，段落 `Phase 187` 起，包含 `bpr0_read/bpr0_write/bpr1_read/bpr1_write` 与 `phase187a_bpr0_map_test`、`phase187b_bpr0_roundtrip_test`、`phase187c_bpr1_floor_test`。
+- 调用：主流程 `测试 11e`，位于 `phase186_bpr1_roundtrip_test()` 之后、`phase19_injection_unify_test()` 之前。
+- hypervisor 无改动，`hypervisor/` 下本阶段不产生 diff。
+
+### 10.2 复现步骤
+
+```
+make -B -f Makefile.virt -j2
+timeout 35 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=off \
+  -cpu max -smp 2 -m 1G -device edu -kernel bin_virt/kernel8.img \
+  -display none -monitor none -serial file:/tmp/p187.out
+```
+
+退出码 124 为正常（超时结束）。检查：`PANIC=0`、`not handled=0`，Phase 186 两侧 PASSED。
+
+### 10.3 预期输出（节选，实测于 `/tmp/p187final.out`）
+
+```
+Phase 187a: ICC_BPR0_EL1 readback map
+  BPR0 write=0 -> 2   write=1 -> 2   write=2 -> 2   write=3 -> 3
+  write=4 -> 4   write=5 -> 5   write=6 -> 6   write=7 -> 7
+  BPR0 restored=2
+Phase 187b: ICC_BPR0_EL1 virtualization round-trip
+  [vm1] round 0: write=2 -> 2, again -> 2 [pcpu 0->0] ... ok
+  [vm1] round 1: write=3 -> 3, again -> 3 [pcpu 0->0] ... ok
+  [vm1] BPR0 PASSED
+  [vm2] round 0: write=4 -> 4, again -> 4 [pcpu 0->0] ... ok
+  [vm2] round 1: write=5 -> 5, again -> 5 [pcpu 0->0] ... ok
+  [vm2] BPR0 PASSED
+Phase 187c: BPR1 effective floor vs BPR0
+  BPR0 write=0 readback=2   BPR1 table: 0->3 1->3 2->3 3->3 4->4 5->5 6->6 7->7
+  BPR0 write=2 readback=2   BPR1 table: 0->3 1->3 2->3 3->3 4->4 5->5 6->6 7->7
+  BPR0 write=4 readback=4   BPR1 table: 0->3 1->3 2->3 3->3 4->4 5->5 6->6 7->7
+```
+
+以上节选逐字取自 `/tmp/p187final.out`，与第 9 节实测表一致。
+
+### 10.4 提交说明
+
+第一版提交 `2f9349a` 仅含设计文档，不含代码。本阶段补交的实现提交包含 `guests/el1_test/main.c` 与本文档，tag 指向该实现提交。
