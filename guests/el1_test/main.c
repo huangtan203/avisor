@@ -186,6 +186,36 @@ static void gic_vcpu_init(void)
 static volatile int vgicd_irq_received = 0;
 static volatile u32 vgicd_queue_received = 0;
 
+/*
+ * Phase 191：pending ring 满测试的接收位图。
+ * 注入 vSPI 52..91，用两个 64 位字记录收到的 vINTID。
+ */
+#define P191_BASE_VIRQ   52
+#define P191_COUNT       40
+static volatile u64 p191_received[2];
+
+static inline int p191_hit(u32 intid)
+{
+    if (intid < P191_BASE_VIRQ || intid >= P191_BASE_VIRQ + P191_COUNT)
+        return 0;
+    u32 idx = intid - P191_BASE_VIRQ;
+    p191_received[idx >> 6] |= 1ULL << (idx & 63);
+    return 1;
+}
+
+static int p191_popcount(void)
+{
+    int n = 0;
+    for (int w = 0; w < 2; w++) {
+        u64 v = p191_received[w];
+        while (v) {
+            v &= v - 1;
+            n++;
+        }
+    }
+    return n;
+}
+
 static inline int vgicd_inject(u32 vintid)
 {
     return (int)hvc_call(HVC_GICD_INJECT, (u64)vintid);
@@ -2747,6 +2777,71 @@ static void phase190_cbpr_test(void)
     guest_puts("\n");
 }
 
+/*
+ * 191：pending ring 满时是否丢中断（仅 VM1 执行）。
+ *
+ * 软件注入可用 1 个 LR（LR1）+ 32 项 pending ring。先屏蔽 IRQ 连续注入
+ * P191_COUNT=40 个不同 vSPI，使注入量超过 33 的容量；再放开 IRQ 统计实际
+ * 送达数。若送达数少于返回 0 的注入数，说明 ring 满时中断被丢弃。
+ *
+ * 注入的是 GICD SPI（52..91），受 GICD enable 门控，默认全部使能。
+ */
+static void phase191_pending_ring_full_test(void)
+{
+    if (guest_vmid() != 1)
+        return;
+    guest_puts("\nPhase 191: pending ring capacity (LR1 + 32 slots)\n");
+
+    p191_received[0] = 0;
+    p191_received[1] = 0;
+
+    /* 屏蔽 IRQ，避免注入过程中被逐个消化 */
+    asm volatile("msr daifset, #2" ::: "memory");
+
+    int accepted = 0;
+    int rejected = 0;
+    for (u32 i = 0; i < P191_COUNT; i++) {
+        int ret = vgicd_inject(P191_BASE_VIRQ + i);
+        if (ret == 0)
+            accepted++;
+        else
+            rejected++;
+    }
+
+    asm volatile("msr daifclr, #2" ::: "memory");
+
+    /* 等待送达，给 ring 重填与中断投递留出时间 */
+    int timeout = 160000000;
+    while (p191_popcount() < accepted && timeout-- > 0)
+        asm volatile("nop");
+
+    int delivered = p191_popcount();
+    guest_puts("  injected=");
+    puts_dec(P191_COUNT);
+    guest_puts(" accepted=");
+    puts_dec(accepted);
+    guest_puts(" rejected=");
+    puts_dec(rejected);
+    guest_puts(" delivered=");
+    puts_dec(delivered);
+    guest_puts("\n");
+
+    /*
+     * 容量模型：LR1 直存 1 个 + pending ring 32 个 = 33。
+     * 第 34 个起应被拒绝（vgic_pending_push 返回 -1）。
+     */
+    int cap_ok = (accepted == 33) && (rejected == P191_COUNT - 33);
+    if (cap_ok)
+        guest_puts("  capacity=33 (LR1 + 32) PASSED\n");
+    else
+        guest_puts("  capacity unexpected FAILED\n");
+
+    if (delivered == accepted)
+        guest_puts("  ring: all accepted interrupts delivered PASSED\n");
+    else
+        guest_puts("  ring: DROPPED (delivered < accepted) FAILED\n");
+}
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -5261,14 +5356,24 @@ void guest_irq_handler(void)
         edu_irq_received = 1;
         vits_irq_intid = intid;
         vits_irq_received = 1;
+        /* Phase 191：72 落在注入区间内，需一并计入位图，否则误判为丢失 */
+        p191_hit(intid);
     } else if (intid == SHM_NOTIFY_VIRQ) {
         /* 共享内存通知中断（Phase 10） */
         shm_notify_received = 1;
+        /* Phase 191：60 落在注入区间内，需一并计入位图，否则误判为丢失 */
+        p191_hit(intid);
     } else if (intid >= VGICD_TEST_VIRQ &&
                intid < VGICD_TEST_VIRQ + 4) {
         if (intid == VGICD_TEST_VIRQ)
             vgicd_irq_received = 1;
         vgicd_queue_received |= 1U << (intid - VGICD_TEST_VIRQ);
+        /* Phase 191：52..55 也属于测试区间，必须一并计入 p191 位图 */
+        p191_hit(intid);
+    } else if (intid >= P191_BASE_VIRQ &&
+               intid < P191_BASE_VIRQ + P191_COUNT) {
+        /* Phase 191：pending ring 满测试，记录到 p191_received */
+        p191_hit(intid);
     } else if (intid == VGICR_TEST_PPI) {
         /* Phase 16: 虚拟 GICR 测试中断 */
         vgicr_irq_received = 1;
@@ -5512,6 +5617,7 @@ void guest_main(void)
     phase188_bpr0_physical_test();
     phase189_bpr_clamp_stage_test();
     phase190_cbpr_test();
+    phase191_pending_ring_full_test();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
