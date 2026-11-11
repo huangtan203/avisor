@@ -87,13 +87,21 @@ hypervisor 侧 LR 事件日志显示 60 和 72 确实经 LR1 送达并被 ACK，
 [vm1]   ring: all accepted interrupts delivered PASSED
 ```
 
-全量回归（清理诊断插桩后单次运行）：`PANIC=0 notHandled=0 PASSED=80 FAILED=3`，`QEMU_EXIT=124`。3 个 FAIL 均为 vm2 既有用例（冻结请求 `轮次 0`、zombie task 回收、task 槽位复用），与 Phase 191 无关。Phase 191 本身三项判定均 PASSED。
+回退插桩后三次连续回归（`/tmp/p36clean_1..3.out`）：`PANIC=0`，`QEMU_EXIT=124`，`PASSED` 分别为 80、81、78，`FAILED` 均为 0。`PASSED` 计数在三次间有差异，原因未核实，不作为稳定指标。此前记录的 `FAILED=3`（vm2 既有用例）未在本次三次回归中复现。Phase 191 本身三项判定均 PASSED。
 
 ## 7. 已知限制
 
 - 等待窗口 `160000000` 次 `nop` 是经验值。实测 2000 万次时送达不足（11 至 27 个不等），1.6 亿次时稳定为 33。两点之间的阈值未测，不能据此推断最小窗口。
 - 本用例只覆盖 LR1 + ring 路径，不覆盖 LR0（vtimer）与 LR2（PCI INTx）。
-- 偶发 vm2 Phase 36 `SYNC_INVALID_EL2` PANIC 仅在一次运行出现（`elr=0x41096000`，`esr=0x2000000`），之后 6 次运行未复现，根因未定位，与本阶段无关。
+- 偶发 vm2 Phase 36 `SYNC_INVALID_EL2` PANIC，与本阶段无关，根因未定位。
+  - 出现记录：共 46 次运行中仅 1 次出现，即插桩加入前的一次运行，现场 `elr=0x41096000`，`esr=0x2000000`。
+  - 该 `elr` 与 vcpu1 的 `task_struct` 基址一致（插桩日志中 `tsk=41096000`）。vcpu1 的 PC 在插桩日志中始终为合法 guest IPA `0x4000a3e4`，FINISH 回滚路径的 commit/rollback 判定与 `vmid`、`ttbr0` 切换均正常。
+  - 插桩批次：加入 `smp.c`、`migration.c` 的回滚点日志，以及 `kernel_exit` 的 `sp`/`elr` 检查后，共 70 次（10 + 30 + 30）未复现。检查项为 `sp != task_pt_regs(current)` 或 `elr` 落入 task 区间，70 次均未命中，`PANIC` 计数均为 0。
+  - 未定位原因：没有在 PANIC 现场抓取到 `pt_regs` 全量内容，也无法确定 `elr` 被写入的位置。检查点位于 `kernel_exit` 入口，只能覆盖该处之前的改写；`kernel_exit` 之后到 `eret` 之间的窗口（仅 `ldp`、`msr`，不写内存）不在覆盖范围内。
+  - 异常类型判断：`esr=0x2000000` 的 EC 字段为 0（Unknown reason），IL 位为 1，说明 EL2 被送到了一个无法执行或非法的地址。该异常走 `sync_invalid_el2` 向量，本向量只接收 EL2 自身的同步异常，进一步印证问题发生在 hypervisor 自己的执行流内。
+  - 已排除：`cpu_switch_to` 的 `cpu_context` 写入未越界（`x30` 与 `pc` 同在偏移 96），`task_pt_regs` 计算正确（`tsk + 0x1ef0`）。`kernel_entry` 用 `stp x22, x23, [sp, #16 * 16]` 把 `elr_el2` 存到 `pt->pc` 槽，`kernel_exit` 用 `ldp` 从同一偏移取回，两者一致。
+  - 待核实（未验证，不作为根因）：`allocate_block_pages` 不清零返回的页，`prepare_task` 也不对 `pt_regs` 做 `memset`；正常情况下 `loader` 会写 `regs->pc`，但 `create_task_on_cpu(cpu, NULL, NULL)` 路径（`task_slot_reuse_selftest` 使用）会以 NULL 调用 `loader`。该路径的 vmid 与 PANIC 现场的 `vmid=2` 不对应，未证实相关。
+  - 回退状态：`smp.c`、`migration.c`、`sched.c`、`entry.S` 的诊断插桩已全部回退至 HEAD，回退后构建通过。
 
 ## 8. 代码改动
 
