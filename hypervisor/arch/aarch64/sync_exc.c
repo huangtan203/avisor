@@ -197,6 +197,28 @@ void handle_hvc64(unsigned long hvc_nr)
 		regs->regs[3] = READ_SYSREG64(S3_0_C12_C12_7);
 		break;
 
+	/*
+	 * Phase 192：EL2 视角读物理 ICC_CTLR_EL1 与 ICH_VMCR_EL2（只读）。
+	 * 不读 ICH_VTR_EL2：Phase 188 已实测该寄存器在本平台未实现，
+	 * 读取会触发 SYNC_INVALID_EL2。
+	 */
+	case HVC_VGIC_CTLR_PHYS:
+		regs->regs[0] = READ_SYSREG64(S3_0_C12_C12_4);
+		regs->regs[1] = READ_SYSREG64(ICH_VMCR_EL2);
+		break;
+
+	/*
+	 * Phase 192：只读诊断，返回当前 vCPU 的 LR0/LR1/LR2 原始值与 VMCR。
+	 * 用于确认 guest 在 split EOI 语义下写完 EOIR 后，软件注入的 LR1
+	 * 是否仍处于 pending/active。不修改任何状态。
+	 */
+	case HVC_VGIC_LR_DUMP:
+		regs->regs[0] = READ_SYSREG64(ICH_LR0_EL2);
+		regs->regs[1] = READ_SYSREG64(ICH_LR1_EL2);
+		regs->regs[2] = READ_SYSREG64(ICH_LR2_EL2);
+		regs->regs[3] = READ_SYSREG64(ICH_VMCR_EL2);
+		break;
+
 	/* Phase 10: 内存管理 hypercall */
 	case HVC_MEM_MAP: {
 		paddr_t ipa = (paddr_t)regs->regs[0];
@@ -666,9 +688,20 @@ void handle_trap_system(unsigned long esr)
 			regs->regs[rt] = (READ_SYSREG64(ICH_VMCR_EL2) >> ICH_VMCR_VPMR_SHIFT) & 0xFFUL;
 			goto sys_fin;
 		}
-		/* Phase 190: 读 ICC_CTLR_EL1 返回虚拟 CBPR，见写分支注释。 */
+		/*
+		 * Phase 192：读 ICC_CTLR_EL1 返回「物理只读能力位 + 虚拟 CBPR」。
+		 * 只读位（PRIbits[10:8] IDbits[13:11] SEIS[14] A3V[15] RSS[18]
+		 * ExtRange[19]）是硬件能力，guest 应看到物理值；CBPR[0] 取虚拟后端。
+		 * EOImode[1] 等可写位本阶段仍不虚拟化，读出为 0（见 Phase 192 文档）。
+		 */
 		if (op0 == 3 && op1 == 0 && crn == 12 && crm == 12 && op2 == 4) {
-			regs->regs[rt] = (READ_SYSREG64(ICH_VMCR_EL2) & ICH_VMCR_VCBPR) ? 1 : 0;
+			unsigned long ro_mask = (0x7UL << 8) | (0x7UL << 11) |
+						(1UL << 14) | (1UL << 15) |
+						(1UL << 18) | (1UL << 19);
+			unsigned long phys = READ_SYSREG64(S3_0_C12_C12_4);
+			unsigned long vmcr = READ_SYSREG64(ICH_VMCR_EL2);
+			unsigned long vcbpr = (vmcr & ICH_VMCR_VCBPR) ? 1UL : 0UL;
+			regs->regs[rt] = (phys & ro_mask) | vcbpr;
 			goto sys_fin;
 		}
 #endif

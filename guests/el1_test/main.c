@@ -2778,6 +2778,49 @@ static void phase190_cbpr_test(void)
 }
 
 /*
+ * 只读探针：打印 ICC_CTLR_EL1 完整值（仅 VM1 执行，不写任何寄存器）。
+ * 用于确认 guest 实际看到的 PRIbits、EOImode、SEIS、A3V、RSS 等位。
+ */
+static void probe_icc_ctlr_readonly(void)
+{
+    if (guest_vmid() != 1)
+        return;
+    u64 guest_view = ctlr_read();
+    register u64 x0 __asm__("x0") = 0;
+    register u64 x1 __asm__("x1");
+    register u64 x8 __asm__("x8") = HVC_VGIC_CTLR_PHYS;
+    asm volatile("hvc #0" : "+r"(x0), "=r"(x1) : "r"(x8) : "memory");
+    u64 phys = x0;
+    const u64 ro_mask = (0x7ULL << 8) | (0x7ULL << 11) |
+                        (1ULL << 14) | (1ULL << 15) |
+                        (1ULL << 18) | (1ULL << 19);
+    int ok = ((guest_view & ro_mask) == (phys & ro_mask));
+    guest_puts("\nProbe: ICC_CTLR_EL1\n");
+    guest_puts("  guest_view=");
+    puts_hex(guest_view, 16);
+    guest_puts(" phys_el2=");
+    puts_hex(phys, 16);
+    guest_puts("\n  readonly bits match: ");
+    guest_puts(ok ? "yes" : "no");
+    guest_puts("\n  PRIbits=");
+    puts_dec(((guest_view >> 8) & 0x7) + 1);
+    guest_puts(" IDbits=");
+    puts_dec((guest_view >> 11) & 0x7);
+    guest_puts(" SEIS=");
+    puts_dec((guest_view >> 14) & 1);
+    guest_puts(" A3V=");
+    puts_dec((guest_view >> 15) & 1);
+    guest_puts(" RSS=");
+    puts_dec((guest_view >> 18) & 1);
+    guest_puts(" ExtRange=");
+    puts_dec((guest_view >> 19) & 1);
+    guest_puts("\n");
+    guest_puts(ok ? "  PASSED: 只读能力位与物理值一致\n"
+                  : "  FAILED: 只读能力位与物理值不一致\n");
+}
+
+
+/*
  * 191：pending ring 满时是否丢中断（仅 VM1 执行）。
  *
  * 软件注入可用 1 个 LR（LR1）+ 32 项 pending ring。先屏蔽 IRQ 连续注入
@@ -2840,6 +2883,53 @@ static void phase191_pending_ring_full_test(void)
         guest_puts("  ring: all accepted interrupts delivered PASSED\n");
     else
         guest_puts("  ring: DROPPED (delivered < accepted) FAILED\n");
+}
+
+/*
+ * Phase 192 探针：单次软件注入后读取 LR1 状态（只读观测）。
+ * vINTID 100 不在任何既有测试区间内，走 guest 分派的兜底分支（仅 EOIR）。
+ * 观察 split EOI 语义下 guest 写 EOIR 后 LR1 是否仍 active（state bit 63:62）。
+ */
+#define P192_PROBE_VIRQ 100
+static volatile int p192_probe_received;
+
+static void probe_lr1_after_eoi(void)
+{
+    guest_puts("\nProbe: LR1 state after guest EOIR (read-only)\n");
+
+    p192_probe_received = 0;
+    asm volatile("msr daifset, #2" ::: "memory");
+    int ret = vgicd_inject(P192_PROBE_VIRQ);
+    asm volatile("msr daifclr, #2" ::: "memory");
+
+    /* 注入后立即读 LR（送达前）：区分「未写入」与「已写入但未送达」 */
+    register u64 a0 __asm__("x0");
+    register u64 a1 __asm__("x1");
+    register u64 a2 __asm__("x2");
+    register u64 a3 __asm__("x3");
+    register u64 a8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a8) : "memory");
+    u64 pre_lr1 = a1;
+
+    for (volatile int i = 0; i < 2000000 && !p192_probe_received; i++)
+        asm volatile("nop");
+
+    register u64 x0 __asm__("x0");
+    register u64 x1 __asm__("x1");
+    register u64 x2 __asm__("x2");
+    register u64 x3 __asm__("x3");
+    register u64 x8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "=r"(x0), "=r"(x1), "=r"(x2), "=r"(x3) : "r"(x8) : "memory");
+
+    guest_puts("  inject_ret=");
+    puts_dec((u64)ret);
+    guest_puts(" received=");
+    puts_dec((u64)p192_probe_received);
+    guest_puts(" pre_LR1=");
+    puts_hex(pre_lr1, 16);
+    guest_puts(" post_LR1=");
+    puts_hex(x1, 16);
+    guest_puts("\n");
 }
 
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
@@ -5377,6 +5467,9 @@ void guest_irq_handler(void)
     } else if (intid == VGICR_TEST_PPI) {
         /* Phase 16: 虚拟 GICR 测试中断 */
         vgicr_irq_received = 1;
+    } else if (intid == P192_PROBE_VIRQ) {
+        /* Phase 192：LR1 探针的 handler 计数（只读观测用） */
+        p192_probe_received = 1;
     } else if (intid < 16) {
         /* Phase 12: SGI（软件生成中断，vSGI 测试用）
          * SGI INTID 范围 0-15。
@@ -5617,7 +5710,9 @@ void guest_main(void)
     phase188_bpr0_physical_test();
     phase189_bpr_clamp_stage_test();
     phase190_cbpr_test();
+    probe_icc_ctlr_readonly();
     phase191_pending_ring_full_test();
+    probe_lr1_after_eoi();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();

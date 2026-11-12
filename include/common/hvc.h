@@ -100,3 +100,9 @@
 /* Phase 188: BPR0 钳位来源实证（只读诊断） */
 #define HVC_VGIC_BPR_PHYS        76 /* 返回 x0=物理 ICC_BPR0_EL1 x1=物理 ICC_BPR1_EL1
                                      * x2=ICH_VMCR_EL2 原始值 x3=物理 ICC_IGRPEN1_EL1 */
+
+/* Phase 192: ICC_CTLR_EL1 物理值读取（只读诊断） */
+#define HVC_VGIC_CTLR_PHYS       77 /* 返回 x0=EL2 视角 ICC_CTLR_EL1 x1=ICH_VMCR_EL2 */
+
+/* Phase 192: LR 状态转储（只读诊断） */
+#define HVC_VGIC_LR_DUMP         78 /* 返回 x0=LR0 x1=LR1 x2=LR2 x3=ICH_VMCR_EL2 */
