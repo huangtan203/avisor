@@ -75,10 +75,10 @@ void enable_interrupt_controller()
  * 显示未捕获异常信息
  */
 void show_invalid_entry_message(int type, unsigned long esr, unsigned long elr,
-                unsigned long far)
+                unsigned long far, unsigned long x30, unsigned long sp)
 {
-    PANIC("uncaught exception(%s) esr: %x, elr: %x, far: %x",
-          entry_error_messages[type], esr, elr, far);
+    PANIC("uncaught exception(%s) esr: %x, elr: %x, far: %x x30: %lx sp: %lx",
+          entry_error_messages[type], esr, elr, far, x30, sp);
 }
 
 /*
