@@ -131,6 +131,29 @@ static void vgic_clear_pending_virq(uint32_t vintid)
 }
 
 /*
+ * Phase 194：处理 Guest 写 ICC_DIR_EL1（TC=1 trap 到 EL2）。
+ *
+ * VEOIM=1 时 guest 只写 EOIR 降优先级，LR 停在 active，须经 DIR 去活。
+ * 这里按 vINTID 找到 active 的软件 LR（LR1..NR-2）并清零。
+ * HW 映射 LR（LR0/LR2）的物理 DIR 由 virt_leaving_vm 负责，此处跳过。
+ */
+void vgic_handle_dir(uint32_t vintid)
+{
+    for (int i = 1; i < NR_VGIC_LRS - 1; i++) {
+        uint64_t lr = read_lr(i);
+        if ((lr & ICH_LR_STATE_MASK) != ICH_LR_ACTIVE)
+            continue;
+        if ((lr & ICH_LR_HW) != 0)
+            continue;
+        if ((uint32_t)(lr & 0xffffffffULL) == vintid) {
+            write_lr(i, 0);
+            asm volatile("isb");
+            return;
+        }
+    }
+}
+
+/*
  * vGIC 初始化
  *
  * 前置条件：gic_init() 已完成（物理 CPU 接口已使能系统寄存器模式，
@@ -161,7 +184,7 @@ void vgic_init(void)
      *    - VENG1 = 1：使能虚拟 Group 1 中断
      */
     {
-        uint64_t vmcr = (0xFFUL << ICH_VMCR_VPMR_SHIFT) | ICH_VMCR_VENG1;
+        uint64_t vmcr = (0xFFUL << ICH_VMCR_VPMR_SHIFT) | ICH_VMCR_VENG1 | ICH_VMCR_VEOIM;
         WRITE_SYSREG64(vmcr, ICH_VMCR_EL2);
         asm volatile("isb");
     }

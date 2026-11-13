@@ -103,6 +103,7 @@ void vgicr_write(struct vgic_rdist *r, uint32_t offset, uint32_t val);
  * 目标 vCPU 亲和，翻译成 vSGI 注入（替代 HVC_VSGI_SEND 半虚拟化）。
  */
 void handle_vgic_sgi1r(uint64_t val);
+void vgic_handle_dir(uint32_t vintid);
 
 /*
  * 向当前 Guest 注入一个 HW 映射的虚拟中断（PCI INTx 直通用，固定 LR2）

@@ -646,6 +646,14 @@ void handle_trap_system(unsigned long esr)
 			goto sys_fin;
 		}
 		/*
+		 * Phase 194：ICC_DIR_EL1 写（TC=1 trap）。VEOIM=1 下 guest 用
+		 * DIR 去活中断，由 EL2 按 vINTID 清除对应软件 LR。
+		 */
+		if (op0 == 3 && op1 == 0 && crn == 12 && crm == 11 && op2 == 1) {
+			vgic_handle_dir((uint32_t)(regs->regs[rt] & 0x3ff));
+			goto sys_fin;
+		}
+		/*
 		 * Phase 180/183: ICH_HCR_EL2.TC=1 同时使 ICC_PMR_EL1 写陷入 EL2。
 		 * 必须同时更新硬件 ICH_VMCR_EL2 与保存副本 current->virt.gic_vmcr：
 		 * trap 不经过 leaving_vm，若只改副本，下一次世界切换会用硬件旧值
@@ -692,7 +700,7 @@ void handle_trap_system(unsigned long esr)
 		 * Phase 192：读 ICC_CTLR_EL1 返回「物理只读能力位 + 虚拟 CBPR」。
 		 * 只读位（PRIbits[10:8] IDbits[13:11] SEIS[14] A3V[15] RSS[18]
 		 * ExtRange[19]）是硬件能力，guest 应看到物理值；CBPR[0] 取虚拟后端。
-		 * EOImode[1] 等可写位本阶段仍不虚拟化，读出为 0（见 Phase 192 文档）。
+		 * Phase 194 起 EOImode[1] 也按虚拟后端 VEOIM 读回（Phase 192 时读出为 0）。
 		 */
 		if (op0 == 3 && op1 == 0 && crn == 12 && crm == 12 && op2 == 4) {
 			unsigned long ro_mask = (0x7UL << 8) | (0x7UL << 11) |
@@ -701,7 +709,8 @@ void handle_trap_system(unsigned long esr)
 			unsigned long phys = READ_SYSREG64(S3_0_C12_C12_4);
 			unsigned long vmcr = READ_SYSREG64(ICH_VMCR_EL2);
 			unsigned long vcbpr = (vmcr & ICH_VMCR_VCBPR) ? 1UL : 0UL;
-			regs->regs[rt] = (phys & ro_mask) | vcbpr;
+			unsigned long veoim = (vmcr & ICH_VMCR_VEOIM) ? 2UL : 0UL;
+			regs->regs[rt] = (phys & ro_mask) | vcbpr | veoim;
 			goto sys_fin;
 		}
 #endif

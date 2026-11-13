@@ -138,7 +138,7 @@ PASSED! Received vSPI 72 (vLPI 8200)
 - 反查表容量 64，满则失败；不做 LRU 或回收；
 - pLPI 空洞仍不回收（单调 cursor）；
 - 只覆盖 VM1 的 edu 设备路径，未覆盖多设备并发替换；
-- 未实现 UNMAPTI，因此无法释放 (devid, eventid) 映射；
+- 解映射由 DISCARD 承担（`db94bd4` 实现，已由 `main.c` 用例实测：DISCARD 后中断被压制、未拥有 requester 被拒绝）；本阶段未实现 UNMAPTI（未取得可靠规范依据）；
 - `edu function reset FAILED` 仍存在。
 
 ## 10. 文件映射

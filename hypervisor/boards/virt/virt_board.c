@@ -503,7 +503,7 @@ static uint64_t alloc_shared_memory(size_t size)
 static void virt_initialize(struct task_struct *tsk)
 {
 	tsk->mm.cntvoff = READ_SYSREG64(CNTPCT_EL0);
-	tsk->virt.gic_vmcr = (0xF8UL << ICH_VMCR_VPMR_SHIFT) | ICH_VMCR_VENG1;
+	tsk->virt.gic_vmcr = (0xF8UL << ICH_VMCR_VPMR_SHIFT) | ICH_VMCR_VENG1 | ICH_VMCR_VEOIM;
 
     /*
      * 分配 per-VM 设备模型数据结构
@@ -591,7 +591,7 @@ void virt_attach_secondary(struct task_struct *tsk, struct task_struct *master)
     tsk->mm.cntvoff = master->mm.cntvoff;
 
     /* vGIC CPU 接口是 per-vCPU 的，独立初始化 */
-    tsk->virt.gic_vmcr = (0xF8UL << ICH_VMCR_VPMR_SHIFT) | ICH_VMCR_VENG1;
+    tsk->virt.gic_vmcr = (0xF8UL << ICH_VMCR_VPMR_SHIFT) | ICH_VMCR_VENG1 | ICH_VMCR_VEOIM;
     tsk->virt.vtimer_pending = 0;
     tsk->virt.cntv_cval = 0;
     tsk->virt.cntv_ctl = 0;

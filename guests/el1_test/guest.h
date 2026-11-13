@@ -159,6 +159,7 @@ static inline void write_sysreg(u64 val, const char *name)
 #define icc_igrpen1_write(v) SYSREG_WRITE(S3_0_C12_C12_7, v)
 #define icc_iar1_read()     SYSREG_READ(S3_0_C12_C12_0)
 #define icc_eoir1_write(v)  SYSREG_WRITE(S3_0_C12_C12_1, v)
+#define icc_dir_write(v)    SYSREG_WRITE(S3_0_C12_C11_1, v)
 /* Phase 17: 标准 SGI 发送（写 ICC_SGI1R_EL1，触发 Hypervisor trap-and-emulate） */
 #define icc_sgi1r_write(v)  SYSREG_WRITE(S3_0_C12_C11_5, v)
 

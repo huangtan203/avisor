@@ -2887,11 +2887,14 @@ static void phase191_pending_ring_full_test(void)
 
 /*
  * Phase 192 探针：单次软件注入后读取 LR1 状态（只读观测）。
- * vINTID 100 不在任何既有测试区间内，走 guest 分派的兜底分支（仅 EOIR）。
- * 观察 split EOI 语义下 guest 写 EOIR 后 LR1 是否仍 active（state bit 63:62）。
+ * vINTID 100 不在任何既有测试区间内，走 guest 分派的兜底分支。
+ * 兜底分支执行 EOIR + DIR（split EOI 路径）。观察 split EOI 语义下
+ * guest 写完 EOIR/DIR 后 LR1 是否被清零（state bit 63:62）。
  */
 #define P192_PROBE_VIRQ 100
+#define P194_DIR_VIRQ   101
 static volatile int p192_probe_received;
+static volatile int p194_eoir_done;
 
 static void probe_lr1_after_eoi(void)
 {
@@ -2900,9 +2903,12 @@ static void probe_lr1_after_eoi(void)
     p192_probe_received = 0;
     asm volatile("msr daifset, #2" ::: "memory");
     int ret = vgicd_inject(P192_PROBE_VIRQ);
-    asm volatile("msr daifclr, #2" ::: "memory");
 
-    /* 注入后立即读 LR（送达前）：区分「未写入」与「已写入但未送达」 */
+    /*
+     * 注入后、开中断前读 LR：此时中断尚未送达，读到的是注入写入的
+     * pending 状态。若在 daifclr 之后读，IRQ 会被立即取走并执行完
+     * EOIR+DIR，LR 已被清空，无法区分「未写入」与「已消费」。
+     */
     register u64 a0 __asm__("x0");
     register u64 a1 __asm__("x1");
     register u64 a2 __asm__("x2");
@@ -2910,6 +2916,8 @@ static void probe_lr1_after_eoi(void)
     register u64 a8 __asm__("x8") = HVC_VGIC_LR_DUMP;
     asm volatile("hvc #0" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a8) : "memory");
     u64 pre_lr1 = a1;
+
+    asm volatile("msr daifclr, #2" ::: "memory");
 
     for (volatile int i = 0; i < 2000000 && !p192_probe_received; i++)
         asm volatile("nop");
@@ -2930,6 +2938,62 @@ static void probe_lr1_after_eoi(void)
     guest_puts(" post_LR1=");
     puts_hex(x1, 16);
     guest_puts("\n");
+}
+
+/*
+ * Phase 194 DIR 探针：验证 VEOIM=1 下 EOIR 与 DIR 的分工。
+ *
+ * 步骤：注入 vINTID 101 → handler 只做 EOIR（不做 DIR）→ 读 LR1 应仍
+ * 为 ACTIVE（EOIR 只降优先级，不去活）→ guest 显式写 DIR → 读 LR1
+ * 应被清零。两次读取之间没有其它路径会清 LR，因此 LR 清零可归因于 DIR。
+ */
+static void probe_dir_semantics(void)
+{
+    guest_puts("\nProbe: ICC_DIR_EL1 semantics (VEOIM=1)\n");
+
+    p194_eoir_done = 0;
+    asm volatile("msr daifset, #2" ::: "memory");
+    int ret = vgicd_inject(P194_DIR_VIRQ);
+    asm volatile("msr daifclr, #2" ::: "memory");
+
+    for (volatile int i = 0; i < 2000000 && !p194_eoir_done; i++)
+        asm volatile("nop");
+
+    register u64 a0 __asm__("x0");
+    register u64 a1 __asm__("x1");
+    register u64 a2 __asm__("x2");
+    register u64 a3 __asm__("x3");
+    register u64 a8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a8) : "memory");
+    u64 after_eoir = a1;
+
+    icc_dir_write(P194_DIR_VIRQ);
+    asm volatile("isb" ::: "memory");
+
+    register u64 x0 __asm__("x0");
+    register u64 x1 __asm__("x1");
+    register u64 x2 __asm__("x2");
+    register u64 x3 __asm__("x3");
+    register u64 x8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "=r"(x0), "=r"(x1), "=r"(x2), "=r"(x3) : "r"(x8) : "memory");
+    u64 after_dir = x1;
+
+    int active_after_eoir = ((after_eoir >> 62) == 2);
+    int cleared_after_dir = (after_dir == 0);
+
+    guest_puts("  inject_ret=");
+    puts_dec((u64)ret);
+    guest_puts(" eoir_done=");
+    puts_dec((u64)p194_eoir_done);
+    guest_puts(" LR1_after_EOIR=");
+    puts_hex(after_eoir, 16);
+    guest_puts(" LR1_after_DIR=");
+    puts_hex(after_dir, 16);
+    guest_puts("\n");
+    if (ret == 0 && p194_eoir_done && active_after_eoir && cleared_after_dir)
+        guest_puts("  PASSED: EOIR 仅降优先级（LR 保持 active），DIR 去活并清除 LR\n");
+    else
+        guest_puts("  FAILED: DIR 语义与 VEOIM=1 预期不符\n");
 }
 
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
@@ -5470,6 +5534,14 @@ void guest_irq_handler(void)
     } else if (intid == P192_PROBE_VIRQ) {
         /* Phase 192：LR1 探针的 handler 计数（只读观测用） */
         p192_probe_received = 1;
+    } else if (intid == P194_DIR_VIRQ) {
+        /*
+         * Phase 194 DIR 探针：只执行 EOIR，跳过下方的 DIR。
+         * 在 EOIR 后、DIR 前读取 LR，判断 VEOIM=1 下 EOIR 是否只降优先级。
+         */
+        icc_eoir1_write(iar);
+        p194_eoir_done = 1;
+        return;
     } else if (intid < 16) {
         /* Phase 12: SGI（软件生成中断，vSGI 测试用）
          * SGI INTID 范围 0-15。
@@ -5482,6 +5554,7 @@ void guest_irq_handler(void)
     }
 
     icc_eoir1_write(iar);
+    icc_dir_write(iar);
 }
 
 /* ---------- 主函数 ---------- */
@@ -5713,6 +5786,7 @@ void guest_main(void)
     probe_icc_ctlr_readonly();
     phase191_pending_ring_full_test();
     probe_lr1_after_eoi();
+    probe_dir_semantics();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
