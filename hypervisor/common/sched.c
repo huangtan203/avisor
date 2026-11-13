@@ -185,7 +185,8 @@ int sched_migrate_current(int target_cpu)
 
     if (!tsk || tsk->pid == 0 || target_cpu < 0 || target_cpu >= MAX_CPUS ||
         target_cpu == source_cpu || !smp_online[target_cpu] ||
-        tsk->phys_cpu != source_cpu || tsk->state != TASK_RUNNING)
+        tsk->phys_cpu != source_cpu || tsk->state != TASK_RUNNING ||
+        (tsk->flags & TASK_PINNED))
         return -1;
 
     first_cpu = source_cpu < target_cpu ? source_cpu : target_cpu;
@@ -295,7 +296,8 @@ void sched_balance_tick(int cpu)
         return;
 
     remote_load = sched_cpu_load(other);
-    if (local_load >= 75 && remote_load + 25 <= local_load &&
+    if (!(current->flags & TASK_PINNED) && local_load >= 75 &&
+        remote_load + 25 <= local_load &&
         current->state == TASK_RUNNING) {
         __atomic_store_n(&balance_target[cpu], other, __ATOMIC_RELEASE);
         balance_cooldown[cpu] = 5;

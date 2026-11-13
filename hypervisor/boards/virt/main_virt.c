@@ -341,6 +341,11 @@ void hypervisor_main()
                 PANIC("failed to create VM2 vcpu1");
             cpu1_tasks[pid]->priority = 10;
             cpu1_tasks[pid]->counter = 10;
+            /*
+             * 固定物理核：Phase 27 冻结握手的 HVC 只能作用于 cpu1 上的
+             * vm2 vCPU1（smp_freeze_begin(1)），被负载均衡器迁走后即失效。
+             */
+            cpu1_tasks[pid]->flags |= TASK_PINNED;
             (void)strncpy(cpu1_tasks[pid]->name, "vm2-cpu1", 36);
             printf("[8.4] VM2 vcpu1 created (vmid=2, cpu1, pid=%d)\n", pid);
             /* 注册 vCPU 到板级查找表（用于 vSGI 等跨 vCPU 操作） */

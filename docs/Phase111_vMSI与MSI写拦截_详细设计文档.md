@@ -2,7 +2,7 @@
 
 > 平台：QEMU virt / AArch64 EL2 / PCI ECAM emulation / ITS
 > 前置阶段：Phase 110 ECAM trap-and-emulate
-> 范围：VM1 edu 的 MSI capability 虚拟化；不含 MSI-X
+> 范围：VM1 edu 的 MSI capability 虚拟化；不含 MSI-X Table/PBA 拦截（见限制）
 
 ## 1. 安全目标
 
@@ -109,7 +109,7 @@ flowchart LR
 ## 9. 限制
 
 - 只覆盖 owner edu，不是通用 per-function capability state。
-- MSI-X 未实现。
+- MSI-X 仅虚拟化配置空间（Control 读写、物理 Enable 强制关闭）；Table/PBA 所在 BAR 的 MMIO 未拦截。edu 只有 MSI 无 MSI-X，`00:01.0` 有 MSI-X 但无 guest 用例访问其 Table，因此未做实测。
 - Mask/Pending 是软件状态；硬件 mask 同步不保证所有设备都遵循虚拟 mask 语义。
 - Guest eventID 必须有合法 requester/vITS 映射，否则不会得到有效 Guest LPI。
 - 无 SMMU/IOMMU DMA 隔离。

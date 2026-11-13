@@ -31,6 +31,7 @@
 /* task_struct::flags：镜像加载完成（Stage 2 页表就绪）
  * 共享页表的次级 vCPU 依赖此标志判断主 vCPU 是否加载完毕 */
 #define TASK_MM_READY 0x1
+#define TASK_PINNED   0x2 /* 固定物理核：负载均衡器不得迁移该任务（冻结测试目标） */
 
 struct board_ops;
 struct vm;

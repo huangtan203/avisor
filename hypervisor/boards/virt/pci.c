@@ -192,6 +192,13 @@ struct pci_device_resource {
     uint32_t msix_table_offset;
     uint32_t msix_pba_offset;
     uint32_t dma_generation;
+    /*
+     * SMMU domain 绑定（软件记录，0 = 未绑定）。
+     * QEMU 6.2 无 ARM SMMUv3 设备，此处只维护授权事务所需的软件状态，
+     * 不写任何 SMMU 寄存器；真正的 Stream Table/Context Descriptor
+     * 编程待 Orin 实机环境验证后再补。
+     */
+    uint16_t smmu_domain;
     struct pci_bar_resource bars[PCI_MAX_BARS];
 };
 
@@ -326,6 +333,36 @@ static uint32_t pci_dma_get_generation(struct pci_device_resource *resource)
     return generation;
 }
 
+/*
+ * SMMU domain 绑定（软件记录）。
+ *
+ * 当前环境（QEMU 6.2）没有 ARM SMMUv3 设备，这里只维护授权事务需要的
+ * 软件状态：未绑定 domain 的 function 不得开启 Bus Master。真正的
+ * Stream Table / Context Descriptor 编程在 Orin 实机上补齐后再替换。
+ *
+ * 返回 0 成功；-1 参数非法。
+ */
+static int pci_smmu_bind(struct pci_device_resource *resource,
+                         uint16_t domain)
+{
+    if (!resource || !domain)
+        return -1;
+    resource->smmu_domain = domain;
+    INFO("PCI: SMMU bind %02x:%02x.%u domain=%u (software only)",
+         resource->bus, resource->dev, resource->func, domain);
+    return 0;
+}
+
+static void pci_smmu_unbind(struct pci_device_resource *resource)
+{
+    if (!resource || !resource->smmu_domain)
+        return;
+    INFO("PCI: SMMU unbind %02x:%02x.%u domain=%u",
+         resource->bus, resource->dev, resource->func,
+         resource->smmu_domain);
+    resource->smmu_domain = 0;
+}
+
 static int pci_dma_set_authorized(struct pci_device_resource *resource,
                                   unsigned int owner_vmid, int authorized,
                                   uint32_t expected_generation)
@@ -342,6 +379,12 @@ static int pci_dma_set_authorized(struct pci_device_resource *resource,
         WARN("PCI: rejected stale DMA transition %02x:%02x.%u expected=%u current=%u state=%u target=%u",
              resource->bus, resource->dev, resource->func,
              expected_generation, current_generation, state, !!authorized);
+        return -1;
+    }
+    if (authorized && !resource->smmu_domain) {
+        pci_dma_lock_release(flags);
+        WARN("PCI: DMA authorize refused, no SMMU domain for %02x:%02x.%u",
+             resource->bus, resource->dev, resource->func);
         return -1;
     }
     if (resource->dma_generation == UINT32_MAX) {
@@ -1043,6 +1086,7 @@ static int pci_dma_guard_init(void)
                          PCI_CFG_COMMAND, command);
         resource->dma_owner_vmid = 0;
         resource->dma_authorized = 0;
+        pci_smmu_unbind(resource);
         resource->dma_generation = 1;
         uint32_t verify = pci_config_read(resource->bus, resource->dev,
                                           resource->func,
@@ -1074,11 +1118,13 @@ static int pci_dma_state_audit_locked(void)
             physical != resource->dma_authorized ||
             (resource->dma_authorized &&
              resource->dma_owner_vmid != resource->owner_vmid) ||
-            (!resource->dma_authorized && resource->dma_owner_vmid)) {
-            WARN("PCI: DMA state mismatch %02x:%02x.%u physical=%u authorized=%u owner=%u/%u generation=%u",
+            (!resource->dma_authorized && resource->dma_owner_vmid) ||
+            (resource->dma_authorized && !resource->smmu_domain)) {
+            WARN("PCI: DMA state mismatch %02x:%02x.%u physical=%u authorized=%u owner=%u/%u generation=%u smmu=%u",
                  resource->bus, resource->dev, resource->func, physical,
                  resource->dma_authorized, resource->dma_owner_vmid,
-                 resource->owner_vmid, resource->dma_generation);
+                 resource->owner_vmid, resource->dma_generation,
+                 resource->smmu_domain);
             return -1;
         }
         authorized += resource->dma_authorized;
@@ -1558,6 +1604,42 @@ static int pci_scan_bus(unsigned int bus)
     return 0;
 }
 
+/*
+ * SMMU 授权不变式自检：未绑定 domain 的 function 必须拒绝授权。
+ *
+ * 在 pci_enumerate 中调用一次。此时所有 function 均未授权、未绑定 domain
+ * （pci_dma_guard_init 已清 BME），对 owner_vmid==1 的条目尝试授权必须失败。
+ * 拒绝发生在写 PCI_CFG_COMMAND 之前，无副作用。
+ */
+static int pci_smmu_authorize_guard_selftest(void)
+{
+    for (unsigned int i = 0; i < pci_device_count; i++) {
+        struct pci_device_resource *resource = &pci_devices[i];
+        if (resource->owner_vmid != 1 || resource->smmu_domain)
+            continue;
+        /*
+         * 排除 stale 拒绝：此时必须未授权且 generation 与当前一致，
+         * 这样「返回非 0」只可能来自缺 domain 的检查，用例才有意义。
+         */
+        if (resource->dma_authorized) {
+            WARN("PCI: SMMU guard selftest precondition failed, %02x:%02x.%u already authorized",
+                 resource->bus, resource->dev, resource->func);
+            return -1;
+        }
+        uint32_t generation = pci_dma_get_generation(resource);
+        if (pci_dma_set_authorized(resource, 1, 1, generation) == 0) {
+            WARN("PCI: SMMU guard failed, authorize succeeded without domain for %02x:%02x.%u",
+                 resource->bus, resource->dev, resource->func);
+            return -1;
+        }
+        INFO("PCI: SMMU guard PASSED, authorize refused for %02x:%02x.%u",
+             resource->bus, resource->dev, resource->func);
+        return 0;
+    }
+    WARN("PCI: SMMU guard selftest found no owner_vmid=1 resource");
+    return -1;
+}
+
 static int pci_enumerate(void)
 {
     if (pool_selftest() < 0) {
@@ -1571,6 +1653,8 @@ static int pci_enumerate(void)
     if (pci_scan_bus(0) < 0 || !edu_found)
         return -1;
     if (pci_dma_guard_init() < 0 || pci_dma_state_audit() < 0)
+        return -1;
+    if (pci_smmu_authorize_guard_selftest() < 0)
         return -1;
     if (pci_bar_resource_audit() < 0) {
         WARN("PCI: BAR resource audit failed");
@@ -1817,7 +1901,8 @@ void pci_init(void)
         }
         uint32_t dma_generation =
             pci_dma_get_generation(edu_resource);
-        if (pci_dma_set_authorized(edu_resource, 1, 1,
+        if (pci_smmu_bind(edu_resource, 1) < 0 ||
+            pci_dma_set_authorized(edu_resource, 1, 1,
                                    dma_generation) < 0) {
             WARN("PCI: edu DMA authorization failed after MSI routing");
             return;
@@ -1854,6 +1939,8 @@ static int pci_edu_quiesce(uint32_t *revoked_generation)
     uint32_t generation = pci_dma_get_generation(resource);
     if (pci_dma_set_authorized(resource, 1, 0, generation) < 0)
         return -1;
+    /* 时序：BME 已由上一步清除，此时才能解绑 domain */
+    pci_smmu_unbind(resource);
     if (revoked_generation)
         *revoked_generation = generation + 1;
     pci_config_write(edu_bus, edu_dev, edu_func, PCI_CFG_COMMAND,
@@ -1945,6 +2032,7 @@ static int pci_edu_reinit_msi(uint32_t expected_generation)
 
     if (vits_lpi_audit_owned_range(lpi_base, vectors, 1,
                                    EDU_MSI_VINTID_BASE) < 0 ||
+        pci_smmu_bind(edu_resource, 1) < 0 ||
         pci_dma_set_authorized(edu_resource, 1, 1,
                                expected_generation) < 0)
         goto rollback;

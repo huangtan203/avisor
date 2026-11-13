@@ -186,9 +186,12 @@ static unsigned long next_vmid = 1;
 static int task_reaped_count[MAX_CPUS];
 static int task_reused_count[MAX_CPUS];
 
-/* 在指定 CPU 上创建 vCPU；legacy task API 由下面的 wrapper 提供。 */
+/* 在指定 CPU 上创建 vCPU；legacy task API 由下面的 wrapper 提供。
+ * attach_vm 为 0 时创建的是「探针任务」：不挂载到 VM（vmid=0），
+ * 用于 task 槽位复用自测，避免与现有 VM 的 vmid/vCPU 槽位冲突。 */
 static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
-                                   int cpu, loader_func_t loader, void *arg)
+                                   int cpu, loader_func_t loader, void *arg,
+                                   int attach_vm)
 {
 	struct task_struct *p;
 	int pid;
@@ -229,6 +232,7 @@ static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
 	p->counter = p->priority;
 	p->vmid = vmid;
 	p->vm = NULL;
+	p->board_data = NULL;
 	p->vcpu_id = vcpu_id;
 	p->phys_cpu = cpu;
 	(void)strncpy(p->name, "VM", 36);
@@ -266,7 +270,7 @@ static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
 	if (cpu_state[cpu].task[pid] == p && pid < cpu_state[cpu].nr_tasks - 1)
 		task_reused_count[cpu]++;
 
-	if (vm_attach_vcpu(p, vmid, vcpu_id) < 0) {
+	if (attach_vm && vm_attach_vcpu(p, vmid, vcpu_id) < 0) {
 		sched_dequeue_task(p);
 		destroy_task_aux(p);
 		deallocate_task_struct(p);
@@ -279,12 +283,25 @@ static int create_vcpu_task_on_cpu(unsigned long vmid, int vcpu_id,
 int create_vcpu_on_cpu(unsigned long vmid, int vcpu_id, int cpu,
                        loader_func_t loader, void *arg)
 {
-	return create_vcpu_task_on_cpu(vmid, vcpu_id, cpu, loader, arg);
+	return create_vcpu_task_on_cpu(vmid, vcpu_id, cpu, loader, arg, 1);
+}
+
+/*
+ * 创建不挂 VM 的探针任务（vmid=0）。
+ *
+ * 用途：task 槽位复用自测需要反复创建/回收 task，但常规创建路径会
+ * 把任务挂到 VM 上（vm_attach_vcpu）。若用自动 vmid 分配，会与已有
+ * VM 的 vmid / vCPU0 槽位冲突导致创建失败。探针任务不参与 VM 生命周期，
+ * 回收时 board_data 为空，virt_destroy_vm 直接返回。
+ */
+static int create_probe_task_on_cpu(int cpu)
+{
+	return create_vcpu_task_on_cpu(0, 0, cpu, NULL, NULL, 0);
 }
 
 int create_task_on_cpu(int cpu, loader_func_t loader, void *arg)
 {
-	return create_vcpu_task_on_cpu(next_vmid++, 0, cpu, loader, arg);
+	return create_vcpu_task_on_cpu(next_vmid++, 0, cpu, loader, arg, 1);
 }
 
 void init_task_console(struct task_struct *tsk)
@@ -371,7 +388,7 @@ int task_slot_reuse_selftest(int cpu, int *first_pid, int *second_pid)
 	if (cpu != smp_processor_id())
 		return -1;
 
-	first = create_task_on_cpu(cpu, NULL, NULL);
+	first = create_probe_task_on_cpu(cpu);
 	if (first < 0)
 		return -1;
 	probe = cpu_state[cpu].task[first];
@@ -379,7 +396,7 @@ int task_slot_reuse_selftest(int cpu, int *first_pid, int *second_pid)
 	if (reap_zombie_tasks(cpu) != 1)
 		return -1;
 
-	second = create_task_on_cpu(cpu, NULL, NULL);
+	second = create_probe_task_on_cpu(cpu);
 	if (second < 0)
 		return -1;
 	probe = cpu_state[cpu].task[second];
