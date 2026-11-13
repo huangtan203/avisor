@@ -2996,6 +2996,60 @@ static void probe_dir_semantics(void)
         guest_puts("  FAILED: DIR 语义与 VEOIM=1 预期不符\n");
 }
 
+/*
+ * Phase 196 不匹配 DIR 探针：注入 P194_DIR_VIRQ（101，handler 只做 EOIR，
+ * LR 保持 active），再对不存在 active 条目的 vINTID 102 写 DIR，LR1 应不变。
+ */
+#define P196_NOMATCH_VIRQ  102
+static void probe_dir_nomatch(void)
+{
+    guest_puts("\nProbe: ICC_DIR_EL1 no-match (VEOIM=1)\n");
+
+    p194_eoir_done = 0;
+    asm volatile("msr daifset, #2" ::: "memory");
+    int ret = vgicd_inject(P194_DIR_VIRQ);
+    asm volatile("msr daifclr, #2" ::: "memory");
+
+    for (volatile int i = 0; i < 2000000 && !p194_eoir_done; i++)
+        asm volatile("nop");
+
+    register u64 a0 __asm__("x0");
+    register u64 a1 __asm__("x1");
+    register u64 a2 __asm__("x2");
+    register u64 a3 __asm__("x3");
+    register u64 a8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a8) : "memory");
+    u64 before_dir = a1;
+
+    icc_dir_write(P196_NOMATCH_VIRQ);
+    asm volatile("isb" ::: "memory");
+
+    register u64 x0 __asm__("x0");
+    register u64 x1 __asm__("x1");
+    register u64 x2 __asm__("x2");
+    register u64 x3 __asm__("x3");
+    register u64 x8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "=r"(x0), "=r"(x1), "=r"(x2), "=r"(x3) : "r"(x8) : "memory");
+    u64 after_dir = x1;
+
+    int active_before = ((before_dir >> 62) == 2);
+    int unchanged = (after_dir == before_dir);
+
+    guest_puts("  inject_ret=");
+    puts_dec((u64)ret);
+    guest_puts(" eoir_done=");
+    puts_dec((u64)p194_eoir_done);
+    guest_puts(" LR1_before_DIR=");
+    puts_hex(before_dir, 16);
+    guest_puts(" LR1_after_DIR(102)=");
+    puts_hex(after_dir, 16);
+    guest_puts("\n");
+    if (ret == 0 && p194_eoir_done && active_before && unchanged)
+        guest_puts("  PASSED: DIR 写不存在 active 条目的 vINTID 时 LR 不变\n");
+    else
+        guest_puts("  FAILED: 不匹配 DIR 改变了 LR\n");
+}
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -5787,6 +5841,7 @@ void guest_main(void)
     phase191_pending_ring_full_test();
     probe_lr1_after_eoi();
     probe_dir_semantics();
+    probe_dir_nomatch();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
