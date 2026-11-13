@@ -314,3 +314,5 @@ flowchart LR
 - VM teardown重复调用现在会严格失败，调用方必须保证一次性生命周期。
 - 没有故障注入测试 stale、duplicate 和 generation exhaustion 分支。
 - 仍未实现 SMMU。后续应将 `expected_generation` 同 SMMU domain generation绑定，并在授权失败时回滚新建 ITS/SMMU资源。
+
+> 后续状态（t5，方向 A）：Phase 195 在授权前增加了「必须已绑定 SMMU domain」的门控，`smmu_domain` 仅为软件记录。`expected_generation` 与 SMMU domain generation 的绑定仍未实现。

@@ -286,9 +286,11 @@ flowchart LR
 
 Phase 122 改进了授权可审计性，但仍有明确边界：
 
-- `dma_authorized=1` 时没有 SMMU 限制 requester 可访问的物理地址；
+- `dma_authorized=1` 时没有 SMMU 限制 requester 可访问的物理地址（Phase 195 起授权前要求已绑定 SMMU domain，但仍不编程 SMMU 硬件）；
 - 当前只有 VM1 edu 使用通用接口，尚未暴露通用设备分配 API；
 - generation 仅在本次启动内有效，没有跨迁移持久化；
 - 未加锁，依赖当前 PCI 初始化/reset/ECAM trap 的串行执行模型；
 - Guest 写后 audit 失败只告警，尚未自动 revoke 或停止 VM；
 - 后续应在 `pci_dma_set_authorized(..., true)` 前要求 requester 已绑定 SMMUv3 domain，并将 domain generation 与 DMA generation 关联。
+
+> 后续状态（t5，方向 A）：授权前要求已绑定 SMMU domain 已实现，见 Phase 195 范围。`smmu_domain` 为纯软件记录，不写 SMMU 寄存器；domain generation 与 DMA generation 的关联未实现。
