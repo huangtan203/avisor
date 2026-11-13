@@ -105,7 +105,7 @@ Test 24 在部分运行中会出现 EL2 PANIC，且全部命中都在 Test 24 `F
 
 - 表 6.1 中 `kernel_exit 检查` 行对应 `diag_check_elr` 批次（60 份，4 次命中）。
 - 另有一批 `diag_check_pt_pc` 版本（判据为 `pt->pc` 落入 `current` 区间，已回退）共 3 次命中：run4 与 run8 为 `SYNC_INVALID_EL2`，`pt->pc` 为合法 guest IPA；run6 为 `DIAG` 误报，`pc=0x4000aa84` 不在任何 task 区间内，且打印的 `cur=0x1` 与其它现场矛盾，该判据不可信。该批仅得到 42 份日志，未核实中断原因。上述结果不计入 6.2。
-- 所有诊断插桩仍在树中，未提交，提交前须全部清理或保留为受控诊断。
+- 6.6 的 `task_stack_check` 插桩已回退（见 6.7）。其余诊断插桩已于此前全部清理。
 
 ### 6.5 未解决问题
 
