@@ -57,6 +57,7 @@ typedef int bool;
 #define HVC_VGIC_BPR_PHYS     76  /* Phase 188：返回 x0=物理 BPR0 x1=物理 BPR1 x2=VMCR x3=物理 IGRPEN1 */
 #define HVC_VGIC_CTLR_PHYS    77  /* Phase 192：返回 x0=EL2 视角 ICC_CTLR_EL1 x1=VMCR */
 #define HVC_VGIC_LR_DUMP      78  /* Phase 192：返回 x0=LR0 x1=LR1 x2=LR2 x3=VMCR */
+#define HVC_TEST_INJECT_HW_LR0 79 /* Phase 197：注入 HW 映射 LR0（vINTID=102, pINTID=1000） */
 #define HVC_MEM_MAP         20
 #define HVC_MEM_UNMAP       21
 #define HVC_MEM_STATS       22  /* 返回 x0=user_pages x1=kernel_pages */

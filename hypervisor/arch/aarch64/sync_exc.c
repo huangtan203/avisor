@@ -219,6 +219,14 @@ void handle_hvc64(unsigned long hvc_nr)
 		regs->regs[3] = READ_SYSREG64(ICH_VMCR_EL2);
 		break;
 
+	/*
+	 * Phase 197：测试接口，注入 HW 映射 LR0（vINTID=102，pINTID=1000）。
+	 * pINTID 1000 在本平台无设备，不会被真实中断触发。
+	 */
+	case HVC_TEST_INJECT_HW_LR0:
+		vgic_inject_virq_hw(102, 1000);
+		break;
+
 	/* Phase 10: 内存管理 hypercall */
 	case HVC_MEM_MAP: {
 		paddr_t ipa = (paddr_t)regs->regs[0];
