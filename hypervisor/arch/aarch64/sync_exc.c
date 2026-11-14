@@ -227,6 +227,14 @@ void handle_hvc64(unsigned long hvc_nr)
 		vgic_inject_virq_hw(102, 1000);
 		break;
 
+	/*
+	 * Phase 198：测试接口，注入 HW 映射 LR2（vINTID=102，pINTID=1000，PCI INTx 路径）。
+	 * 与 HVC 79 相同 pINTID，不设 EOI 位。
+	 */
+	case HVC_TEST_INJECT_HW_LR2:
+		vgic_inject_virq_hw_eoi(102, 1000);
+		break;
+
 	/* Phase 10: 内存管理 hypercall */
 	case HVC_MEM_MAP: {
 		paddr_t ipa = (paddr_t)regs->regs[0];

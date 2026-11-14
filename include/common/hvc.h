@@ -107,3 +107,4 @@
 /* Phase 192: LR 状态转储（只读诊断） */
 #define HVC_VGIC_LR_DUMP         78 /* 返回 x0=LR0 x1=LR1 x2=LR2 x3=ICH_VMCR_EL2 */
 #define HVC_TEST_INJECT_HW_LR0   79 /* Phase 197：注入 HW 映射 LR0（vINTID=102, pINTID=1000），无返回值 */
+#define HVC_TEST_INJECT_HW_LR2   80 /* Phase 198：注入 HW 映射 LR2（vINTID=102, pINTID=1000），无返回值 */

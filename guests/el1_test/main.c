@@ -3121,6 +3121,75 @@ static void probe_hw_lr_dir(void)
     guest_puts("\n");
 }
 
+/*
+ * Phase 198：HW 映射 LR2（PCI INTx 路径）的虚拟 IAR/EOIR/DIR 探针。
+ * 与 probe_hw_lr_dir 相同流程，注入 HVC 80，观测 LR2（HVC_VGIC_LR_DUMP 的 x2）。
+ */
+static void probe_hw_lr2_dir(void)
+{
+    guest_puts("\nProbe: HW LR2 virtual IAR+EOIR+DIR (VEOIM=1)\n");
+
+    asm volatile("msr daifset, #2" ::: "memory");
+
+    register u64 h0 __asm__("x0");
+    register u64 h8 __asm__("x8") = HVC_TEST_INJECT_HW_LR2;
+    asm volatile("hvc #0" : "=r"(h0) : "r"(h8) : "memory");
+
+    register u64 a0 __asm__("x0");
+    register u64 a1 __asm__("x1");
+    register u64 a2 __asm__("x2");
+    register u64 a3 __asm__("x3");
+    register u64 a8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a8) : "memory");
+    u64 before = a2;
+
+    u64 iar = icc_iar1_read();
+
+    register u64 b0 __asm__("x0");
+    register u64 b1 __asm__("x1");
+    register u64 b2 __asm__("x2");
+    register u64 b3 __asm__("x3");
+    register u64 b8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(b8) : "memory");
+    u64 after_iar = b2;
+
+    icc_eoir1_write(P197_HW_VIRQ);
+    asm volatile("isb" ::: "memory");
+
+    register u64 c0 __asm__("x0");
+    register u64 c1 __asm__("x1");
+    register u64 c2 __asm__("x2");
+    register u64 c3 __asm__("x3");
+    register u64 c8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3) : "r"(c8) : "memory");
+    u64 after_eoir = c2;
+
+    icc_dir_write(P197_HW_VIRQ);
+    asm volatile("isb" ::: "memory");
+
+    register u64 d0 __asm__("x0");
+    register u64 d1 __asm__("x1");
+    register u64 d2 __asm__("x2");
+    register u64 d3 __asm__("x3");
+    register u64 d8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3) : "r"(d8) : "memory");
+    u64 after_dir = d2;
+
+    asm volatile("msr daifclr, #2" ::: "memory");
+
+    guest_puts("  LR2_before=");
+    puts_hex(before, 16);
+    guest_puts(" IAR=");
+    puts_hex(iar, 8);
+    guest_puts(" LR2_after_IAR=");
+    puts_hex(after_iar, 16);
+    guest_puts(" LR2_after_EOIR=");
+    puts_hex(after_eoir, 16);
+    guest_puts(" LR2_after_DIR=");
+    puts_hex(after_dir, 16);
+    guest_puts("\n");
+}
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -5914,6 +5983,7 @@ void guest_main(void)
     probe_dir_semantics();
     probe_dir_nomatch();
     probe_hw_lr_dir();
+    probe_hw_lr2_dir();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();
