@@ -108,3 +108,8 @@
 #define HVC_VGIC_LR_DUMP         78 /* 返回 x0=LR0 x1=LR1 x2=LR2 x3=ICH_VMCR_EL2 */
 #define HVC_TEST_INJECT_HW_LR0   79 /* Phase 197：注入 HW 映射 LR0（vINTID=102, pINTID=1000），无返回值 */
 #define HVC_TEST_INJECT_HW_LR2   80 /* Phase 198：注入 HW 映射 LR2（vINTID=102, pINTID=1000），无返回值 */
+#define HVC_TEST_PHYS_PPI27_ACTIVE 81 /* Phase 200：返回 x0=物理 PPI 27 active 位 */
+#define HVC_TEST_PPI27_ACK        82 /* Phase 200：EL2 真实应答物理 PPI 27，不 EOI/DIR，返回 x0=INTID */
+#define HVC_TEST_INJECT_PPI27_LR0 83 /* Phase 200：注入 HW 映射 LR0（vINTID=27, pINTID=27），无返回值 */
+#define HVC_TEST_LEAVING_LR0_DIR  84 /* Phase 200：读硬件 LR0 后调用 leaving DIR 判断，返回 x0=物理 PPI 27 active */
+#define HVC_TEST_PPI27_CLEAR      85 /* Phase 200：显式 EOI+DIR 清理物理 PPI 27，无返回值 */

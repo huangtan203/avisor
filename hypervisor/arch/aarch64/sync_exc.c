@@ -235,6 +235,23 @@ void handle_hvc64(unsigned long hvc_nr)
 		vgic_inject_virq_hw_eoi(102, 1000);
 		break;
 
+	/* Phase 200：物理 PPI 27 真实应答与 DIR 测试接口 */
+	case HVC_TEST_PHYS_PPI27_ACTIVE:
+		regs->regs[0] = virt_test_phys_ppi27_active();
+		break;
+	case HVC_TEST_PPI27_ACK:
+		regs->regs[0] = virt_test_ppi27_ack();
+		break;
+	case HVC_TEST_INJECT_PPI27_LR0:
+		vgic_inject_virq_hw(27, 27);  /* PPI_VIRT_TIMER */
+		break;
+	case HVC_TEST_LEAVING_LR0_DIR:
+		regs->regs[0] = virt_test_leaving_lr0_dir();
+		break;
+	case HVC_TEST_PPI27_CLEAR:
+		virt_test_ppi27_clear();
+		break;
+
 	/* Phase 10: 内存管理 hypercall */
 	case HVC_MEM_MAP: {
 		paddr_t ipa = (paddr_t)regs->regs[0];

@@ -33,6 +33,7 @@
 #include "common/types.h"
 #include "common/debug.h"
 #include "common/utils.h"
+#include "common/sched.h"
 
 /* ---------- 虚拟设备地址空间 ---------- */
 #define VIRTIO_NET_BASE   0x0A000000UL
@@ -667,6 +668,18 @@ void virt_destroy_vm(struct task_struct *tsk)
 
 /* ---------- 世界切换 ---------- */
 
+static void vtimer_hw_lr_deactivate(uint64_t lr0)
+{
+	if ((lr0 & ICH_LR_HW) && (lr0 & ICH_LR_STATE_MASK)) {
+		uint32_t pintid = (uint32_t)(lr0 >> 32) & 0x3ff;
+
+		if (pintid == PPI_VIRT_TIMER) {
+			WRITE_SYSREG64(PPI_VIRT_TIMER, ICC_DIR_EL1);
+			asm volatile("isb");
+		}
+	}
+}
+
 static void virt_leaving_vm(struct task_struct *tsk)
 {
 	uint64_t lr0, lr2, ctl;
@@ -680,14 +693,7 @@ static void virt_leaving_vm(struct task_struct *tsk)
 	 * 2. 若 LR0 是 vtimer 的 HW 映射且非 invalid，
 	 *    强制 deactivate 物理 PPI 27。
 	 */
-	if ((lr0 & ICH_LR_HW) && (lr0 & ICH_LR_STATE_MASK)) {
-		uint32_t pintid = (uint32_t)(lr0 >> 32) & 0x3ff;
-
-		if (pintid == PPI_VIRT_TIMER) {
-			WRITE_SYSREG64(PPI_VIRT_TIMER, ICC_DIR_EL1);
-			asm volatile("isb");
-		}
-	}
+	vtimer_hw_lr_deactivate(lr0);
 
 	/*
 	 * 2b. 若 LR2 是 PCI INTx 的 HW 映射且非 invalid，
@@ -716,6 +722,42 @@ static void virt_leaving_vm(struct task_struct *tsk)
 	/* 4. 禁用物理 CNTV */
 	WRITE_SYSREG64(0, CNTV_CTL_EL0);
 	asm volatile("isb");
+}
+
+/* Phase 200：读取物理 PPI 27 active 位（只读） */
+uint32_t virt_test_phys_ppi27_active(void)
+{
+	uint64_t sgi = gic_get_redist_base(smp_processor_id()) + GICR_SGI_BASE;
+
+	return (get32(sgi + GICR_ISACTIVER0) >> PPI_VIRT_TIMER) & 1;
+}
+
+/* Phase 200：物理 PPI 27 置 pending 后在 EL2 真实应答，不做 EOI/DIR，保持 active */
+uint32_t virt_test_ppi27_ack(void)
+{
+	uint64_t sgi = gic_get_redist_base(smp_processor_id()) + GICR_SGI_BASE;
+
+	put32(sgi + GICR_ISPENDR0, 1U << PPI_VIRT_TIMER);
+	asm volatile("isb" ::: "memory");
+
+	uint64_t iar = READ_SYSREG64(ICC_IAR1_EL1);
+
+	return (uint32_t)(iar & 0x3ff);
+}
+
+/* Phase 200：清理物理 PPI 27（显式 EOI + DIR） */
+void virt_test_ppi27_clear(void)
+{
+	WRITE_SYSREG64(PPI_VIRT_TIMER, ICC_EOIR1_EL1);
+	WRITE_SYSREG64(PPI_VIRT_TIMER, ICC_DIR_EL1);
+	asm volatile("isb");
+}
+
+/* Phase 200：读硬件 LR0，复用 leaving 的 DIR 判断，返回物理 active */
+uint32_t virt_test_leaving_lr0_dir(void)
+{
+	vtimer_hw_lr_deactivate(READ_SYSREG64(ICH_LR0_EL2));
+	return virt_test_phys_ppi27_active();
 }
 
 static void virt_entering_vm(struct task_struct *tsk)

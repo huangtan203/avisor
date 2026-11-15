@@ -3190,6 +3190,53 @@ static void probe_hw_lr2_dir(void)
     guest_puts("\n");
 }
 
+/*
+ * Phase 200：真实应答物理 PPI 27，并验证 leaving DIR 对物理 active 的作用。
+ * 步骤：关闭 guest vtimer → 读物理 active → EL2 应答 PPI 27（保持 active）
+ *       → 注入 HW LR0（pINTID=27）→ guest 虚拟 IAR → leaving DIR 判断并读物理 active
+ *       → 显式 EOI+DIR 清理。
+ */
+static void probe_ppi27_phys_dir(void)
+{
+    guest_puts("\nProbe: physical PPI 27 real ack + leaving DIR (Phase 200)\n");
+
+    asm volatile("msr daifset, #2" ::: "memory");
+    asm volatile("msr cntv_ctl_el0, xzr" ::: "memory");
+    asm volatile("isb" ::: "memory");
+
+    u64 phys_before = hvc_call(HVC_TEST_PHYS_PPI27_ACTIVE, 0);
+    u64 ack_intid = hvc_call(HVC_TEST_PPI27_ACK, 0);
+    u64 phys_after_ack = hvc_call(HVC_TEST_PHYS_PPI27_ACTIVE, 0);
+
+    hvc_call(HVC_TEST_INJECT_PPI27_LR0, 0);
+    u64 iar = icc_iar1_read();
+
+    u64 phys_after_iar = hvc_call(HVC_TEST_PHYS_PPI27_ACTIVE, 0);
+    u64 phys_after_leaving = hvc_call(HVC_TEST_LEAVING_LR0_DIR, 0);
+
+    hvc_call(HVC_TEST_PPI27_CLEAR, 0);
+    u64 phys_after_clear = hvc_call(HVC_TEST_PHYS_PPI27_ACTIVE, 0);
+
+    asm volatile("msr daifclr, #2" ::: "memory");
+
+    guest_puts("  phys_before=");
+    puts_hex(phys_before, 2);
+    guest_puts(" ack_intid=");
+    puts_hex(ack_intid, 4);
+    guest_puts(" phys_after_ack=");
+    puts_hex(phys_after_ack, 2);
+    guest_puts(" guest_IAR=");
+    puts_hex(iar, 4);
+    guest_puts(" phys_after_iar=");
+    puts_hex(phys_after_iar, 2);
+    guest_puts(" phys_after_leaving=");
+    puts_hex(phys_after_leaving, 2);
+    guest_puts(" phys_after_clear=");
+    puts_hex(phys_after_clear, 2);
+    guest_puts("\n");
+}
+
+
 /* ---------- Phase 18: 优先级与 pending 完整建模 ---------- */
 
 /*
@@ -5984,6 +6031,7 @@ void guest_main(void)
     probe_dir_nomatch();
     probe_hw_lr_dir();
     probe_hw_lr2_dir();
+    probe_ppi27_phys_dir();
 
     /* 测试 12: Phase 19 vGIC 注入路径统一（VM 间协作验证） */
     phase19_injection_unify_test();

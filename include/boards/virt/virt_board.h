@@ -69,3 +69,9 @@ void virt_copy_vgic_state(struct task_struct *dst, struct task_struct *src);
  * （virt_vm_devices）物理页。调用后 tsk->board_data 置 NULL。
  */
 void virt_destroy_vm(struct task_struct *tsk);
+
+/* Phase 200：物理 PPI 27 测试接口（HVC 81–85） */
+uint32_t virt_test_phys_ppi27_active(void);
+uint32_t virt_test_ppi27_ack(void);
+void virt_test_ppi27_clear(void);
+uint32_t virt_test_leaving_lr0_dir(void);
