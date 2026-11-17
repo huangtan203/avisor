@@ -651,6 +651,8 @@ void vgic_save_state(struct vm_virt_state *state)
     state->gic_vmcr = READ_SYSREG64(ICH_VMCR_EL2);
     for (int i = 0; i < NR_VGIC_LRS; i++)
         state->gic_lr[i] = read_lr(i);
+    state->gic_ap0r0 = READ_SYSREG64(ICH_AP0R0_EL2);
+    state->gic_ap1r0 = READ_SYSREG64(ICH_AP1R0_EL2);
 }
 
 /*
@@ -661,6 +663,8 @@ void vgic_restore_state(struct vm_virt_state *state)
     WRITE_SYSREG64(state->gic_vmcr, ICH_VMCR_EL2);
     for (int i = 0; i < NR_VGIC_LRS; i++)
         write_lr(i, state->gic_lr[i]);
+    WRITE_SYSREG64(state->gic_ap0r0, ICH_AP0R0_EL2);
+    WRITE_SYSREG64(state->gic_ap1r0, ICH_AP1R0_EL2);
     asm volatile("isb");
 }
 

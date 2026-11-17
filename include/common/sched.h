@@ -190,6 +190,14 @@ struct task_console {
 struct vm_virt_state {
 	unsigned long gic_vmcr;         /* ICH_VMCR_EL2 */
 	unsigned long gic_lr[NR_VGIC_LRS]; /* ICH_LR0..LRn_EL2 */
+	/*
+	 * 活动优先级寄存器也必须随世界切换保存/恢复。
+	 * PRIbits=5（ICH_VTR_EL2=0x90b80003）→ 32 个优先级组 → 每组 1 个。
+	 * 若缺失，离开 VM 时残留的 active 位会把下一个 VM 的运行优先级钉住，
+	 * 令其软件注入中断无法被 signal。
+	 */
+	unsigned long gic_ap0r0;        /* ICH_AP0R0_EL2（Group0） */
+	unsigned long gic_ap1r0;        /* ICH_AP1R0_EL2（Group1） */
 	unsigned long cntv_ctl;         /* CNTV_CTL_EL0 */
 	unsigned long cntv_cval;        /* CNTV_CVAL_EL0 */
 	int vtimer_pending;			/* vtimer 延迟注入标志 */

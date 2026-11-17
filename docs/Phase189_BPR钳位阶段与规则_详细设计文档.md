@@ -92,7 +92,7 @@ static void write_vbpr(GICv3CPUState *cs, int grp, int value)
 
 ### 5.4 未验证的部分
 
-- `vprebits = 5` 是由钳位值反推的，未能直接读取。本平台 `ICH_VTR_EL2` 未实现（见 Phase 188 第 2 节），读它会触发 `SYNC_INVALID_EL2`。
+- `vprebits = 5` 最初是由钳位值反推的。Phase 188 曾据此记录「本平台 `ICH_VTR_EL2` 未实现」，该记录源于错误编码 `S3_4_C12_C11_6`，已作废：正确编码为 `S3_4_C12_C11_1`，读取正常。
 - 未测试 `ICC_CTLR_EL1.CBPR=1` 时 BPR1 的替代语义（读返回 `VBPR0+1` 饱和到 7、写被忽略）。该路径在 QEMU 实现中存在，但不属于「钳位规则」本身。
 
 ## 6. 与前序阶段的关系

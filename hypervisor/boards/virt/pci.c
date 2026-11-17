@@ -2631,8 +2631,8 @@ int pci_mmio_access(struct task_struct *vm, unsigned long ipa,
 /*
  * 调试：dump PCI 直通中断链路的完整状态
  * （Guest 在 INTx 测试超时后通过 HVC_PCI_DEBUG 触发）
- * 注意：不读 ICH_VTR_EL2 / ICH_LR2_EL2 —— 这套 QEMU 上它们未实现，
- * 读取会触发 UNDEFINED 异常（曾导致 PANIC）。
+ * 注意：这里不读 ICH_VTR_EL2 / ICH_LR2_EL2，需要的能力信息已由
+ * 其它路径提供（ICH_VTR_EL2 的编码在 sysregs.h 中为 S3_4_C12_C11_1）。
  */
 void pci_debug_dump(void)
 {

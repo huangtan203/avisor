@@ -109,11 +109,16 @@
 // ***************************************
 
 #define ICH_HCR_EL2  S3_4_C12_C11_0 /* Hypervisor 控制接口 */
-#define ICH_VTR_EL2  S3_4_C12_C11_6 /* 虚拟化特征（只读，LR 个数等） */
 #define ICH_VMCR_EL2 S3_4_C12_C11_7 /* 虚拟机控制（PMR/BPR/GRPEN 后端） */
 #define ICH_LR0_EL2  S3_4_C12_C12_0 /* List Register 0 */
 #define ICH_LR1_EL2  S3_4_C12_C12_1 /* List Register 1 */
 #define ICH_LR2_EL2  S3_4_C12_C12_2 /* List Register 2 (PCI INTx HW+EOI) */
+#define ICH_EISR_EL2 S3_4_C12_C11_3 /* 哪些 LR 处于 active（只读） */
+#define ICH_ELRSR_EL2 S3_4_C12_C11_5 /* 哪些 LR 为空（只读） */
+#define ICH_MISR_EL2  S3_4_C12_C11_2 /* 维护中断状态（只读）：硬件认为有待处理的维护中断 */
+#define ICH_VTR_EL2   S3_4_C12_C11_1 /* 虚拟接口能力（只读）：ListRegs/优先级位数等 */
+#define ICH_AP0R0_EL2 S3_4_C12_C8_0  /* Group0 活动优先级（bit n = 优先级组 n 有 active） */
+#define ICH_AP1R0_EL2 S3_4_C12_C9_0  /* Group1 活动优先级（bit n = 优先级组 n 有 active） */
 
 /* LR 数量（我们使用的数量，实际硬件可能更多）
  * Phase 7 扩展为 3：LR0=vtimer, LR1=软件注入, LR2=PCI INTx HW+EOI */
@@ -150,6 +155,7 @@
 /* 虚拟定时器相关 */
 #define CNTVOFF_EL2  S3_4_C14_C0_3 /* 虚拟计数器偏移 */
 #define CNTHCTL_EL2  S3_4_C14_C1_0 /* EL1 访问 CNTP/CNTV 的 trap 控制 */
+#define HCR_EL2_ENC  S3_4_C1_C1_0  /* 虚拟化配置寄存器（EL2 访问） */
 
 /*
  * EL1 视角的虚拟定时器寄存器（EL2 可直接访问 = 访问"当前加载的

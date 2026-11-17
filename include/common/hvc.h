@@ -104,8 +104,14 @@
 /* Phase 192: ICC_CTLR_EL1 物理值读取（只读诊断） */
 #define HVC_VGIC_CTLR_PHYS       77 /* 返回 x0=EL2 视角 ICC_CTLR_EL1 x1=ICH_VMCR_EL2 */
 
-/* Phase 192: LR 状态转储（只读诊断） */
-#define HVC_VGIC_LR_DUMP         78 /* 返回 x0=LR0 x1=LR1 x2=LR2 x3=ICH_VMCR_EL2 */
+/* Phase 192: LR 状态转储（只读诊断）
+ * x0 = guest 缓冲区 IPA，写入 8 个 uint64_t：
+ *      [0]=LR0 [1]=LR1 [2]=LR2 [3]=ICH_VMCR_EL2 [4]=ICH_ELRSR_EL2 [5]=ICH_EISR_EL2
+ *      [6]=ICH_HCR_EL2 [7]=ICH_MISR_EL2
+ * 返回 x0=0 成功 / -1 缓冲区未映射或跨页。
+ * 注意：只用 x0 回传，不改写 x1..x5。
+ */
+#define HVC_VGIC_LR_DUMP         78
 #define HVC_TEST_INJECT_HW_LR0   79 /* Phase 197：注入 HW 映射 LR0（vINTID=102, pINTID=1000），无返回值 */
 #define HVC_TEST_INJECT_HW_LR2   80 /* Phase 198：注入 HW 映射 LR2（vINTID=102, pINTID=1000），无返回值 */
 #define HVC_TEST_PHYS_PPI27_ACTIVE 81 /* Phase 200：返回 x0=物理 PPI 27 active 位 */

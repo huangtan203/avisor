@@ -199,8 +199,6 @@ void handle_hvc64(unsigned long hvc_nr)
 
 	/*
 	 * Phase 192：EL2 视角读物理 ICC_CTLR_EL1 与 ICH_VMCR_EL2（只读）。
-	 * 不读 ICH_VTR_EL2：Phase 188 已实测该寄存器在本平台未实现，
-	 * 读取会触发 SYNC_INVALID_EL2。
 	 */
 	case HVC_VGIC_CTLR_PHYS:
 		regs->regs[0] = READ_SYSREG64(S3_0_C12_C12_4);
@@ -208,16 +206,65 @@ void handle_hvc64(unsigned long hvc_nr)
 		break;
 
 	/*
-	 * Phase 192：只读诊断，返回当前 vCPU 的 LR0/LR1/LR2 原始值与 VMCR。
-	 * 用于确认 guest 在 split EOI 语义下写完 EOIR 后，软件注入的 LR1
-	 * 是否仍处于 pending/active。不修改任何状态。
+	 * Phase 192：只读诊断，返回当前 vCPU 的 LR0/LR1/LR2、VMCR、ELRSR、EISR。
+	 *
+	 * x0 = guest 缓冲区 IPA（6 个 uint64_t，按 LR0,LR1,LR2,VMCR,ELRSR,EISR 顺序写入）。
+	 *
+	 * 不用 x1..x5 回传：entry.S 的异常帧会恢复全部通用寄存器，
+	 * 而 guest 侧内联汇编只能声明自己认识的 clobber。漏声明时
+	 * 编译器仍认为这些寄存器有效，会静默用到被改写后的值。
+	 * 走 guest 内存则完全绕开这条隐式契约。
 	 */
-	case HVC_VGIC_LR_DUMP:
-		regs->regs[0] = READ_SYSREG64(ICH_LR0_EL2);
-		regs->regs[1] = READ_SYSREG64(ICH_LR1_EL2);
-		regs->regs[2] = READ_SYSREG64(ICH_LR2_EL2);
-		regs->regs[3] = READ_SYSREG64(ICH_VMCR_EL2);
+	case HVC_VGIC_LR_DUMP: {
+		uint64_t vals[8];
+		paddr_t pa;
+		void *dst;
+		int i;
+
+		vals[0] = READ_SYSREG64(ICH_LR0_EL2);
+		vals[1] = READ_SYSREG64(ICH_LR1_EL2);
+		vals[2] = READ_SYSREG64(ICH_LR2_EL2);
+		vals[3] = READ_SYSREG64(ICH_VMCR_EL2);
+		vals[4] = READ_SYSREG64(ICH_ELRSR_EL2);
+		vals[5] = READ_SYSREG64(ICH_EISR_EL2);
+		vals[6] = READ_SYSREG64(ICH_HCR_EL2);
+		vals[7] = READ_SYSREG64(ICH_MISR_EL2);
+
+		if (ipa_to_pa(current, regs->regs[0], &pa) != 0) {
+			regs->regs[0] = (uint64_t)-1;
+			break;
+		}
+
+		dst = (void *)TO_VADDR(pa);
+
+		/* 缓冲区必须整段落在同一页内，避免跨页映射差异导致越界写 */
+		if (((pa & (PAGE_SIZE - 1)) + sizeof(vals)) > PAGE_SIZE) {
+			regs->regs[0] = (uint64_t)-1;
+			break;
+		}
+
+		for (i = 0; i < 8; i++)
+			((uint64_t *)dst)[i] = vals[i];
+
+		/*
+		 * guest 以不可缓存方式读时，必须先把数据写回内存；
+		 * 否则读到的是旧值或未定义内容。
+		 */
+		{
+			uint64_t line = 64;
+			uintptr_t p = (uintptr_t)dst & ~(line - 1);
+			uintptr_t end = (uintptr_t)dst + sizeof(vals);
+
+			while (p < end) {
+				asm volatile("dc cvac, %0" ::"r"(p) : "memory");
+				p += line;
+			}
+			asm volatile("dsb sy" ::: "memory");
+		}
+
+		regs->regs[0] = 0;
 		break;
+	}
 
 	/*
 	 * Phase 197：测试接口，注入 HW 映射 LR0（vINTID=102，pINTID=1000）。

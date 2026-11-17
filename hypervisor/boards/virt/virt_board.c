@@ -505,6 +505,8 @@ static void virt_initialize(struct task_struct *tsk)
 {
 	tsk->mm.cntvoff = READ_SYSREG64(CNTPCT_EL0);
 	tsk->virt.gic_vmcr = (0xF8UL << ICH_VMCR_VPMR_SHIFT) | ICH_VMCR_VENG1 | ICH_VMCR_VEOIM;
+	tsk->virt.gic_ap0r0 = 0;
+	tsk->virt.gic_ap1r0 = 0;
 
     /*
      * 分配 per-VM 设备模型数据结构
@@ -593,6 +595,8 @@ void virt_attach_secondary(struct task_struct *tsk, struct task_struct *master)
 
     /* vGIC CPU 接口是 per-vCPU 的，独立初始化 */
     tsk->virt.gic_vmcr = (0xF8UL << ICH_VMCR_VPMR_SHIFT) | ICH_VMCR_VENG1 | ICH_VMCR_VEOIM;
+    tsk->virt.gic_ap0r0 = 0;
+    tsk->virt.gic_ap1r0 = 0;
     tsk->virt.vtimer_pending = 0;
     tsk->virt.cntv_cval = 0;
     tsk->virt.cntv_ctl = 0;

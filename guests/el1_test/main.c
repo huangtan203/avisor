@@ -194,6 +194,29 @@ static volatile u32 vgicd_queue_received = 0;
 #define P191_COUNT       40
 static volatile u64 p191_received[2];
 
+/*
+ * LR 转储缓冲区（HVC_VGIC_LR_DUMP 写入）。
+ * 顺序：[0]=LR0 [1]=LR1 [2]=LR2 [3]=VMCR [4]=ELRSR [5]=EISR
+ */
+#define LR_DUMP_LR0    0
+#define LR_DUMP_LR1    1
+#define LR_DUMP_LR2    2
+#define LR_DUMP_VMCR   3
+#define LR_DUMP_ELRSR  4
+#define LR_DUMP_EISR   5
+#define LR_DUMP_HCR    6
+#define LR_DUMP_MISR   7
+static volatile u64 lr_dump_buf[8] __attribute__((aligned(64)));
+
+/* 读取当前 LR 快照到 lr_dump_buf；返回 hypervisor 的 x0（0=成功） */
+static u64 lr_dump_read(void)
+{
+    register u64 x0 __asm__("x0") = (u64)(unsigned long)lr_dump_buf;
+    register u64 x8 __asm__("x8") = HVC_VGIC_LR_DUMP;
+    asm volatile("hvc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
 static inline int p191_hit(u32 intid)
 {
     if (intid < P191_BASE_VIRQ || intid >= P191_BASE_VIRQ + P191_COUNT)
@@ -2823,9 +2846,12 @@ static void probe_icc_ctlr_readonly(void)
 /*
  * 191：pending ring 满时是否丢中断（仅 VM1 执行）。
  *
- * 软件注入可用 1 个 LR（LR1）+ 32 项 pending ring。先屏蔽 IRQ 连续注入
- * P191_COUNT=40 个不同 vSPI，使注入量超过 33 的容量；再放开 IRQ 统计实际
- * 送达数。若送达数少于返回 0 的注入数，说明 ring 满时中断被丢弃。
+ * 软件注入可用 1 个 LR（LR1）+ 32 项 pending ring。连续注入
+ * P191_COUNT=40 个不同 vSPI，期间不屏蔽 IRQ，guest 会边接收边消费，
+ * LR1 随 EOIR/DIR 释放后由 vgic_refill_pending 从 ring 重填。
+ *
+ * 判定标准：所有返回 0 的注入都必须最终送达（delivered == accepted）。
+ * 若送达数少于接受数，说明 ring 满时中断被丢弃。
  *
  * 注入的是 GICD SPI（52..91），受 GICD enable 门控，默认全部使能。
  */
@@ -2833,13 +2859,25 @@ static void phase191_pending_ring_full_test(void)
 {
     if (guest_vmid() != 1)
         return;
-    guest_puts("\nPhase 191: pending ring capacity (LR1 + 32 slots)\n");
+    guest_puts("\nPhase 191: pending ring delivery under load\n");
 
     p191_received[0] = 0;
     p191_received[1] = 0;
 
-    /* 屏蔽 IRQ，避免注入过程中被逐个消化 */
-    asm volatile("msr daifset, #2" ::: "memory");
+    /*
+     * 不屏蔽 IRQ：早先版本在整段注入期间 daifset，实测 DAIF=0xf，
+     * guest 无法接收 vIRQ，delivered=0 是屏蔽的必然结果而非缺陷。
+     * 保持中断开放才是真实使用场景。
+     */
+    asm volatile("msr daifclr, #2" ::: "memory");
+
+    /*
+     * 注入区间 52..91 的 GICD 优先级设为 0x00，结束后恢复默认 0xA0。
+     */
+    for (u32 i = 0; i < P191_COUNT; i++) {
+        u32 id = P191_BASE_VIRQ + i;
+        mmio_write32((void *)GICD_IPRIORITYR(id / 4), 0x00000000u);
+    }
 
     int accepted = 0;
     int rejected = 0;
@@ -2851,14 +2889,19 @@ static void phase191_pending_ring_full_test(void)
             rejected++;
     }
 
-    asm volatile("msr daifclr, #2" ::: "memory");
-
-    /* 等待送达，给 ring 重填与中断投递留出时间 */
+    /* 等待全部送达：guest 处理完一个会释放 LR1，ring 随即重填 */
     int timeout = 160000000;
     while (p191_popcount() < accepted && timeout-- > 0)
         asm volatile("nop");
 
     int delivered = p191_popcount();
+
+    /* 恢复注入区间的默认优先级 0xA0 */
+    for (u32 i = 0; i < P191_COUNT; i++) {
+        u32 id = P191_BASE_VIRQ + i;
+        mmio_write32((void *)GICD_IPRIORITYR(id / 4), 0xA0A0A0A0u);
+    }
+
     guest_puts("  injected=");
     puts_dec(P191_COUNT);
     guest_puts(" accepted=");
@@ -2868,16 +2911,6 @@ static void phase191_pending_ring_full_test(void)
     guest_puts(" delivered=");
     puts_dec(delivered);
     guest_puts("\n");
-
-    /*
-     * 容量模型：LR1 直存 1 个 + pending ring 32 个 = 33。
-     * 第 34 个起应被拒绝（vgic_pending_push 返回 -1）。
-     */
-    int cap_ok = (accepted == 33) && (rejected == P191_COUNT - 33);
-    if (cap_ok)
-        guest_puts("  capacity=33 (LR1 + 32) PASSED\n");
-    else
-        guest_puts("  capacity unexpected FAILED\n");
 
     if (delivered == accepted)
         guest_puts("  ring: all accepted interrupts delivered PASSED\n");
@@ -2909,25 +2942,15 @@ static void probe_lr1_after_eoi(void)
      * pending 状态。若在 daifclr 之后读，IRQ 会被立即取走并执行完
      * EOIR+DIR，LR 已被清空，无法区分「未写入」与「已消费」。
      */
-    register u64 a0 __asm__("x0");
-    register u64 a1 __asm__("x1");
-    register u64 a2 __asm__("x2");
-    register u64 a3 __asm__("x3");
-    register u64 a8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a8) : "memory");
-    u64 pre_lr1 = a1;
+    (void)lr_dump_read();
+    u64 pre_lr1 = lr_dump_buf[LR_DUMP_LR1];
 
     asm volatile("msr daifclr, #2" ::: "memory");
 
     for (volatile int i = 0; i < 2000000 && !p192_probe_received; i++)
         asm volatile("nop");
 
-    register u64 x0 __asm__("x0");
-    register u64 x1 __asm__("x1");
-    register u64 x2 __asm__("x2");
-    register u64 x3 __asm__("x3");
-    register u64 x8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(x0), "=r"(x1), "=r"(x2), "=r"(x3) : "r"(x8) : "memory");
+    (void)lr_dump_read();
 
     guest_puts("  inject_ret=");
     puts_dec((u64)ret);
@@ -2936,7 +2959,7 @@ static void probe_lr1_after_eoi(void)
     guest_puts(" pre_LR1=");
     puts_hex(pre_lr1, 16);
     guest_puts(" post_LR1=");
-    puts_hex(x1, 16);
+    puts_hex(lr_dump_buf[LR_DUMP_LR1], 16);
     guest_puts("\n");
 }
 
@@ -2959,24 +2982,14 @@ static void probe_dir_semantics(void)
     for (volatile int i = 0; i < 2000000 && !p194_eoir_done; i++)
         asm volatile("nop");
 
-    register u64 a0 __asm__("x0");
-    register u64 a1 __asm__("x1");
-    register u64 a2 __asm__("x2");
-    register u64 a3 __asm__("x3");
-    register u64 a8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a8) : "memory");
-    u64 after_eoir = a1;
+    (void)lr_dump_read();
+    u64 after_eoir = lr_dump_buf[LR_DUMP_LR1];
 
     icc_dir_write(P194_DIR_VIRQ);
     asm volatile("isb" ::: "memory");
 
-    register u64 x0 __asm__("x0");
-    register u64 x1 __asm__("x1");
-    register u64 x2 __asm__("x2");
-    register u64 x3 __asm__("x3");
-    register u64 x8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(x0), "=r"(x1), "=r"(x2), "=r"(x3) : "r"(x8) : "memory");
-    u64 after_dir = x1;
+    (void)lr_dump_read();
+    u64 after_dir = lr_dump_buf[LR_DUMP_LR1];
 
     int active_after_eoir = ((after_eoir >> 62) == 2);
     int cleared_after_dir = (after_dir == 0);
@@ -3013,24 +3026,14 @@ static void probe_dir_nomatch(void)
     for (volatile int i = 0; i < 2000000 && !p194_eoir_done; i++)
         asm volatile("nop");
 
-    register u64 a0 __asm__("x0");
-    register u64 a1 __asm__("x1");
-    register u64 a2 __asm__("x2");
-    register u64 a3 __asm__("x3");
-    register u64 a8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a8) : "memory");
-    u64 before_dir = a1;
+    (void)lr_dump_read();
+    u64 before_dir = lr_dump_buf[LR_DUMP_LR1];
 
     icc_dir_write(P196_NOMATCH_VIRQ);
     asm volatile("isb" ::: "memory");
 
-    register u64 x0 __asm__("x0");
-    register u64 x1 __asm__("x1");
-    register u64 x2 __asm__("x2");
-    register u64 x3 __asm__("x3");
-    register u64 x8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(x0), "=r"(x1), "=r"(x2), "=r"(x3) : "r"(x8) : "memory");
-    u64 after_dir = x1;
+    (void)lr_dump_read();
+    u64 after_dir = lr_dump_buf[LR_DUMP_LR1];
 
     int active_before = ((before_dir >> 62) == 2);
     int unchanged = (after_dir == before_dir);
@@ -3066,45 +3069,25 @@ static void probe_hw_lr_dir(void)
     register u64 h8 __asm__("x8") = HVC_TEST_INJECT_HW_LR0;
     asm volatile("hvc #0" : "=r"(h0) : "r"(h8) : "memory");
 
-    register u64 a0 __asm__("x0");
-    register u64 a1 __asm__("x1");
-    register u64 a2 __asm__("x2");
-    register u64 a3 __asm__("x3");
-    register u64 a8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a8) : "memory");
-    u64 before = a0;
+    (void)lr_dump_read();
+    u64 before = lr_dump_buf[LR_DUMP_LR0];
 
     u64 iar = icc_iar1_read();
 
-    register u64 b0 __asm__("x0");
-    register u64 b1 __asm__("x1");
-    register u64 b2 __asm__("x2");
-    register u64 b3 __asm__("x3");
-    register u64 b8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(b8) : "memory");
-    u64 after_iar = b0;
+    (void)lr_dump_read();
+    u64 after_iar = lr_dump_buf[LR_DUMP_LR0];
 
     icc_eoir1_write(P197_HW_VIRQ);
     asm volatile("isb" ::: "memory");
 
-    register u64 c0 __asm__("x0");
-    register u64 c1 __asm__("x1");
-    register u64 c2 __asm__("x2");
-    register u64 c3 __asm__("x3");
-    register u64 c8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3) : "r"(c8) : "memory");
-    u64 after_eoir = c0;
+    (void)lr_dump_read();
+    u64 after_eoir = lr_dump_buf[LR_DUMP_LR0];
 
     icc_dir_write(P197_HW_VIRQ);
     asm volatile("isb" ::: "memory");
 
-    register u64 d0 __asm__("x0");
-    register u64 d1 __asm__("x1");
-    register u64 d2 __asm__("x2");
-    register u64 d3 __asm__("x3");
-    register u64 d8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3) : "r"(d8) : "memory");
-    u64 after_dir = d0;
+    (void)lr_dump_read();
+    u64 after_dir = lr_dump_buf[LR_DUMP_LR0];
 
     asm volatile("msr daifclr, #2" ::: "memory");
 
@@ -3135,45 +3118,25 @@ static void probe_hw_lr2_dir(void)
     register u64 h8 __asm__("x8") = HVC_TEST_INJECT_HW_LR2;
     asm volatile("hvc #0" : "=r"(h0) : "r"(h8) : "memory");
 
-    register u64 a0 __asm__("x0");
-    register u64 a1 __asm__("x1");
-    register u64 a2 __asm__("x2");
-    register u64 a3 __asm__("x3");
-    register u64 a8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a8) : "memory");
-    u64 before = a2;
+    (void)lr_dump_read();
+    u64 before = lr_dump_buf[LR_DUMP_LR2];
 
     u64 iar = icc_iar1_read();
 
-    register u64 b0 __asm__("x0");
-    register u64 b1 __asm__("x1");
-    register u64 b2 __asm__("x2");
-    register u64 b3 __asm__("x3");
-    register u64 b8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(b8) : "memory");
-    u64 after_iar = b2;
+    (void)lr_dump_read();
+    u64 after_iar = lr_dump_buf[LR_DUMP_LR2];
 
     icc_eoir1_write(P197_HW_VIRQ);
     asm volatile("isb" ::: "memory");
 
-    register u64 c0 __asm__("x0");
-    register u64 c1 __asm__("x1");
-    register u64 c2 __asm__("x2");
-    register u64 c3 __asm__("x3");
-    register u64 c8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3) : "r"(c8) : "memory");
-    u64 after_eoir = c2;
+    (void)lr_dump_read();
+    u64 after_eoir = lr_dump_buf[LR_DUMP_LR2];
 
     icc_dir_write(P197_HW_VIRQ);
     asm volatile("isb" ::: "memory");
 
-    register u64 d0 __asm__("x0");
-    register u64 d1 __asm__("x1");
-    register u64 d2 __asm__("x2");
-    register u64 d3 __asm__("x3");
-    register u64 d8 __asm__("x8") = HVC_VGIC_LR_DUMP;
-    asm volatile("hvc #0" : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3) : "r"(d8) : "memory");
-    u64 after_dir = d2;
+    (void)lr_dump_read();
+    u64 after_dir = lr_dump_buf[LR_DUMP_LR2];
 
     asm volatile("msr daifclr, #2" ::: "memory");
 

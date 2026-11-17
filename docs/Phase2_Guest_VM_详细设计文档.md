@@ -594,7 +594,7 @@ EOI 联动）把树莓派版需要软件模拟的所有中断路径都下沉到�
 | 寄存器 | 编码 | 作用 |
 |--------|------|------|
 | ICH_HCR_EL2 | S3_4_C12_C11_0 | bit0=En 使能虚拟 CPU 接口 |
-| ICH_VTR_EL2 | S3_4_C12_C11_6 | 只读：LR 数量、优先级位宽 |
+| ICH_VTR_EL2 | S3_4_C12_C11_1 | 只读：LR 数量、优先级位宽 |
 | ICH_VMCR_EL2 | S3_4_C12_C11_7 | VENG1(bit1)、VPMR[31:24] |
 | ICH_LR0_EL2 | S3_4_C12_C12_0 | vINTID[31:0] pINTID[41:32] Group(60) HW(61) State[63:62] |
 | CNTVOFF_EL2 | S3_4_C14_C0_3 | 虚拟计数器偏移（per-VM） |
