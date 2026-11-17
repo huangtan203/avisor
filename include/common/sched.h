@@ -189,6 +189,12 @@ struct task_console {
  */
 struct vm_virt_state {
 	unsigned long gic_vmcr;         /* ICH_VMCR_EL2 */
+	/*
+	 * ICH_HCR_EL2 也纳入世界切换。En/TC 在各 VM 间相同，但按 GICv3 架构
+	 * EOICount[31:27] 由硬件维护，可能跨 VM 残留（未在本平台实测）。
+	 * 保存/恢复成本低，故不依赖该推断，直接隔离。
+	 */
+	unsigned long gic_hcr;          /* ICH_HCR_EL2 */
 	unsigned long gic_lr[NR_VGIC_LRS]; /* ICH_LR0..LRn_EL2 */
 	/*
 	 * 活动优先级寄存器也必须随世界切换保存/恢复。

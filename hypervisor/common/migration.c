@@ -568,7 +568,7 @@ int migration_finish(struct task_struct *src)
 	virt_copy_vgic_state(mig_dst, src);
 #endif
 
-	/* 7. 转移 per-vCPU 虚拟化状态（gic_vmcr/gic_lr/cntv/vtimer_pending） */
+	/* 7. 转移 per-vCPU 虚拟化状态（gic_hcr/gic_vmcr/gic_lr/AP/cntv/vtimer_pending） */
 	memcpy(&mig_dst->virt, &src->virt, sizeof(struct vm_virt_state));
 
 	/* 8. 转移虚拟计数器偏移（保证迁移后 Guest 的 CNTVCT 连续） */

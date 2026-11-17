@@ -648,6 +648,7 @@ int vgic_is_virq_pending(uint32_t vintid)
  */
 void vgic_save_state(struct vm_virt_state *state)
 {
+    state->gic_hcr = READ_SYSREG64(ICH_HCR_EL2);
     state->gic_vmcr = READ_SYSREG64(ICH_VMCR_EL2);
     for (int i = 0; i < NR_VGIC_LRS; i++)
         state->gic_lr[i] = read_lr(i);
@@ -660,6 +661,8 @@ void vgic_save_state(struct vm_virt_state *state)
  */
 void vgic_restore_state(struct vm_virt_state *state)
 {
+    /* 先使能虚拟接口，再装载 LR/VMCR */
+    WRITE_SYSREG64(state->gic_hcr, ICH_HCR_EL2);
     WRITE_SYSREG64(state->gic_vmcr, ICH_VMCR_EL2);
     for (int i = 0; i < NR_VGIC_LRS; i++)
         write_lr(i, state->gic_lr[i]);

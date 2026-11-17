@@ -138,7 +138,9 @@ hypervisor 侧 LR 事件日志显示 60 和 72 确实经 LR1 送达并被 ACK，
 
 去掉手动清零仍能通过，说明泄漏本身已被消除。P191 中一度加入的 AP 清零前置与 `HVC_TEST_AP_CLEAR`（90）已随之删除，使 P191 重新成为能捕获此类泄漏回归的测试。
 
-**遗留**：`ICH_HCR_EL2` 仍未纳入 save/restore。它只在 `vgic_init` 写一次，且各 VM 配置相同，风险较低，未处理。
+**后续补全**：`ICH_HCR_EL2` 原未纳入 save/restore，理由是它只在 `vgic_init` 写一次、各 VM 配置相同。但按 GICv3 架构 `EOICount[31:27]` 由硬件维护、可能跨 VM 残留（本平台未实测）。该保存成本极低，且不必依赖上述推断，故已一并纳入：`vm_virt_state` 新增 `gic_hcr`，`vgic_restore_state` 中先于 `ICH_VMCR_EL2`/LR 写入（`En=0` 时写 LR 行为未定义）。两处 VM 初始化按 `ICH_HCR_EL2_EN | ICH_HCR_EL2_TC` 赋初值，否则新字段为零会让恢复后虚拟接口失能。
+
+纳入后 30 轮回归：`build=0`、warning 50（与改前同数）、P191 30/30 PASSED、0 FAILED；1 次 vm2 Phase 36 `SYNC_INVALID_EL2` PANIC 与 1 次次核超时，均为文档已记录的偶发项（历史 46 轮 1 次），与本次改动无关。
 
 ## 9. 代码改动
 
@@ -151,9 +153,9 @@ guest 侧：
 
 hypervisor 侧：
 
-- `include/common/sched.h`：`struct vm_virt_state` 新增 `gic_ap0r0` / `gic_ap1r0`。
-- `hypervisor/boards/virt/vgic.c`：`vgic_save_state` / `vgic_restore_state` 增加 AP0R0/AP1R0 的保存与恢复。
-- `hypervisor/boards/virt/virt_board.c`：`virt_initialize` 与次 vCPU 初始化显式清零这两个字段。
+- `include/common/sched.h`：`struct vm_virt_state` 新增 `gic_ap0r0` / `gic_ap1r0`，后续追加 `gic_hcr`。
+- `hypervisor/boards/virt/vgic.c`：`vgic_save_state` / `vgic_restore_state` 增加 AP0R0/AP1R0 的保存与恢复；后续追加 `ICH_HCR_EL2`（restore 时先于 VMCR/LR 写入）。
+- `hypervisor/boards/virt/virt_board.c`：`virt_initialize` 与次 vCPU 初始化显式清零 AP 字段，并按 `ICH_HCR_EL2_EN | ICH_HCR_EL2_TC` 赋 `gic_hcr` 初值。
 - `include/arch/aarch64/sysregs.h`：补充 `ICH_AP0R0_EL2`、`ICH_AP1R0_EL2`、`ICH_EISR_EL2`、`ICH_ELRSR_EL2`、`ICH_MISR_EL2`、`HCR_EL2_ENC` 定义；修正 `ICH_VTR_EL2` 编码为 `S3_4_C12_C11_1`。
 - `hypervisor/arch/aarch64/sync_exc.c`：`HVC_VGIC_LR_DUMP` 改为写 guest 缓冲区并返回 8 项快照。
 - `hypervisor/boards/virt/pci.c`：修正 `pci_debug_dump` 上关于 `ICH_VTR_EL2` 未实现的错误注释。
