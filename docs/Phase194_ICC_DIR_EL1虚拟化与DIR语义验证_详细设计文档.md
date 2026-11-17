@@ -166,3 +166,22 @@ timeout 35 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=o
 ```
 
 退出码 124 为正常超时。检查 `Probe: ICC_DIR_EL1 semantics` 段落出现两次 PASSED。
+
+## 10. 稳定性复核（20 轮）
+
+2026-11 复核「vm2 该探针间歇 `eoir_done=0`」的旧观察，用当前代码（无诊断插桩）连跑 20 轮，结果：
+
+| 指标 | 结果 |
+|---|---|
+| `Probe: ICC_DIR_EL1 semantics` 出现次数 | 每轮 4 次（vm1/vm2 各 2 段） |
+| `eoir_done=0` | 0 次 |
+| 本探针 `FAILED` | 0 次 |
+
+历史 `eoir_done=0` 的日志（`/tmp/af_*.out`、`/tmp/ap_*.out` 等）来自**带诊断插桩的版本**，那些插桩（`[save-chg]`、`[raw-dbg]`、`[dbg] GICD_INJECT`）在 Phase 191 提交前已全部清理，**不能作为当前代码的证据**。
+
+因此本阶段不再把「vm2 间歇失败」列为待修项。若将来复现，需要重新抓取现场；历史日志中有两条线索，均未在当前代码上验证，不作为结论：
+
+- 失败时 `LR1_after_EOIR=50a0000000000064`，即 LR1 里是 vINTID 100（Phase 192 探针）的 pending 条目，而非本探针注入的 101。
+- `[raw-dbg] vintid=101 LR1=...0064 pend_cnt=1` 表明 101 被 `vgic_pending_push` 排入软件队列，`vgic_inject_virq_raw` 对「LR1 已被其它 vINTID 占用」的注入返回 0（=已受理），但中断并未进入 LR，guest 不会收到，`eoir_done` 因此保持 0。
+
+上述两点说明注入接口的返回值语义（0 表示「已受理」，不等于「已送达硬件 LR」）在探针判据里不够严格，但这属于测试判据设计问题，不是 VEOIM/DIR 语义缺陷。收尾时未改判据，保留现状。
