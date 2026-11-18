@@ -53,6 +53,22 @@ A/B 对照，每组 30 轮，同一构建方式，仅 pin 开关不同。
 
 **未定性的 PANIC**：第 1 批出现的 3 次 `EL2 task stack exhausted`（vmid=1/2 的 vcpu1）在复测中 0/30 出现，且基线（无 pin）也为 0。该类 PANIC 可能是偶发，也可能与 pin 有关，目前样本不足以区分，**未定性**。`SYNC_INVALID_EL2` 同理，基线 2 次、pin 后 1 次，未见规律。
 
+### 6.1 有 pin 版本的补充轮次
+
+有 pin 版本共 150 轮（5 批 × 30 轮），每批统计 `FAIL:`、`PANIC` 与 `握手完成 100 轮`。
+
+| 批次 | Test 18 PASS | 冻结类 FAIL | 回收类 FAIL | PANIC |
+|---|---|---|---|---|
+| 1 | 30/30 | 0 | 0 | 4（stack exhausted 3、SYNC_INVALID 1） |
+| 2（复测） | 30/30 | 0 | 0 | 0 |
+| 3 | 30/30 | 0 | 0 | 1（SYNC_INVALID，run4） |
+| 4 | 30/30 | 0 | 3 行，run6 | 0 |
+| 5 | 30/30 | 0 | 3 行，run16 | 1（SYNC_INVALID，run16） |
+
+合计：Test 18 冻结 150/150 通过；冻结类 FAIL 0；回收类 FAIL 2 轮（run6、run16，各含「zombie 未回收」「槽位未复用」，run16 另含「FINISH abort 未回滚到 IDLE」）；PANIC 6 次（stack exhausted 3、SYNC_INVALID 3）。
+
+回收类 FAIL 与 Phase201 观察到的 vm2 回收类失败症状相似。两者是否同一根因未验证。pin 对它是否有影响，本批数据也无法判断。
+
 ## 7. 未验证的部分
 
 - 「冻结失败由 vCPU0 迁移引起」的因果链由实测（失败时 `cpu=1`）与代码路径共同支持，但未直接对迁移事件本身插桩计数。
