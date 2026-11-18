@@ -314,6 +314,12 @@ void hypervisor_main()
                 PANIC("failed to create VM2 vcpu0");
             cpu0_tasks[pid]->priority = 10;
             cpu0_tasks[pid]->counter = 10;
+            /*
+             * 固定物理核：冻结 HVC 门禁要求 VM2 vCPU0 在 CPU0 发起
+             * （smp_processor_id() == 0）。被负载均衡器迁到 CPU1 后，
+             * HVC_SMP_FREEZE_BEGIN 会被直接拒绝，Test 18 首轮即失败。
+             */
+            cpu0_tasks[pid]->flags |= TASK_PINNED;
             (void)strncpy(cpu0_tasks[pid]->name, "vm2-cpu0", 36);
             vm2_master = cpu0_tasks[pid];
 
