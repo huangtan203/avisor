@@ -189,3 +189,22 @@ timeout 35 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=o
 - `[raw-dbg] vintid=101 LR1=...0064 pend_cnt=1` 表明 101 被 `vgic_pending_push` 排入软件队列，`vgic_inject_virq_raw` 对「LR1 已被其它 vINTID 占用」的注入返回 0（=已受理），但中断并未进入 LR，guest 不会收到，`eoir_done` 因此保持 0。
 
 上述两点说明注入接口的返回值语义（0 表示「已受理」，不等于「已送达硬件 LR」）在探针判据里不够严格，但这属于测试判据设计问题，不是 VEOIM/DIR 语义缺陷。收尾时未改判据，保留现状。
+
+**代码层面的事实（已读代码确认，未经运行验证）：**
+
+- `vgic_inject_virq_raw` 在 LR1 被其它 vINTID 占用、且目标 vINTID 未 pending 时，调用 `vgic_pending_push` 入队并返回其结果。队列未满时结果为 0，因此调用方看到的是「已受理」，而中断此刻并未写入硬件 LR。
+- 排队的中断由 `vgic_refill_pending()` 补送。除 `vgic.c` 内部注入路径外，调用点还包括 `entry.S` 中 `el01_irq`（guest IRQ 陷入）与 `el01_sync`（guest 同步异常，含 HVC）返回前，`sync_exc.c` 与 `virt_board.c` 中也有调用。
+
+**实验排除（2026-11，强制占用 LR1，20 轮）：**
+
+曾假设「LR1 被占用 → 注入走排队 → nop 窗口内不送达 → `eoir_done=0`」。为验证该假设，在 P194 注入前临时注入 vINTID 100 占用 LR1（仅改 guest 测试代码，hypervisor 与判据未动），跑 20 轮：
+
+| 指标 | 结果 |
+|---|---|
+| `eoir_done=0` | 0 行 |
+| P194 `PASSED` | 40 行 |
+| P194 `FAILED` | 0 行 |
+
+`eoir_done` 恒为 1，且 `LR1_after_EOIR` 为 vINTID 101 的有效条目。**「LR1 被占用」不是 `eoir_done=0` 的充分条件，该假设已被排除。** 实验代码已还原，构建产物回到提交状态。
+
+注：实验未插桩，无法区分排队的 101 是经 `el01_irq` 还是其它重填点送入 LR1，此细节未验证，也不影响上述排除结论。
