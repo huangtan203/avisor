@@ -49,7 +49,7 @@ QEMU 两轮（`timeout 35 qemu-system-aarch64 -M virt,virtualization=on,gic-vers
 - 只测了单条 active 条目（101）。多条同时 active 时，不匹配写入是否误清其他条目未测。
 - 测的是软件 LR（LR1），HW 映射 LR 的行为未测。
 - QEMU 环境的 GIC 行为可能与 Orin 实机存在差异，实机未验证。
-- 与本探针同批运行的 Phase 194 段落，其历史间歇 `eoir_done=0` 已在 Phase 194 文档第 10 节复核（20 轮未复现）。
+- 与本探针同批运行的 Phase 194 段落，其历史间歇 `eoir_done=0` 已在 Phase 194 文档第 10 节复核（共 40 轮未复现，结束）。
 
 ## 6. 代码位置
 

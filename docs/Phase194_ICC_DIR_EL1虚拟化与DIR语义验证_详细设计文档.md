@@ -167,19 +167,23 @@ timeout 35 qemu-system-aarch64 -M virt,virtualization=on,gic-version=3,highmem=o
 
 退出码 124 为正常超时。检查 `Probe: ICC_DIR_EL1 semantics` 段落出现两次 PASSED。
 
-## 10. 稳定性复核（20 轮）
+## 10. 稳定性复核（共 40 轮，结论：未复现，结束）
 
-2026-11 复核「vm2 该探针间歇 `eoir_done=0`」的旧观察，用当前代码（无诊断插桩）连跑 20 轮，结果：
+2026-11 复核「vm2 该探针间歇 `eoir_done=0`」的旧观察。用当前代码（无诊断插桩）分两批连跑，统计方式为逐行计数，判据如下：
 
-| 指标 | 结果 |
-|---|---|
-| `Probe: ICC_DIR_EL1 semantics` 出现次数 | 每轮 4 次（vm1/vm2 各 2 段） |
-| `eoir_done=0` | 0 次 |
-| 本探针 `FAILED` | 0 次 |
+| 指标 | 第一批（20 轮） | 第二批（20 轮） |
+|---|---|---|
+| `eoir_done=0` 行数 | 0 | 0 |
+| 本探针 `PASSED: EOIR 仅降优先级` 行数 | 40 | 40 |
+| Phase 194/196 `FAILED` 行数 | 0 | 0 |
+
+每轮 vm1、vm2 各执行两段探针（194 与 196），因此每批 `PASSED` 为 40 行。
 
 历史 `eoir_done=0` 的日志（`/tmp/af_*.out`、`/tmp/ap_*.out` 等）来自**带诊断插桩的版本**，那些插桩（`[save-chg]`、`[raw-dbg]`、`[dbg] GICD_INJECT`）在 Phase 191 提交前已全部清理，**不能作为当前代码的证据**。
 
-因此本阶段不再把「vm2 间歇失败」列为待修项。若将来复现，需要重新抓取现场；历史日志中有两条线索，均未在当前代码上验证，不作为结论：
+**结论：结束，不改代码。** 在当前代码上连续 40 轮未复现，无可修复的现象。若将来复现，需要当前代码产生的真实失败日志才能开始定位。
+
+历史日志中有两条线索，均未在当前代码上验证，不作为结论：
 
 - 失败时 `LR1_after_EOIR=50a0000000000064`，即 LR1 里是 vINTID 100（Phase 192 探针）的 pending 条目，而非本探针注入的 101。
 - `[raw-dbg] vintid=101 LR1=...0064 pend_cnt=1` 表明 101 被 `vgic_pending_push` 排入软件队列，`vgic_inject_virq_raw` 对「LR1 已被其它 vINTID 占用」的注入返回 0（=已受理），但中断并未进入 LR，guest 不会收到，`eoir_done` 因此保持 0。
