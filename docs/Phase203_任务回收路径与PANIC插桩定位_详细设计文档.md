@@ -17,7 +17,7 @@ Phase202 固定 vm2 vCPU0 到物理核 0 后，冻结类失败在 150 轮中为 
 - `task_reap_stats()`：`reaped` 取自 `task_reaped_count[cpu]`，只在 `remove_task_slot()` 成功路径递增。
 - `hypervisor/arch/aarch64/sync_exc.c` `HVC_TASK_REAP_STATS`：返回 `reaped`，Test 26 以 `reaped==0` 判 FAIL。
 
-**推断（未验证）**：Test 26 的 `reaped==0` 可能是 `sched_dequeue_task` 对 zombie 返回非 1，导致回收被短路。这是候选假设，需插桩确认。
+**推断（已验证为可达但未复现）**：Test 26 的 `reaped==0` 可能是 `sched_dequeue_task` 对 zombie 返回非 1，导致回收被短路。插桩已确认该短路分支可达（见第 5.1 节反例），但 30 轮实测中 0 次触发，故**不是已确认根因**。
 
 ## 3. 插桩方案
 
@@ -33,10 +33,35 @@ Phase202 固定 vm2 vCPU0 到物理核 0 后，冻结类失败在 150 轮中为 
 
 ## 5. 执行与结论
 
-### 5.1 回收路径（第 2 节推断，未验证）
+### 5.1 回收路径（已实测，结论：短路路径可达但未复现）
 
-- 第 3 节计划的 `[RTDBG]` 插桩**未实际插入**（代码中无 `RTDBG` 字样），本阶段没有 `remove_task_slot()` 短路原因的实测数据。
-- 第 2 节"sched_dequeue_task 返回非 1 导致短路"仍是**未验证假设**。
+**插桩内容**（已还原）：在 `remove_task_slot()` 的 `sched_dequeue_task(tsk) != 1` 分支加计数与 `WARN("[RTDBG] short dq=%d ...")`；`cpu != smp_processor_id()` 分支加计数；`task_reap_after_switch()` 的 ZOMBIE 分支打印 `remove_task_slot()` 返回值。
+
+**30 轮实测**：
+
+| 项目 | 计数 |
+|---|---|
+| 轮数 | 30 |
+| `PANIC` | 1（`run14`） |
+| `[RTDBG] short`（`dq != 1` 短路） | 0 |
+| `reap-after-switch ret=0` | 0 |
+| `reap-after-switch` 总行数 | 30（全部 `ret=1`） |
+| `cpu_mis` 非零 | 0 |
+
+即 30 轮内每次进入 ZOMBIE 回收都成功，**未观察到短路**。
+
+**反例构造（`[RTDBG-NEG]`，已还原）**：在 `task_slot_reuse_selftest()` 末尾新建一个探针任务，先 `sched_dequeue_task()` 把它摘出 runqueue，再调用 `remove_task_slot()`。实测输出：
+
+```
+WARN[3]: [RTDBG-NEG] pre-dequeue ret=1 (expect 1)
+WARN[3]: [RTDBG-NEG] remove after dequeue ret=0 (expect 0)
+```
+
+该轮 `PANIC` 0 次。结论：**`dq != 1` 短路分支可达，`return 0` 路径确实会被执行**。
+
+**限制**：反例为人为构造（先摘再回收），与真实竞态下的调用顺序不必相同；它只证明分支可达，不证明真实运行会出现。
+
+**因此**："`sched_dequeue_task` 返回非 1 导致短路"是**可达但 30 轮未复现**的路径，**不能定为根因**。
 
 ### 5.2 回收类 FAIL（run6 型）
 
@@ -142,3 +167,47 @@ Phase202 固定 vm2 vCPU0 到物理核 0 后，冻结类失败在 150 轮中为 
 
 两批合计 100 轮仅 1 次 PANIC，低于不挂 gdb 时的频率（见第 6 节）。样本太小，无法判断是否由 gdb 挂载造成，**未验证**。
 
+### 7.5 Test 23 前驱假设的撤回与修正
+
+**撤回**：上一轮曾提出"四次 PANIC 都紧跟在 Test 23 开头，Test 23 是共同前驱"。该判断**不成立**。
+
+**依据**（`[DBG23]` 插桩，40 轮，已还原）：
+- Test 23 的 `enter`、`step1`–`step4`、`exit` 六处标记全部按序输出，且 Test 23 PASS。
+- 唯一 PANIC（`r22.log`）出现在 Test 23 `exit` 之后、Test 24 `PASS: FINISH 失败已回滚` 之后。
+- PANIC 签名：`esr=86000005, elr=0xa, far=0xa, x30=0x20000000a, sp=0x4108bdf0`。`x30` 与 `elr` 不相等，与第 5.3 节签名 B（三者相等）形态不同，**归为新变体，未定性**。
+
+**修正后的结论**：
+- Test 23 不能作为 PANIC 的必要前驱。
+- 早前 PANIC 日志在 Test 23 开头即被截断，因此"PANIC 位于 Test 23"这一观察是**日志截断造成的假象**，不能反映真实触发位置。
+- 样本仅 1 次 PANIC，无法建立统计关系；Test 24 与 PANIC 的关系**未验证**。
+
+**插桩状态**：`[DBG23]` 标记已于本轮还原（`git diff -- guests` 为空，产物中 `DBG23` 计数为 0）。
+
+### 7.6 把 PANIC 收敛到 HVC_MIGRATE_START 内部
+
+第 7.5 节遗留的问题是"Test 24 与 PANIC 的关系未验证"。本节用 `[DBG24]` 插桩把它收敛到具体 hypercall。
+
+**静态核实（先于插桩）**：
+- `migration_finish`（`hypervisor/common/migration.c:487`）的失败分支会执行 `mig_src = NULL; mig_state = MIGRATION_IDLE; mig_finish_abort_count++;` 并恢复 vCPU 注册与 vCPU1 的 mm/board_data/name。因此 Test 24 的 FINISH 失败不会留下阻止后续 START 的状态残留，可以排除"状态残留导致 START 被拒"。
+- 39 个非 PANIC 轮全部输出 `PASS: FINISH 失败已回滚源/目标状态，可重试`（39/39），说明 Test 24 本身不会导致 PANIC。
+
+**插桩设计**（3 处，`guests/el1_test/main.c`，已还原）：
+1. Test 24 块结束后、重写页模式之前：`[DBG24] after-pass`
+2. `HVC_MIGRATE_START` 调用之前：`[DBG24] before-start`
+3. `HVC_MIGRATE_START` 返回之后：`[DBG24] after-start`
+
+**结果**（40 轮，`/tmp/dbg24_runs/`，PANIC 1 次）：
+- 39 个非 PANIC 轮：`after-pass → before-start → after-start` 三条标记全部按序出现。
+- 唯一 PANIC 轮（`r39.log`）：只有 `after-pass` 与 `before-start`，**缺 `after-start`**。
+- PANIC 行紧接在 `before-start` 之后，中间无任何其他 guest 输出。
+
+**结论**：
+- PANIC 发生在 `HVC_MIGRATE_START` 执行期间，而不是 Test 24 内部、也不是 START 之后的代码。范围已从"Test 24 附近"收敛到单个 hypercall 内。
+- 该次签名：`esr=97810005, elr=400b0f6c, far=a00b1e3c, x30=400b0f30, sp=4108bc90`。`esr` 的 EC 为 `0x25`（数据中止），`elr != far`，与此前 B/D 形态均不同，**归为新签名，未定性**。
+
+**未验证**：
+- 样本仅 1 次，无法建立统计关系。
+- 本轮 `esr=0x97810005` 与第 2 节签名 C 的 `esr` 数值相同；但 `elr=0x400b0f6c` 是否落在 `vgic_pending_pop` 内**未核对**，不能据此把本轮并入签名 C。
+- `far=0xa00b1e3c` 指向何处**未核对**。
+
+**插桩状态**：`[DBG24]` 三处标记已于本轮还原（`git diff -- guests hypervisor` 为 0 行，`bin_virt/kernel8.img` 中 `DBG24` 计数为 0）。`guests/el1_test/` 下的中间产物（`el1_test.bin`、`el1_test.elf`、`main_c.o`）为构建缓存，非源码，不影响仓库。
