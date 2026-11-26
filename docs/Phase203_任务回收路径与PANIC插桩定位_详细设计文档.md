@@ -211,3 +211,26 @@ WARN[3]: [RTDBG-NEG] remove after dequeue ret=0 (expect 0)
 - `far=0xa00b1e3c` 指向何处**未核对**。
 
 **插桩状态**：`[DBG24]` 三处标记已于本轮还原（`git diff -- guests hypervisor` 为 0 行，`bin_virt/kernel8.img` 中 `DBG24` 计数为 0）。`guests/el1_test/` 下的中间产物（`el1_test.bin`、`el1_test.elf`、`main_c.o`）为构建缓存，非源码，不影响仓库。
+
+### 7.7 签名 C 的访存位置与 vgic_pending 结构体破坏的首次命中
+
+**符号映射**（`build_virt/kernel8.elf`，重建后核实）：
+- `elr=0x400b0f6c` = `vgic_pending_pop+84`：`ldr w1, [x0,#12]`，读取 `virt->vgic_pending[head]`。
+- `x30=0x400b0f30` = `vgic_pending_pop+24`：函数内 `if (!virt->vgic_pending_count)` 的入口，是返回地址而非访存点。
+- 因此签名 C 的访存位于 `vgic_pending_pop` 读取 pending 槽位处，`far` 由 `virt` 基址与 `head` 共同决定。
+
+**VPDBG 守卫（40 轮，`/tmp/vpdbg_runs/`）**：在 `vgic_pending_pop` 入口检查 `head`/`tail` 是否越界（`>= VGIC_PENDING_CAPACITY=32`）。
+- 唯一一次命中（`r36.log`）：`WARN[1]: [VPDBG] bad idx head=1091091760 tail=0 count=1091091760 virt=4108a000`。
+- 随后同一轮 PANIC：`esr=97810005, elr=400b1088, far=452b951c, x30=400b104c`。
+- `head` 与 `count` 数值相同，均为 `0x4108BD30`（`printf '%x'` 换算核实）。该值与同批 PANIC 的 `sp` 同属 `0x4108bxxx` 栈区，**可能**是栈地址被写入 `head`/`count` 字段，**未验证**。`virt=0x4108a000` 本身为合法地址。
+- `head`（`virt+80`）与 `count`（`virt+88`）相隔 8 字节，**可能**由同一越界写入覆盖，**未验证**。
+
+**同批其他 PANIC**：
+- `r17.log`：`esr=97c08006, elr=400b4708, far=11e93c8c`，且同一轮出现 `EL2 task stack` 耗尽。该轮无 VPDBG 输出，归为签名 A，与 `vgic_pending` 破坏无关。
+
+**未验证与限制**：
+- 样本仅 1 次命中，无法建立统计关系。
+- `r36` 的 `elr=400b1088` 与前次 `400b0f6c` 不同，是否仍在 `vgic_pending_pop` 内**未核对**。
+- 谁写入了 `head`/`count` 的越界值，**未定位**。需在 `vgic_pending_push`/`pop` 的写入处或对 `virt+80`/`virt+88` 加写入记录才能确认。
+
+**插桩状态**：`[VPDBG]` 守卫已于本轮还原（`git diff -- hypervisor guests` 为 0 行，`bin_virt/kernel8.img` 中 `VPDBG` 计数为 0）。
